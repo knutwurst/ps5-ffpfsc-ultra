@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1985,17 +1985,30 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
     # Disk images are games as-is.
     games.extend(image_files)
 
-    # Archives: peek the first volume of each set; keep the ones that hold a game.
+    # Archives: only the first volume of each multi-part set is a candidate
+    # (.part02+/.r01+ resolve back to the first volume and are skipped).
     first_volumes = [a for a in archive_files
                      if ArchiveExtractor._first_volume(a) == a]
-    for a in first_volumes:
-        names = ArchiveExtractor.list_members(a, candidate_passwords)
-        if names and ArchiveExtractor.names_look_like_game(names):
-            games.append(a)
+    if first_volumes:
+        if len(first_volumes) == 1 and not games:
+            # One archive set and nothing else competing → it IS the game. Don't
+            # peek: listing a multi-volume RAR reads through every part (slow over
+            # USB). Extraction confirms it later, and a non-game archive just
+            # fails with a clear "no game found".
+            games.append(first_volumes[0])
             if log_fn:
-                log_fn("INFO", f"  Game archive detected: {a.name}")
-        elif log_fn:
-            log_fn("INFO", f"  Not a game (kept as extra): {a.name}")
+                log_fn("INFO", f"  Game archive (by structure): {first_volumes[0].name}")
+        else:
+            # Ambiguous (several archive sets, or one alongside a folder/image) →
+            # peek each to find which actually holds the game.
+            for a in first_volumes:
+                names = ArchiveExtractor.list_members(a, candidate_passwords)
+                if names and ArchiveExtractor.names_look_like_game(names):
+                    games.append(a)
+                    if log_fn:
+                        log_fn("INFO", f"  Game archive detected: {a.name}")
+                elif log_fn:
+                    log_fn("INFO", f"  Not a game (kept as extra): {a.name}")
 
     if len(games) != 1:
         return None, [], games

@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -2989,6 +2989,13 @@ class App:
         except Exception:
             pass
 
+    def _persisted_bool(self, settings, key, default):
+        """A BooleanVar that loads from settings.json and auto-saves on every
+        change, so the option sticks regardless of which checkbox toggles it."""
+        v = tk.BooleanVar(value=bool(settings.get(key, default)))
+        v.trace_add("write", lambda *_: save_settings({key: v.get()}))
+        return v
+
     def _setup(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
@@ -3101,19 +3108,19 @@ class App:
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
         self.copy_siblings_var = tk.BooleanVar(value=getattr(self, "_saved_copy_siblings", True))
-        self.keep_pfs_var = tk.BooleanVar(value=False)
-        self.open_output_var = tk.BooleanVar(value=False)
-        self.summary_popup_var = tk.BooleanVar(value=True)
-        self.sound_complete_var = tk.BooleanVar(value=True)
-        self.sound_error_var = tk.BooleanVar(value=True)
-        self.batch_var = tk.BooleanVar(value=False)
-        self.unpack_mode_var = tk.BooleanVar(value=False)
-        self.verify_output_var = tk.BooleanVar(value=False)
-        self.auto_clear_temp_var = tk.BooleanVar(value=self._saved_auto_clear_temp)
+        self.keep_pfs_var        = self._persisted_bool(settings, "keep_pfs", False)
+        self.open_output_var     = self._persisted_bool(settings, "open_output", False)
+        self.summary_popup_var   = self._persisted_bool(settings, "summary_popup", True)
+        self.sound_complete_var  = self._persisted_bool(settings, "sound_complete", True)
+        self.sound_error_var     = self._persisted_bool(settings, "sound_error", True)
+        self.batch_var = tk.BooleanVar(value=False)        # session state — not persisted
+        self.unpack_mode_var = tk.BooleanVar(value=False)  # session state — not persisted
+        self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
+        self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
         # MkPFS 0.0.8 tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
-        self.verbose_var           = tk.BooleanVar(value=False)
+        self.verbose_var           = self._persisted_bool(settings, "verbose", False)
         self.block_size_var        = tk.StringVar(value=self._saved_block_size)
 
         # ── Top folder row ───────────────────────────────────────────────────

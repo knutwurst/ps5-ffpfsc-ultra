@@ -4,7 +4,7 @@ A desktop app that packs PS5 game dumps into `.ffpfsc` containers for ShadowMoun
 
 Built by Knutwurst on top of the Bizkut `ps5-ffpfs-cli` backend. Runs on macOS, Windows, and Linux.
 
-Current version: 1.0.3
+Current version: 1.0.4
 
 ## What it does
 
@@ -12,6 +12,7 @@ Current version: 1.0.3
 - Reads ZIP, RAR, and 7z archives directly. Multi-part RAR sets and password-protected archives work out of the box. macOS carries a self-contained native UnRAR module, so there is no dependency on an external `unrar` or 7-Zip binary.
 - Keeps a saved list of archive passwords and tries them automatically, so a recurring scene password never has to be retyped.
 - Names the output after the game (`Game Name [v01.004] [PPSA12345].ffpfsc`) so the files stay findable.
+- Packs a release folder in one go. It finds the game inside the folder (even when it sits in a RAR or 7z), recreates the folder at the destination, and copies the DLCs and other extras next to the finished `.ffpfsc`.
 - Unpacks `.ffpfs` / `.ffpfsc` back into a folder.
 - Queue with per-stage progress, a heartbeat, and a live log.
 

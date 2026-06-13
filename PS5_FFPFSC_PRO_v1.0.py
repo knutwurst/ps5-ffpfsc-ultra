@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1299,6 +1299,19 @@ class SettingsWindow(ctk.CTkToplevel):
                        hover_color=GREEN2, width=150, command=_save_pw_list).pack(
             anchor="w", padx=14, pady=(0, 10))
 
+        # ── Folder bundles ───────────────────────────────────────────────────
+        _cs_cb = ctk.CTkCheckBox(
+            comp,
+            text="Copy extra files (DLCs etc.) next to the .ffpfsc when packing a folder",
+            variable=self.app.copy_siblings_var, fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
+            command=lambda: save_settings({"copy_bundle_siblings": self.app.copy_siblings_var.get()}),
+        )
+        _cs_cb.pack(anchor="w", padx=14, pady=(2, 4))
+        ctk.CTkLabel(comp, text="When a folder holds one game plus extras, the source folder is recreated "
+                                "at the destination with the .ffpfsc and the extras inside.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left").pack(
+            anchor="w", padx=14, pady=(0, 10))
+
         # USER INTERFACE
         self._section_label(scroll, "USER INTERFACE")
         ui = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
@@ -1473,6 +1486,59 @@ class ArchiveExtractor:
             "is saved.\n\nAdd the password in Settings → Saved Archive Passwords "
             "(or in the 'Archive Password' field) and try again."
         )
+
+    @staticmethod
+    def list_members(archive: Path, passwords=None) -> list[str]:
+        """Return member names ('/'-separated) WITHOUT extracting — a cheap peek
+        used to tell a game archive from a DLC/extra. Tries candidate passwords
+        for header-encrypted archives. Returns [] if it can't be opened."""
+        suffix = archive.suffix.lower()
+        cands = [p for p in (passwords or []) if p] + [""]
+        if suffix == ".zip":
+            try:
+                with zipfile.ZipFile(archive, "r") as zf:
+                    return [n.replace("\\", "/") for n in zf.namelist()]
+            except Exception:
+                return []
+        if suffix == ".rar":
+            resolved = ArchiveExtractor._first_volume(archive)
+            try:
+                backend_dir = backend_base_dir()
+                if str(backend_dir) not in sys.path:
+                    sys.path.insert(0, str(backend_dir))
+                from unrar import rarfile as _br  # type: ignore
+            except Exception:
+                return []
+            for pwd in cands:
+                try:
+                    with _br.RarFile(str(resolved), pwd=pwd or None) as rf:
+                        return [n.replace("\\", "/") for n in rf.namelist()]
+                except Exception:
+                    continue
+            return []
+        if suffix == ".7z":
+            try:
+                import py7zr  # type: ignore
+            except ImportError:
+                return []
+            for pwd in cands:
+                try:
+                    kwargs = {"password": pwd} if pwd else {}
+                    with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
+                        return [n.replace("\\", "/") for n in sz.getnames()]
+                except Exception:
+                    continue
+            return []
+        return []
+
+    @staticmethod
+    def names_look_like_game(names) -> bool:
+        """True if a member-name listing contains the PS5 game signature
+        (an eboot.bin plus a sce_sys/param.json), at any depth."""
+        low = [n.lower().rstrip("/") for n in names]
+        has_eboot = any(n == "eboot.bin" or n.endswith("/eboot.bin") for n in low)
+        has_param = any(n.endswith("sce_sys/param.json") for n in low)
+        return has_eboot and has_param
 
     # ── format handlers ────────────────────────────────────────────────────────
 
@@ -1879,6 +1945,78 @@ class ArchiveExtractor:
 
 # ─── Game Item ─────────────────────────────────────────────────────────────────
 
+# Files copied to the destination alongside a packed game, minus scene junk.
+SCENE_JUNK_EXTS = {".nfo", ".sfv", ".txt", ".diz", ".url", ".md5", ".sha1",
+                   ".srr", ".jpg", ".jpeg", ".png", ".gif", ".db"}
+
+
+def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
+    """Inspect *folder* for the 'game + extras' layout.
+
+    Returns (game_source, siblings, all_games):
+      • game_source — the single game (a game subfolder, a disk image, or an
+        archive whose listing shows a PS5 game), or None.
+      • siblings    — the other files to copy next to the output (scene junk and
+        the game's own multi-part volumes removed).
+      • all_games   — every game candidate found (so the caller can warn on >1).
+    Archives are only *listed* here (peeked), never extracted.
+    """
+    try:
+        entries = list(folder.iterdir())
+    except Exception:
+        return None, [], []
+    files = [p for p in entries if p.is_file()]
+    subdirs = [p for p in entries if p.is_dir()]
+
+    archive_files = [f for f in files if f.suffix.lower() in (".zip", ".rar", ".7z")]
+    image_files = [f for f in files if f.suffix.lower() in DISK_IMAGE_SUFFIXES]
+
+    games: list[Path] = []
+
+    # Game subfolders directly inside (a loose dump sitting in the folder).
+    for d in subdirs:
+        if is_game_folder(d):
+            games.append(d)
+        else:
+            inner = find_game_folders(d, max_depth=2)
+            if len(inner) == 1:
+                games.append(inner[0])
+
+    # Disk images are games as-is.
+    games.extend(image_files)
+
+    # Archives: peek the first volume of each set; keep the ones that hold a game.
+    first_volumes = [a for a in archive_files
+                     if ArchiveExtractor._first_volume(a) == a]
+    for a in first_volumes:
+        names = ArchiveExtractor.list_members(a, candidate_passwords)
+        if names and ArchiveExtractor.names_look_like_game(names):
+            games.append(a)
+            if log_fn:
+                log_fn("INFO", f"  Game archive detected: {a.name}")
+        elif log_fn:
+            log_fn("INFO", f"  Not a game (kept as extra): {a.name}")
+
+    if len(games) != 1:
+        return None, [], games
+    game = games[0]
+
+    # Exclude the game itself (and, for an archive, every volume of its set) from
+    # the siblings; drop scene junk too.
+    game_volume_set: set[Path] = set()
+    if game.is_file() and game.suffix.lower() in (".zip", ".rar", ".7z"):
+        for a in archive_files:
+            if a == game or ArchiveExtractor._first_volume(a) == game:
+                game_volume_set.add(a.resolve())
+    elif game.is_file():
+        game_volume_set.add(game.resolve())
+
+    siblings = [f for f in files
+                if f.resolve() not in game_volume_set
+                and f.suffix.lower() not in SCENE_JUNK_EXTS]
+    return game, siblings, games
+
+
 class GameItem:
     def __init__(self, path: Path):
         self.path       = path
@@ -1905,6 +2043,25 @@ class GameItem:
         obj.artwork      = None
         obj.status       = "Pending Extract"
         obj.password     = None          # optional per-archive password override
+        return obj
+
+    @classmethod
+    def from_bundle(cls, bundle_dir: Path, game_source: Path, siblings) -> "GameItem":
+        """A source folder holding one game (archive / game folder / disk image)
+        plus extra files (DLCs etc.). The game is packed into a recreated
+        '<bundle_dir name>' folder at the destination; the extras are copied next
+        to the .ffpfsc. Reuses the archive/folder/image item, then tags it."""
+        suffix = game_source.suffix.lower()
+        if game_source.is_dir():
+            obj = cls(game_source)
+        elif suffix in DISK_IMAGE_SUFFIXES:
+            obj = cls.from_exfat(game_source)
+        else:
+            obj = cls.from_archive(game_source)
+        obj.bundle_dir       = bundle_dir
+        obj.bundle_subfolder = bundle_dir.name
+        obj.bundle_siblings  = list(siblings)
+        obj.name             = bundle_dir.name   # nicer queue label until extraction
         return obj
 
     @classmethod
@@ -1994,6 +2151,14 @@ class CLIWorker(threading.Thread):
         self.start_time = time.time()
         self.last_heartbeat = self.start_time
         _ticker_stop = threading.Event()   # stops the liveness ticker (see below)
+
+        # A bundle writes its .ffpfsc into a recreated sub-folder; make sure that
+        # folder exists before the backend tries to write into it.
+        if self.operation != "unpack":
+            try:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
         # Raw log strategy: rolling tail buffer.
         # All backend lines are held in a deque; error lines are always kept in a
@@ -2138,6 +2303,10 @@ class CLIWorker(threading.Thread):
                 expected = "extracted output folder" if self.operation == "unpack" else "new .ffpfsc output"
                 self.app.finish(False, f"Backend exited but no {expected} was created.", self.last_cmd_str)
                 return
+
+            # Bundle: copy the extra files (DLCs etc.) next to the new .ffpfsc.
+            self._copy_bundle_siblings()
+
             # ShadowMount compatibility checks
             if self.operation != "unpack":
                 for w in self._validate_shadowmount():
@@ -2566,6 +2735,36 @@ class CLIWorker(threading.Thread):
         self.final_size = 0
         return False
 
+    def _copy_bundle_siblings(self) -> None:
+        """For a folder bundle, copy the extra files (DLCs etc.) next to the
+        packed .ffpfsc. No-op unless the item carries siblings and the user has
+        'copy extras' enabled."""
+        siblings = getattr(self.item, "bundle_siblings", None)
+        if not siblings:
+            return
+        var = getattr(self.app, "copy_siblings_var", None)
+        if var is not None and not var.get():
+            self.app.log("INFO", "Copy extras is off — leaving DLC/extra files in the source folder.")
+            return
+        dest_dir = self.output_dir
+        copied = 0
+        for src in siblings:
+            try:
+                src = Path(src)
+                if not src.exists() or not src.is_file():
+                    continue
+                target = dest_dir / src.name
+                if target.exists() and target.stat().st_size == src.stat().st_size:
+                    copied += 1
+                    continue
+                self.app.log("INFO", f"Copying extra next to output: {src.name} ({format_size(src.stat().st_size)})")
+                shutil.copy2(src, target)
+                copied += 1
+            except Exception as e:
+                self.app.log("WARN", f"Could not copy extra '{Path(src).name}': {e}")
+        if copied:
+            self.app.log("OK", f"Copied {copied} extra file(s) next to the .ffpfsc.")
+
     def _validate_shadowmount(self) -> list:
         """Post-compression ShadowMount compatibility checks.
         Returns a list of warning strings (empty = all OK)."""
@@ -2728,6 +2927,8 @@ class App:
         if self._saved_passwords is None:
             self._saved_passwords = ["DLPSGAME.COM"]
             save_settings({"archive_passwords": self._saved_passwords})
+        # Folder bundles: copy DLC/extra files next to the .ffpfsc (default on).
+        self._saved_copy_siblings = settings.get("copy_bundle_siblings", True)
 
     def _show_first_run_wizard(self):
         wiz = FirstRunWizard(self.root)
@@ -2810,6 +3011,7 @@ class App:
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
+        self.copy_siblings_var = tk.BooleanVar(value=getattr(self, "_saved_copy_siblings", True))
         self.keep_pfs_var = tk.BooleanVar(value=False)
         self.open_output_var = tk.BooleanVar(value=False)
         self.summary_popup_var = tk.BooleanVar(value=True)
@@ -3678,9 +3880,23 @@ class App:
         self.status_update("Scanning", f"Scanning {src.name}…",
                             "Scanning Files", 0, 0, "00:00", "—", "—")
         self.log("INFO", f"Scanning folder: {src}")
+        cand_pw = self._candidate_passwords()   # built on the Tk thread, for archive peeking
 
-        def _scan_folder(p=src):
+        def _scan_folder(p=src, cand_pw=cand_pw):
             try:
+                # 0. Bundle: one game (archive / game folder / disk image) plus
+                #    extra files (DLCs etc.). Pack the game into a recreated copy
+                #    of this folder and copy the extras next to it. Only triggers
+                #    when there ARE extras — a plain game still packs normally.
+                game, siblings, all_games = detect_game_bundle(p, cand_pw, self.log)
+                if game is not None and siblings:
+                    self.log("OK", f"Folder bundle: 1 game + {len(siblings)} extra file(s) — "
+                                   "the folder will be recreated at the destination with the extras alongside.")
+                    self.scan_q.put(("ok", GameItem.from_bundle(p, game, siblings)))
+                    return
+                if len(all_games) > 1:
+                    self.log("WARN", f"{len(all_games)} games found in this folder — adding them individually.")
+
                 # 1. Look for extracted game folders first
                 self.log("INFO", "Looking for PS5 game folders…")
                 games = find_game_folders(p)
@@ -4132,10 +4348,13 @@ class App:
         if (getattr(item, "operation", "pack") == "pack"
                 and not self.batch_var.get()
                 and out.suffix.lower() != ".ffpfsc"):
+            # Bundle: recreate the source folder under the output dir.
+            sub = getattr(item, "bundle_subfolder", None)
+            base = (out / sanitize_filename(sub)) if sub else out
             try:
-                out = out / descriptive_ffpfsc_name(item)
+                out = base / descriptive_ffpfsc_name(item)
             except Exception:
-                pass
+                out = base   # keep the subfolder; backend names <title_id>.ffpfsc inside
         temp = Path(self.temp_var.get().strip())
         backend = backend_base_dir()
         cli_py = Path("backend") / "cli.py"  # macOS-ready pathlib form

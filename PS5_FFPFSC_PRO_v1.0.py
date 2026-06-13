@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -219,10 +219,21 @@ def get_total_space(path: Path) -> int:
 
 
 def same_drive(path_a: Path, path_b: Path) -> bool:
+    """True if both paths are on the same filesystem/volume.
+
+    Uses the device id (st_dev) — correct on macOS/Linux, where Path.drive is
+    always '' and the old comparison wrongly reported every pair as 'same drive'
+    (which over-estimated the temp space needed when temp and output were on
+    different volumes). Falls back to drive letters only if stat fails."""
     try:
-        return path_a.resolve().drive.lower() == path_b.resolve().drive.lower()
+        a = path_a if path_a.exists() else path_a.parent
+        b = path_b if path_b.exists() else path_b.parent
+        return os.stat(a).st_dev == os.stat(b).st_dev
     except Exception:
-        return str(path_a)[:2].lower() == str(path_b)[:2].lower()
+        try:
+            return path_a.resolve().drive.lower() == path_b.resolve().drive.lower()
+        except Exception:
+            return str(path_a)[:2].lower() == str(path_b)[:2].lower()
 
 
 def estimate_peak_space_needed(game_size: int, same_temp_output_drive: bool = True) -> int:

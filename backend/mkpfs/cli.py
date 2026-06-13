@@ -809,13 +809,14 @@ def cli_mkpfs_add_create_args(
         "--verify-structure",
         dest="verify_structure",
         action="store_true",
-        default=True,
-        help="Run quick structure verification after a successful pack (default)",
+        default=None,
+        help="Run quick structure verification after a successful pack (on by default)",
     )
     verify_structure_group.add_argument(
         "--no-verify-structure",
         dest="verify_structure",
         action="store_false",
+        default=None,
         help="Disable the default quick structure verification after a successful pack",
     )
     parser.add_argument(
@@ -1017,19 +1018,23 @@ def _resolve_pack_verification_mode(args: argparse.Namespace) -> PackVerificatio
     """
     skip_verification: bool = bool(getattr(args, "skip_verification", False))
     verify: bool = bool(getattr(args, "verify", False))
-    verify_structure: bool = bool(getattr(args, "verify_structure", True))
+    # None = default (structure check on), True = explicit --verify-structure,
+    # False = explicit --no-verify-structure. Only an explicit --verify-structure
+    # conflicts with --skip-verification; the default must yield to skip so that
+    # --skip-verification works on its own.
+    verify_structure = getattr(args, "verify_structure", None)
 
     if skip_verification and verify:
         raise BuildError("--verify and --skip-verification cannot be used together")
-    if skip_verification and verify_structure:
+    if skip_verification and verify_structure is True:
         raise BuildError("--verify-structure and --skip-verification cannot be used together")
     if skip_verification:
         return PackVerificationMode.SKIP
     if verify:
         return PackVerificationMode.FULL
-    if verify_structure:
-        return PackVerificationMode.STRUCTURE
-    return PackVerificationMode.SKIP
+    if verify_structure is False:
+        return PackVerificationMode.SKIP
+    return PackVerificationMode.STRUCTURE
 
 
 def _contains_direct_game_markers(root_path: Path) -> bool:

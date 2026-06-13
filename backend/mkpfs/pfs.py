@@ -78,6 +78,33 @@ class SupportsIntQueue(Protocol):
 _PFSC_WORKER_PROGRESS_QUEUE: SupportsIntQueue | None = None
 
 
+# ── macOS / Windows filesystem junk that must never be packed into an image ──
+# OS/Finder/archiver metadata, never part of a PS5 game dump. The packer skips
+# these AND the post-pack verify ignores them, so the two stay symmetric — else a
+# junk file present in the source but not the image (or one Spotlight/Finder
+# creates mid-pack) would be reported as a spurious "missing in image" error.
+_JUNK_FILE_NAMES = frozenset({
+    ".DS_Store", ".localized", ".VolumeIcon.icns", ".apdisk",
+    "Thumbs.db", "ehthumbs.db", "desktop.ini",
+})
+_JUNK_DIR_NAMES = frozenset({
+    "__MACOSX", ".AppleDouble", ".Spotlight-V100", ".Trashes",
+    ".fseventsd", ".TemporaryItems", ".DocumentRevisions-V100",
+    ".AppleDB", ".AppleDesktop",
+})
+
+
+def is_fs_junk(rel_path: Path) -> bool:
+    """True if *rel_path* (relative to a source root) is OS/archiver junk that must
+    never enter a PFS image: macOS metadata (.DS_Store, AppleDouble ._*, Spotlight/
+    Trashes dirs, __MACOSX) and the common Windows equivalents. Matched on the
+    basename and on every path component, so junk nested at any depth is caught."""
+    name = rel_path.name
+    if name in _JUNK_FILE_NAMES or name.startswith("._"):
+        return True
+    return any(part in _JUNK_DIR_NAMES for part in rel_path.parts)
+
+
 def estimate_file_data_footprint(*, file_sizes: list[int], block_size: int) -> int:
     """Estimate data-block footprint for file payloads at a given PFS block size."""
     return sum((ceil_div(size, block_size) * block_size) if size > 0 else block_size for size in file_sizes)
@@ -85,7 +112,10 @@ def estimate_file_data_footprint(*, file_sizes: list[int], block_size: int) -> i
 
 def choose_auto_fit_block_size(source_root: Path) -> int:
     """Choose a PFS block size that minimizes estimated file-data footprint."""
-    file_sizes: list[int] = [p.stat().st_size for p in source_root.rglob("*") if p.is_file()]
+    file_sizes: list[int] = [
+        p.stat().st_size for p in source_root.rglob("*")
+        if p.is_file() and not is_fs_junk(p.relative_to(source_root))
+    ]
     if not file_sizes:
         return consts.PFSC_LOGICAL_BLOCK_SIZE
 
@@ -2534,7 +2564,10 @@ def scan_source_tree(root: Path, progress: Progress) -> tuple[dict[str, DirNode]
         by relative path and total_files is the number of files discovered.
     """
     progress.status("\nDiscovering files...")
-    abs_files: list[Path] = [p for p in root.rglob("*") if p.is_file()]
+    abs_files: list[Path] = [
+        p for p in root.rglob("*")
+        if p.is_file() and not is_fs_junk(p.relative_to(root))
+    ]
     abs_files.sort(key=lambda p: p.relative_to(root).as_posix().lower())
 
     # Validate filenames before compression work begins; non-ASCII names are unsupported.
@@ -5219,7 +5252,10 @@ def validate_source_paths(
         errors.append(f"source path does not exist or is not a directory: {source}")
         return None
 
-    source_files: list[Path] = sorted(path for path in source.rglob("*") if path.is_file())
+    source_files: list[Path] = sorted(
+        path for path in source.rglob("*")
+        if path.is_file() and not is_fs_junk(path.relative_to(source))
+    )
     source_rel: set[str] = {path.relative_to(source).as_posix() for path in source_files}
     image_rel: set[str] = set(file_inodes.keys())
 

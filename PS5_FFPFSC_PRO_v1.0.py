@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -2017,6 +2017,41 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
     return game, siblings, games
 
 
+def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None):
+    """Treat *parent* as a library of games: every immediate subfolder that holds
+    a game becomes its own bundle, so its folder is recreated at the destination
+    with just the .ffpfsc (plus any extras) inside. Returns a list of bundle
+    GameItems (one per game subfolder)."""
+    items = []
+    try:
+        children = sorted((d for d in parent.iterdir() if d.is_dir()),
+                          key=lambda p: p.name.lower())
+    except Exception:
+        return items
+    for child in children:
+        game, siblings = None, []
+        if is_game_folder(child):
+            game = child                       # the subfolder itself is the dump
+        else:
+            g, sib, _all = detect_game_bundle(child, candidate_passwords, log_fn)
+            if g is not None:
+                game, siblings = g, sib
+            else:
+                inner = find_game_folders(child, max_depth=2)
+                if len(inner) == 1:
+                    game = inner[0]
+        if game is not None:
+            try:
+                items.append(GameItem.from_bundle(child, game, siblings))
+                if log_fn:
+                    extra = f" + {len(siblings)} extra(s)" if siblings else ""
+                    log_fn("INFO", f"  Library game: {child.name}{extra}")
+            except Exception as e:
+                if log_fn:
+                    log_fn("WARN", f"  Skipped {child.name}: {e}")
+    return items
+
+
 class GameItem:
     def __init__(self, path: Path):
         self.path       = path
@@ -2906,6 +2941,41 @@ class App:
         # After the UI is fully loaded, remind user to report any untested games
         self.root.after(4000, self._check_pending_compat_reports)
 
+    def _restore_window_geometry(self):
+        """Reapply the last saved window position/size, if it looks valid."""
+        geo = (getattr(self, "_saved_window_geometry", "") or "").strip()
+        if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geo):
+            try:
+                self.root.geometry(geo)
+            except Exception:
+                pass
+
+    def _on_window_configure(self, event):
+        """Debounced: persist the window geometry shortly after a move/resize so
+        the position survives any quit path (close button, Cmd-Q, …)."""
+        if event.widget is not self.root:
+            return
+        if getattr(self, "_geo_save_after", None):
+            try:
+                self.root.after_cancel(self._geo_save_after)
+            except Exception:
+                pass
+        self._geo_save_after = self.root.after(800, self._save_window_geometry)
+
+    def _save_window_geometry(self):
+        self._geo_save_after = None
+        try:
+            save_settings({"window_geometry": self.root.geometry()})
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_window_geometry()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _setup(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
@@ -2919,7 +2989,7 @@ class App:
         self._saved_auto_clear_temp = settings.get("auto_clear_temp", False)
         self._saved_compression_level = settings.get("compression_level", 7)
         self._saved_cpu_count = settings.get("cpu_count", 0)
-        self._saved_block_size = settings.get("block_size", "auto")
+        self._saved_block_size = settings.get("block_size", "auto-fit")
         # Global, auto-tried archive password list. Seed once with the most
         # common PS5-scene password so it never has to be typed again. `is None`
         # (not falsiness) so an intentionally-emptied list is not re-seeded.
@@ -2929,6 +2999,12 @@ class App:
             save_settings({"archive_passwords": self._saved_passwords})
         # Folder bundles: copy DLC/extra files next to the .ffpfsc (default on).
         self._saved_copy_siblings = settings.get("copy_bundle_siblings", True)
+        # Remember the window position/size across launches.
+        self._saved_window_geometry = settings.get("window_geometry", "")
+        self._geo_save_after = None
+        self._restore_window_geometry()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._on_window_configure, add="+")
 
     def _show_first_run_wizard(self):
         wiz = FirstRunWizard(self.root)
@@ -3894,8 +3970,16 @@ class App:
                                    "the folder will be recreated at the destination with the extras alongside.")
                     self.scan_q.put(("ok", GameItem.from_bundle(p, game, siblings)))
                     return
-                if len(all_games) > 1:
-                    self.log("WARN", f"{len(all_games)} games found in this folder — adding them individually.")
+                # 0b. Library: each immediate subfolder holds its own game →
+                #     one bundle per subfolder (each recreated at the destination
+                #     with only the .ffpfsc plus extras inside). Covers "select
+                #     /…/PS5 Spiele and convert every game".
+                lib = scan_parent_for_bundles(p, cand_pw, self.log)
+                if lib:
+                    self.log("OK", f"Library scan: {len(lib)} game folder(s) found — each will be "
+                                   "mirrored at the destination.")
+                    self.scan_q.put(("bundles", lib))
+                    return
 
                 # 1. Look for extracted game folders first
                 self.log("INFO", "Looking for PS5 game folders…")
@@ -4345,11 +4429,12 @@ class App:
         # FOLDER. The backend honours an explicit .ffpfsc path (it only auto-names
         # by title id when handed a directory). Batch keeps per-title-id names;
         # an explicit .ffpfsc the user typed is respected as-is.
+        sub = getattr(item, "bundle_subfolder", None)
         if (getattr(item, "operation", "pack") == "pack"
-                and not self.batch_var.get()
-                and out.suffix.lower() != ".ffpfsc"):
-            # Bundle: recreate the source folder under the output dir.
-            sub = getattr(item, "bundle_subfolder", None)
+                and out.suffix.lower() != ".ffpfsc"
+                and (sub or not self.batch_var.get())):
+            # Bundle: recreate the source folder under the output dir. Bundle
+            # naming applies even in batch (each item has its own subfolder).
             base = (out / sanitize_filename(sub)) if sub else out
             try:
                 out = base / descriptive_ffpfsc_name(item)
@@ -5284,6 +5369,33 @@ class App:
                     if self.pending_start:
                         self.pending_start = False
                         self.start()
+
+                elif status == "bundles":
+                    # Library scan: one bundle per game subfolder, each mirrored.
+                    items: list = payload
+                    count = len(items)
+                    preview = "\n".join(f"  • {getattr(it, 'bundle_subfolder', it.name)}" for it in items[:12])
+                    if count > 12:
+                        preview += f"\n  … and {count - 12} more"
+                    proceed = count == 1 or messagebox.askyesno(
+                        f"Found {count} Games",
+                        f"Found {count} game folder(s):\n\n{preview}\n\n"
+                        f"Convert all {count}? Each keeps its own folder at the destination, "
+                        "with any extras/DLCs next to the .ffpfsc."
+                    )
+                    if proceed:
+                        for it in items:
+                            self.queue.append(it)
+                        self.update_queue_box(select_item=items[0] if items else None)
+                        self.log("OK", f"Queued {count} game folder(s) — each mirrored at the destination.")
+                        self.status_update("Ready", f"{count} game(s) added to queue.",
+                                            "Ready", 0, 0, "00:00", "—", "—")
+                        if self.pending_start:
+                            self.pending_start = False
+                            self.start()
+                    else:
+                        self.status_update("Ready", "Batch add cancelled.", "Ready", 0, 0, "00:00", "—", "—")
+                        self.pending_start = False
 
                 elif status == "multi_found":
                     # Multiple extracted game folders discovered

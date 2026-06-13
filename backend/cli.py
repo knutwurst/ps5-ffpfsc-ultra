@@ -279,10 +279,17 @@ def pack_folder_uncompressed(
     if verbose:
         cmd.append("--verbose")
     if verify_enabled:
-        print("[INFO] MkPFS post-build verify is ENABLED. This is slower and may use more RAM.", flush=True)
+        print("[INFO] Post-pack verify is ENABLED (full check against the source folder — slower, more RAM).", flush=True)
         cmd.append("--verify")
     else:
-        print("[INFO] MkPFS post-build verify is disabled by default to avoid MemoryError on some systems.", flush=True)
+        # "Verify Output" off → skip the post-pack verify entirely. Without this,
+        # mkpfs runs its DEFAULT structure verify, which still compares the image's
+        # file list against the source folder and fails the whole build on a single
+        # discrepancy (a stray .DS_Store, an empty file, an extraction artifact) —
+        # verification the user never asked for. The final .ffpfsc still gets a cheap
+        # internal structure check in the compress pass.
+        print("[INFO] Post-pack verify is off (enable 'Verify Output' to check against the source). Skipping it.", flush=True)
+        cmd.append("--no-verify-structure")
     cmd += [str(game_folder), str(pfs_path)]
     print(f"[INFO] Running: {' '.join(cmd)}", flush=True)
     try:

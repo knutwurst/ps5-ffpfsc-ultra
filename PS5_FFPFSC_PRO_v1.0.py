@@ -7,6 +7,7 @@ import sys
 import time
 import json
 import queue
+import hashlib
 import zipfile
 import threading
 import subprocess
@@ -91,7 +92,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -238,6 +239,25 @@ def same_drive(path_a: Path, path_b: Path) -> bool:
 
 def estimate_peak_space_needed(game_size: int, same_temp_output_drive: bool = True) -> int:
     return int(game_size * (2.20 if same_temp_output_drive else 1.20))
+
+
+def estimate_output_space_needed(game_size: int) -> int:
+    """Worst-case free space the OUTPUT drive must have for the final .ffpfsc.
+    A non-compressing title (PFSC gain ~0%, e.g. already-compressed game assets)
+    produces a container roughly the size of the source; +5% covers block
+    alignment and container headers."""
+    return int(game_size * 1.05)
+
+
+def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
+    """True only if BOTH drives have room: the temp drive for the uncompressed
+    image (and, on a shared drive, the final container too via the 2.20x peak),
+    and — when output is on a different drive — the output drive for the
+    full-size final .ffpfsc."""
+    same = same_drive(temp_dir, out_dir)
+    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(item.size, same)
+    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(item.size)
+    return temp_ok and out_ok
 
 
 def get_folder_size(path: Path) -> int:
@@ -400,8 +420,21 @@ def validate_game_structure(path: Path) -> list[str]:
     return warnings
 
 
-# Maps log keywords → user-friendly cause + fix
+# Maps log keywords → user-friendly cause + fix.
+# Order matters: smart_error_from_log() returns the FIRST keyword found in the
+# log, so the most specific causes (post-pack verify mismatches) come first —
+# otherwise an incidental keyword like "memoryerror" elsewhere in the output
+# would mask the real diagnosis.
 _ERROR_PATTERNS: list[tuple[str, str]] = [
+    ("missing in image",
+     "Verify failed: a file in the source folder is missing from the packed image.\n"
+     "Open the Logs tab and search for 'missing in image:' to see the exact file."),
+    ("extra in image",
+     "Verify failed: the image contains a file that is not in the source folder.\n"
+     "Open the Logs tab and search for 'extra in image:' to see the exact file."),
+    ("flat_path_table",
+     "Verify failed: the image's path table does not match the source tree.\n"
+     "See the Logs tab for the mismatching entry."),
     ("unable to stage source file",
      "Temp drive does not support hardlinks or symlinks.\n"
      "Fix: use a temp folder on an NTFS-formatted SSD/NVMe."),
@@ -410,7 +443,7 @@ _ERROR_PATTERNS: list[tuple[str, str]] = [
      "Fix: use a temp folder on an NTFS-formatted SSD/NVMe."),
     ("memoryerror",
      "Not enough RAM during compression.\n"
-     "Fix: close other apps, or disable 'Verify Output'."),
+     "Fix: lower CPU cores to 2 or 1, or set compression Level to 5."),
     ("no space left on device",
      "Drive ran out of space mid-compression.\n"
      "Fix: free up space on the temp or output drive."),
@@ -930,7 +963,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
     def __init__(self, parent, item, temp_dir: Path, out_dir: Path):
         super().__init__(parent)
         self.title("Drive Space Diagnostics")
-        self.geometry("520x450")
+        self.geometry("520x520")
         self.resizable(False, False)
         self.configure(fg_color=BLACK)
         self.proceed = False
@@ -943,9 +976,8 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         self.lift()
         self.focus_force()
         self.after(50, self.grab_set)
-        # Auto-proceed after 4 s when space is sufficient
-        if get_free_space(temp_dir) >= estimate_peak_space_needed(
-                item.size, same_drive(temp_dir, out_dir)):
+        # Auto-proceed after 4 s only when BOTH temp and output drives have room
+        if _space_preflight_ok(item, temp_dir, out_dir):
             self._countdown = 4
             self.after(1000, self._tick_countdown)
 
@@ -964,6 +996,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         out_free    = get_free_space(out_dir)
         same        = same_drive(temp_dir, out_dir)
         peak_needed = estimate_peak_space_needed(item.size, same)
+        out_needed  = estimate_output_space_needed(item.size)
         final_est   = int(item.size * 0.55)
         temp_fs     = get_filesystem_type(temp_dir)   # fast ctypes call
         out_fs      = get_filesystem_type(out_dir)
@@ -978,15 +1011,21 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
             if status == "warn": return YELLOW
             return WHITE
 
-        space_ok = temp_free >= peak_needed
+        temp_ok  = temp_free >= peak_needed
+        out_ok   = same or out_free >= out_needed
+        space_ok = temp_ok and out_ok
 
         static_rows = [
             ("Game Size",          format_size(item.size),                  None),
-            ("Temp Drive Free",    format_size(temp_free),                  None),
-            ("Output Drive Free",  format_size(out_free),                   None),
-            ("Est. Peak Required", format_size(peak_needed),
-             "ok" if space_ok else "warn"),
-            ("Est. Final Output",  f"~{format_size(final_est)} (typical)",  None),
+            ("Temp Drive Free",    format_size(temp_free),
+             "ok" if temp_ok else "warn"),
+            ("Temp Needs (image)", format_size(peak_needed),                None),
+            ("Output Drive Free",  format_size(out_free),
+             None if same else ("ok" if out_ok else "warn")),
+            ("Output Needs (≈full)",
+             "— (= temp drive)" if same else format_size(out_needed),
+             None if same else ("ok" if out_ok else "warn")),
+            ("Est. Final Output",  f"~{format_size(final_est)} – {format_size(item.size)}", None),
             ("Temp Filesystem",    temp_fs,    _fs_status(temp_fs)),
             ("Output Filesystem",  out_fs,     _fs_status(out_fs)),
         ]
@@ -1011,7 +1050,12 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         self._dt_label.grid(row=0, column=1, sticky="e")
 
         # ── Space result banner ────────────────────────────────────────────────
-        result_text  = "✓  Enough space to proceed." if space_ok else "⚠  Not enough space — compression may fail."
+        if space_ok:
+            result_text = "✓  Enough space to proceed."
+        elif not temp_ok:
+            result_text = "⚠  Temp drive low — packing may fail mid-run."
+        else:
+            result_text = "⚠  Output drive low — the final .ffpfsc may not fit (≈full size at 0% gain)."
         result_color = ("#1a7a40", "#4ade80") if space_ok else YELLOW
         ctk.CTkLabel(panel, text=result_text, text_color=result_color,
                       font=ctk.CTkFont(size=13, weight="bold")
@@ -1399,7 +1443,13 @@ class ArchiveExtractor:
         """Extract *archive* under *dest_root/<stem>* and return the extracted root.
         progress_fn(pct, filename) is called periodically.
         password is used for encrypted archives (ZIP/RAR/7z)."""
-        dest = dest_root / archive.stem
+        # Unique per-archive subfolder. Two queued archives that share a stem
+        # (Game.zip + Game.rar, or same-named releases from different folders)
+        # must not extract into — and rmtree — each other's tree. The digest of
+        # the absolute path keeps it stable, so re-extracting the same archive
+        # reuses (and refreshes) its own folder.
+        digest = hashlib.sha1(str(archive.resolve()).encode("utf-8", "replace")).hexdigest()[:8]
+        dest = dest_root / f"{archive.stem}__{digest}"
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.mkdir(parents=True, exist_ok=True)
@@ -1960,6 +2010,17 @@ class ArchiveExtractor:
 SCENE_JUNK_EXTS = {".nfo", ".sfv", ".txt", ".diz", ".url", ".md5", ".sha1",
                    ".srr", ".jpg", ".jpeg", ".png", ".gif", ".db"}
 
+# OS/Finder/archiver metadata that must never enter the image OR be copied to the
+# destination. The mkpfs backend filters the same set inside the image
+# (pfs.is_fs_junk); this GUI copy path is a separate process, so it carries its own.
+FS_JUNK_NAMES = {".DS_Store", ".localized", ".VolumeIcon.icns", ".apdisk",
+                 "Thumbs.db", "ehthumbs.db", "desktop.ini"}
+
+
+def is_fs_junk_name(name: str) -> bool:
+    """True for macOS/Windows filesystem junk (by basename). '._*' = AppleDouble."""
+    return name in FS_JUNK_NAMES or name.startswith("._")
+
 
 def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
     """Inspect *folder* for the 'game + extras' layout.
@@ -2037,7 +2098,8 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
 
     siblings = [f for f in files
                 if f.resolve() not in game_volume_set
-                and f.suffix.lower() not in SCENE_JUNK_EXTS]
+                and f.suffix.lower() not in SCENE_JUNK_EXTS
+                and not is_fs_junk_name(f.name)]
     return game, siblings, games
 
 
@@ -4517,6 +4579,45 @@ class App:
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() != ".ffpfsc" else out.parent, temp
 
+    def _cleanup_after_failure(self, item) -> None:
+        """Reclaim a failed run's temp artifacts so large leftovers don't stack up:
+        the mkpfs tmp* working dirs (the orphaned uncompressed image) and THIS item's
+        own _extracted source subdir. Identified by path, so it never removes another
+        queued item's source or a real (non-temp) game folder. Runs in a background
+        thread (rmtree of a ~150 GB tree must not freeze the UI)."""
+        tp = self.temp_var.get().strip()
+        if not tp:
+            return
+        temp_dir = Path(tp)
+        if not temp_dir.exists():
+            return
+
+        def _work():
+            freed = 0
+            try:
+                for p in temp_dir.iterdir():
+                    if p.is_dir() and p.name.lower().startswith("tmp"):
+                        sz = get_folder_size(p)
+                        shutil.rmtree(str(p), ignore_errors=True)
+                        freed += sz
+            except Exception:
+                pass
+            try:
+                ex_root = (temp_dir / "_extracted").resolve()
+                src = Path(getattr(item, "path", "") or "").resolve()
+                if ex_root in src.parents:
+                    own = ex_root / src.relative_to(ex_root).parts[0]
+                    if own.exists():
+                        sz = get_folder_size(own)
+                        shutil.rmtree(str(own), ignore_errors=True)
+                        freed += sz
+            except Exception:
+                pass
+            if freed:
+                self.log("INFO", f"Cleaned {format_size(freed)} of temp data from the failed run.")
+
+        threading.Thread(target=_work, daemon=True).start()
+
     # ── Feature 5: Auto-clear temp ────────────────────────────────────────────
     def _auto_clear_temp(self):
         """Silently clear temp folder contents after a successful compression."""
@@ -4675,7 +4776,25 @@ class App:
         # Stale temp data warning
         try:
             if getattr(item, "operation", "pack") != "unpack" and temp_dir.exists():
-                stale_items = [p for p in temp_dir.iterdir() if p.name.lower().startswith("tmp")]
+                # Count ALL leftover temp data — mkpfs tmp* working dirs AND old
+                # _extracted game trees — but never the CURRENT item's own source,
+                # which legitimately lives under <temp>/_extracted right now.
+                cur_src = None
+                try:
+                    ex_root = (temp_dir / "_extracted").resolve()
+                    src = Path(getattr(item, "path", "") or "").resolve()
+                    if ex_root in src.parents:
+                        cur_src = ex_root / src.relative_to(ex_root).parts[0]
+                except Exception:
+                    cur_src = None
+                stale_items = []
+                for p in temp_dir.iterdir():
+                    if p.name == "_extracted" and p.is_dir():
+                        for child in p.iterdir():
+                            if cur_src is None or child.resolve() != cur_src:
+                                stale_items.append(child)
+                    elif p.name.lower().startswith("tmp"):
+                        stale_items.append(p)
                 if stale_items:
                     stale_size = sum(folder_size(p) for p in stale_items)
                     if stale_size > 1024 * 1024 * 1024:
@@ -5478,6 +5597,9 @@ class App:
                         self.update_queue_box()
                         self.status_update("Ready", f"{count} disk image(s) added to queue.",
                                             "Ready", 0, 0, "00:00", "—", "—")
+                        if self.pending_start:
+                            self.pending_start = False
+                            self.start()
                     else:
                         self.status_update("Ready", "Image add cancelled.", "Ready", 0, 0, "00:00", "—", "—")
                         self.pending_start = False
@@ -5503,6 +5625,9 @@ class App:
                         self.update_queue_box()
                         self.status_update("Ready", f"{count} archive(s) added to queue.",
                                             "Ready", 0, 0, "00:00", "—", "—")
+                        if self.pending_start:
+                            self.pending_start = False
+                            self.start()
                     else:
                         self.status_update("Ready", "Archive add cancelled.", "Ready", 0, 0, "00:00", "—", "—")
                         self.pending_start = False
@@ -5526,6 +5651,9 @@ class App:
                         self.update_queue_box()
                         self.status_update("Ready", f"{count} PFS image(s) added to queue.",
                                             "Ready", 0, 0, "00:00", "—", "—")
+                        if self.pending_start:
+                            self.pending_start = False
+                            self.start()
                     else:
                         self.status_update("Ready", "PFS image add cancelled.", "Ready", 0, 0, "00:00", "—", "—")
                         self.pending_start = False
@@ -5709,6 +5837,8 @@ class App:
                 self.status_update("Failed", msg, "Failed", 0, 0, "—", "—", "—")
                 self.log("ERROR", msg)
                 self.play_complete_sound(False)
+                if completed_item is not None:
+                    self._cleanup_after_failure(completed_item)
                 log_lines = get_last_log_lines(50)
                 ErrorDialog(self.root, msg, last_cmd, log_lines)
         except queue.Empty:

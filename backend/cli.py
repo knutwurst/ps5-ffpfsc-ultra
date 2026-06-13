@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 
@@ -298,6 +299,48 @@ def pack_folder_uncompressed(
         _mkpfs_error_hint(e, pfs_path)
         sys.exit(1)
     print(f"[OK] Uncompressed PFS creation complete: {pfs_path}")
+
+
+def _looks_incompressible(path: Path, *, samples: int = 24, chunk: int = 1 << 20,
+                          min_gain_pct: float = 2.0) -> bool:
+    """Cheap heuristic: sample ~`samples` x `chunk` bytes spread across `path`,
+    zlib-compress them, and return True if the aggregate gain is below
+    `min_gain_pct`%.
+
+    Used to skip the expensive deflate on already-compressed games: when the inner
+    image barely shrinks, the .ffpfsc would store every block raw anyway (the per-
+    block threshold rejects non-shrinking blocks), so a level-0 pass produces the
+    same container far faster. Conservative by design — on any error, a small file,
+    or genuine compressibility it returns False (i.e. compress normally), so the
+    worst case is a slightly-larger-but-correct file, never a broken one."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size < 64 * (1 << 20):   # small images: just compress normally
+        return False
+    raw_total = 0
+    comp_total = 0
+    try:
+        with path.open("rb") as fh:
+            step = max(chunk, size // max(1, samples))
+            offset = 0
+            taken = 0
+            while offset < size and taken < samples:
+                fh.seek(offset)
+                buf = fh.read(chunk)
+                if not buf:
+                    break
+                raw_total += len(buf)
+                comp_total += len(zlib.compress(buf, 6))
+                taken += 1
+                offset += step
+    except OSError:
+        return False
+    if raw_total == 0:
+        return False
+    gain_pct = (1.0 - comp_total / raw_total) * 100.0
+    return gain_pct < min_gain_pct
 
 
 def compress_file_to_ffpfsc(
@@ -573,7 +616,14 @@ def main() -> None:
                     **pack_kwargs,
                 )
             else:
-                # Game folder: pack uncompressed PFS, then compress → .ffpfsc
+                # Game folder: build an UNCOMPRESSED inner PFS image, then wrap it in a
+                # compressed PFSC container (.ffpfsc). This two-pass "wrapper" flow is
+                # REQUIRED, not an inefficiency: packing a game folder directly with
+                # per-file PFSC compression (single-pass "pack folder --compress") builds
+                # a valid-looking, locally-verifiable image that the PS5 console MISREADS
+                # (upstream MkPFS issue #49 — see the warning in backend/mkpfs/cli.py). A
+                # green local build/verify is NOT proof of console correctness, so never
+                # "optimize" this into single-pass to save the temp intermediate.
                 with tempfile.TemporaryDirectory(dir=user_temp) as temp_dir:
                     temp_pfs = Path(temp_dir) / f"{title_id}.ffpfs"
 
@@ -583,16 +633,35 @@ def main() -> None:
                         temp_folder=Path(temp_dir),
                         **pack_kwargs,
                     )
+
+                    # Incompressible-image fast path: if the inner image barely shrinks
+                    # (already-compressed game assets — common; gain ~0%), pass 2 at
+                    # compression-level 0 stores every block raw, which is exactly what the
+                    # per-block threshold produces for incompressible data anyway. Same
+                    # .ffpfsc, but without spending CPU on millions of futile deflate
+                    # attempts over a ~150 GB image.
+                    pass2_kwargs = dict(pack_kwargs)
+                    if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
+                        print("[INFO] Inner image sampled as incompressible — storing without "
+                              "compression (level 0) to skip wasted CPU; the .ffpfsc is the same "
+                              "size either way.", flush=True)
+                        pass2_kwargs["compression_level"] = 0
                     compress_file_to_ffpfsc(
                         temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                         temp_folder=Path(temp_dir),
-                        **pack_kwargs,
+                        **pass2_kwargs,
                     )
 
                     if args.keep_pfs:
                         saved = current_ffpfs_path.parent / f"{title_id}.ffpfs"
                         print(f"[INFO] Saving intermediate PFS image to {saved}...")
-                        shutil.copy2(temp_pfs, saved)
+                        # move (not copy): pass 2 already consumed temp_pfs, and the
+                        # TemporaryDirectory is about to delete it — relocating frees the
+                        # SSD copy instead of leaving it to be wiped.
+                        try:
+                            shutil.move(str(temp_pfs), str(saved))
+                        except Exception as e:
+                            print(f"[WARN] Could not save intermediate PFS image: {e}")
 
     print("\n[SUCCESS] All operations completed successfully!")
 

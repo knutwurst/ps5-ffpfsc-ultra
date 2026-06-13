@@ -1589,7 +1589,10 @@ def _encode_pfsc_file_to_spool(
                 progress_callback=progress_callback,
             )
             spool_file.truncate(stored_size)
-    except OSError:
+    except BaseException:
+        # Clean up the partial spool on ANY failure (OSError, MemoryError,
+        # zlib.error, KeyboardInterrupt) so a failed/cancelled compression does
+        # not leak a half-written spool file on the temp drive.
         with suppress(OSError):
             spool_path.unlink()
         raise

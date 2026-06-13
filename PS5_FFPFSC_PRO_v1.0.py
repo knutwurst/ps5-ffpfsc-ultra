@@ -92,7 +92,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -2433,8 +2433,8 @@ class CLIWorker(threading.Thread):
                 for w in self._validate_shadowmount():
                     self.app.log("WARN", w)
             self._write_report(True)
-            if self.operation != "unpack":
-                self.app.add_history(self.item, self.output_path, self.final_size, time.time() - self.start_time)
+            # NOTE: history is recorded on the MAIN thread in the done_q handler
+            # (add_history mutates Tk widgets, which are not thread-safe).
             success_msg = "Extraction completed successfully." if self.operation == "unpack" else "Compression completed successfully."
             self.app.finish(True, success_msg, self.last_cmd_str)
         except Exception as e:
@@ -3028,9 +3028,23 @@ class App:
         self.root.after(4000, self._check_pending_compat_reports)
 
     def _restore_window_geometry(self):
-        """Reapply the last saved window position/size, if it looks valid."""
+        """Reapply the last saved window position/size, if valid. Vertically clamp so
+        the title bar can never restore above the screen (e.g. hidden under the macOS
+        menu bar) or absurdly off-screen. Horizontal position is left intact so an
+        external-monitor placement is respected."""
         geo = (getattr(self, "_saved_window_geometry", "") or "").strip()
-        if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geo):
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geo)
+        if m:
+            try:
+                w, h, x, y = (int(m.group(i)) for i in range(1, 5))
+                if abs(x) > 20000 or abs(y) > 20000:
+                    return  # corrupt coordinates — let the default geometry stand
+                sh = self.root.winfo_screenheight()
+                y = max(0, min(y, max(0, sh - 80)))   # keep the title bar grabbable
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
+        elif re.fullmatch(r"\d+x\d+", geo):
             try:
                 self.root.geometry(geo)
             except Exception:
@@ -3070,13 +3084,14 @@ class App:
         return v
 
     def _setup(self):
-        ctk.set_appearance_mode("dark")
+        settings = load_settings()
+        self._theme = settings.get("appearance_mode", "dark")
+        ctk.set_appearance_mode(self._theme)
         ctk.set_default_color_theme("green")
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry("1400x960")
         self.root.minsize(1100, 760)
 
-        settings = load_settings()
         self._saved_output = settings.get("output_folder", "")
         self._saved_temp = settings.get("temp_folder", "")
         self._saved_auto_clear_temp = settings.get("auto_clear_temp", False)
@@ -3177,6 +3192,10 @@ class App:
         self.source_var = tk.StringVar()
         self.output_var = tk.StringVar(value=self._saved_output)
         self.temp_var = tk.StringVar(value=self._saved_temp)
+        # Persist typed/browsed paths so they survive a restart (previously only
+        # browsed paths that happened to be saved elsewhere stuck).
+        self.output_var.trace_add("write", lambda *_: save_settings({"output_folder": self.output_var.get()}))
+        self.temp_var.trace_add("write", lambda *_: save_settings({"temp_folder": self.temp_var.get()}))
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
@@ -3196,6 +3215,11 @@ class App:
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
         self.verbose_var           = self._persisted_bool(settings, "verbose", False)
         self.block_size_var        = tk.StringVar(value=self._saved_block_size)
+        # Persist the main-window tuning controls on change (previously only the
+        # Settings window saved these, so edits made in the main window were lost).
+        self.compression_level_var.trace_add("write", lambda *_: save_settings({"compression_level": self.compression_level_var.get()}))
+        self.cpu_count_var.trace_add("write", lambda *_: save_settings({"cpu_count": self.cpu_count_var.get()}))
+        self.block_size_var.trace_add("write", lambda *_: save_settings({"block_size": self.block_size_var.get()}))
 
         # ── Top folder row ───────────────────────────────────────────────────
         top = self.panel(main, row=1, column=0, sticky="ew", padx=18, pady=8)
@@ -3772,6 +3796,7 @@ class App:
     def _toggle_theme(self):
         self._theme = "light" if self._theme == "dark" else "dark"
         ctk.set_appearance_mode(self._theme)
+        save_settings({"appearance_mode": self._theme})
         # No manual recoloring needed — all color constants are (light, dark) tuples
         # so CTk picks the correct value automatically on appearance mode change.
 
@@ -4630,6 +4655,10 @@ class App:
         freed = 0
         errors = 0
         for p in list(temp_dir.iterdir()):
+            # Only remove THIS app's working data (mkpfs tmp* dirs and the _extracted
+            # tree); never wipe unrelated files a user may keep in their temp folder.
+            if not (p.name.lower().startswith("tmp") or p.name == "_extracted"):
+                continue
             try:
                 sz = get_folder_size(p) if p.is_dir() else (p.stat().st_size if p.is_file() else 0)
                 if p.is_dir():
@@ -4656,6 +4685,18 @@ class App:
 
     def _batch_auto_start(self):
         """Start the next game in the queue — rechecks disk space before each game."""
+        # Honor a cancel requested during the 600 ms advance gap (cancel_requested is
+        # reset below, so a dropped cancel would otherwise silently keep the batch going).
+        if self.cancel_requested or self.extract_cancel_event.is_set():
+            self._batch_running = False
+            self.cancel_requested = False
+            self.extract_cancel_event.clear()
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self._update_batch_counter()
+            self.status_update("Ready", "Batch cancelled.", "Ready", 0, 0, "00:00", "—", "—")
+            self.log("WARN", "Batch cancelled by user.")
+            return
         if not self.queue:
             self._batch_running = False
             self.start_btn.configure(state="normal")
@@ -4808,11 +4849,15 @@ class App:
         except Exception:
             pass
 
-        # Initialise batch counters on a fresh (non-auto-advance) start
-        self._batch_total   = len(self.queue)
-        self._batch_done    = 0
-        self._batch_failed  = 0
-        self._batch_running = self._batch_total > 0
+        # Initialise batch counters only for a FRESH start. An archive item re-enters
+        # start() after extraction (the _extract_q "ok" handler calls start() again);
+        # re-running this block then would wipe a running batch's progress and skip the
+        # Batch Complete dialog for all-archive batches.
+        if not self._batch_running:
+            self._batch_total   = len(self.queue)
+            self._batch_done    = 0
+            self._batch_failed  = 0
+            self._batch_running = self._batch_total > 0
         self._update_batch_counter()
 
         self._last_cmd_str = " ".join(cmd)
@@ -5768,13 +5813,28 @@ class App:
                 self.status_update("Ready", str(payload), "Ready", 0, 0, "00:00", "—", "—")
                 self.log("WARN", str(payload))
             else:
-                # Extraction failed — re-enable start, show error
-                self.start_btn.configure(state="normal")
-                self.cancel_btn.configure(state="disabled")
+                # Extraction failed — pop the stuck archive so the queue doesn't freeze,
+                # then continue or end the batch like a pack failure.
                 if self.queue:
                     self.queue[0].status = "Failed"
-                    self.update_queue_box()
-                messagebox.showerror("Extraction Failed", payload)
+                    self.queue.pop(0)
+                self._batch_failed += 1
+                self.update_queue_box()
+                self.log("ERROR", f"Extraction failed: {payload}")
+                if self._batch_running and self.queue:
+                    self.log("WARN", "Continuing batch with the next item after extraction failure.")
+                    self._refresh_space_for_item(self.queue[0])
+                    self.root.after(600, self._batch_auto_start)
+                else:
+                    self._batch_running = False
+                    self.pending_start = False
+                    self.start_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self._update_batch_counter()
+                    if self._batch_total > 1:
+                        self._show_batch_complete()
+                    else:
+                        messagebox.showerror("Extraction Failed", str(payload))
         except queue.Empty:
             pass
 
@@ -5800,6 +5860,17 @@ class App:
                 completed_operation = getattr(completed_item, "operation", "pack") if completed_item else "pack"
                 if completed_operation != "unpack":
                     self._compat_autofill(item=completed_item, final_size=_final_sz)
+                    # Record history HERE (main thread) — add_history mutates Tk widgets.
+                    try:
+                        _w = self.worker
+                        self.add_history(
+                            completed_item,
+                            getattr(_w, "output_path", "") if _w else "",
+                            _final_sz,
+                            (time.time() - _w.start_time) if (_w and getattr(_w, "start_time", None)) else 0.0,
+                        )
+                    except Exception as e:
+                        self.log("WARN", f"Could not record history: {e}")
 
                 # Feature 5: auto-clear temp after success
                 if self.auto_clear_temp_var.get():
@@ -5827,20 +5898,42 @@ class App:
                 # Prompt user to share compatibility data
                 if completed_operation != "unpack":
                     self.root.after(400, lambda: self._prompt_compat_share(completed_item, _final_sz))
-            else:
-                self._batch_failed += 1
+            elif self.cancel_requested or self.extract_cancel_event.is_set():
+                # A user cancel surfaces here as a failed result — treat it as a cancel,
+                # not a failure: stop the batch and don't inflate the failed count.
                 self._batch_running = False
+                self.cancel_requested = False
+                self.extract_cancel_event.clear()
+                self.update_queue_box()
                 self.start_btn.configure(state="normal")
                 self.cancel_btn.configure(state="disabled")
-                self.update_queue_box()
                 self._update_batch_counter()
+                self.status_update("Ready", "Cancelled by user.", "Ready", 0, 0, "00:00", "—", "—")
+                self.log("WARN", "Cancelled by user.")
+            else:
+                self._batch_failed += 1
+                self.update_queue_box()
                 self.status_update("Failed", msg, "Failed", 0, 0, "—", "—", "—")
                 self.log("ERROR", msg)
                 self.play_complete_sound(False)
                 if completed_item is not None:
                     self._cleanup_after_failure(completed_item)
-                log_lines = get_last_log_lines(50)
-                ErrorDialog(self.root, msg, last_cmd, log_lines)
+                # Batch resilience: one failure must not abort the rest of the queue.
+                if self._batch_running and self.queue:
+                    self.log("WARN", "Continuing batch with the next item after failure.")
+                    self._refresh_space_for_item(self.queue[0])
+                    self.root.after(600, self._batch_auto_start)
+                else:
+                    self._batch_running = False
+                    self.start_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self._update_batch_counter()
+                    if self._batch_total > 1:
+                        # Aggregate (done/failed) is reported here; no modal per failure.
+                        self._show_batch_complete()
+                    else:
+                        log_lines = get_last_log_lines(50)
+                        ErrorDialog(self.root, msg, last_cmd, log_lines)
         except queue.Empty:
             pass
 

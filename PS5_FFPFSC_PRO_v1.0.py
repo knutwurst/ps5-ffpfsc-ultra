@@ -91,7 +91,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3108,6 +3108,7 @@ class App:
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
         self.copy_siblings_var = tk.BooleanVar(value=getattr(self, "_saved_copy_siblings", True))
+        settings = load_settings()   # _build() is a separate method from _setup()
         self.keep_pfs_var        = self._persisted_bool(settings, "keep_pfs", False)
         self.open_output_var     = self._persisted_bool(settings, "open_output", False)
         self.summary_popup_var   = self._persisted_bool(settings, "summary_popup", True)

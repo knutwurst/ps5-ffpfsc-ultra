@@ -606,9 +606,9 @@ def main() -> None:
 
     # ── PATCH MODE: overlay loose patch files onto a game, then (re)pack ──────────
     if args.patch:
-        patch_dir = Path(args.patch).resolve()
-        if not patch_dir.exists():
-            print(f"[ERROR] Patch source not found: {patch_dir}")
+        patch_arg = Path(args.patch).resolve()
+        if not patch_arg.exists():
+            print(f"[ERROR] Patch source not found: {patch_arg}")
             sys.exit(1)
         if ffpfs_path.exists() and not args.overwrite:
             print(f"[ERROR] Output already exists: {ffpfs_path}  (use --overwrite)")
@@ -620,9 +620,30 @@ def main() -> None:
             block_size=args.block_size,
             verbose=args.verbose,
         )
-        print(f"[INFO] PATCH MODE: overlay '{patch_dir.name}' onto '{game_folder.name}'", flush=True)
+        print(f"[INFO] PATCH MODE: overlay '{patch_arg.name}' onto '{game_folder.name}'", flush=True)
         with tempfile.TemporaryDirectory(dir=user_temp) as td:
             td = Path(td)
+            # The patch may arrive as an archive (auto-patch hands a sibling RAR/ZIP
+            # straight through). Extract zip/rar here; a folder is used as-is. A 7z
+            # patch is left to the GUI to pre-extract.
+            patch_dir = patch_arg
+            if patch_arg.is_file() and patch_arg.suffix.lower() in (".zip", ".rar"):
+                patch_dir = td / "_patch"
+                patch_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[INFO] Extracting patch archive '{patch_arg.name}'...", flush=True)
+                if patch_arg.suffix.lower() == ".zip":
+                    with zipfile.ZipFile(patch_arg) as zf:
+                        zf.extractall(patch_dir, pwd=args.password.encode() if args.password else None)
+                else:
+                    first = patch_arg
+                    m = re.match(r"^(?P<b>.*\.part)(?P<n>\d+)(?P<e>\.rar)$", patch_arg.name, re.I)
+                    if m:
+                        cand = patch_arg.with_name(f"{m.group('b')}{'1'.zfill(len(m.group('n')))}{m.group('e')}")
+                        if cand.exists():
+                            first = cand
+                    from unrar import rarfile
+                    with rarfile.RarFile(first, pwd=args.password or None) as rf:
+                        rf.extractall(str(patch_dir))
             if game_folder.is_file() and game_folder.suffix.lower() == ".ffpfsc":
                 print("[INFO] Unpacking the existing .ffpfsc to patch it (outer → inner → files)...", flush=True)
                 outer = td / "_outer"

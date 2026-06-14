@@ -252,6 +252,25 @@ def _locate_mkpfs() -> tuple[list[str], str | None]:
 # MkPFS wrappers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _assert_pass2_spool_space(image_path, temp_dir) -> None:
+    """Before pass-2 PFSC compression — which spools roughly the image size into
+    *temp_dir* — make sure the temp drive can hold it. If not, exit non-zero with a
+    distinct, parseable message BEFORE mkpfs starts. Call this INSIDE the enclosing
+    TemporaryDirectory block so its unwind reclaims the inner image, instead of letting
+    mkpfs crash mid-write and strand a ~150 GB image (the Crimson Desert failure)."""
+    try:
+        need = int(Path(image_path).stat().st_size * 1.10)
+        free = shutil.disk_usage(str(temp_dir)).free
+    except Exception:
+        return
+    if free < need:
+        g = 1024 ** 3
+        print(f"[ERROR] Insufficient temp space for pass-2 spool: need ~{need // g} GiB, "
+              f"have {free // g} GiB in {temp_dir}. Point --temp-dir at a drive with more "
+              f"free space (e.g. the output drive).", flush=True)
+        sys.exit(1)
+
+
 def pack_folder_uncompressed(
     game_folder: Path,
     pfs_path: Path,
@@ -697,6 +716,7 @@ def main() -> None:
                         ffpfs_path.unlink()
                     except Exception:
                         pass
+                _assert_pass2_spool_space(temp_pfs, td2)
                 compress_file_to_ffpfsc(
                     temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                     temp_folder=Path(td2), **pass2_kwargs,
@@ -826,6 +846,7 @@ def main() -> None:
                               "compression (level 0) to skip wasted CPU; the .ffpfsc is the same "
                               "size either way.", flush=True)
                         pass2_kwargs["compression_level"] = 0
+                    _assert_pass2_spool_space(temp_pfs, temp_dir)
                     compress_file_to_ffpfsc(
                         temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                         temp_folder=Path(temp_dir),

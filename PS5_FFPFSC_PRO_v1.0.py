@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.20"
+APP_VERSION = "1.0.21"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -249,8 +249,63 @@ def space_safety_factor() -> float:
         return 1.0
 
 
-def estimate_peak_space_needed(game_size: int, same_temp_output_drive: bool = True) -> int:
-    return int(game_size * (2.20 if same_temp_output_drive else 1.20) * space_safety_factor())
+# Peak SCRATCH-drive multiples of the EXTRACTED game size for one packing run, where
+# {extracted source + inner .ffpfs image + pass-2 PFSC spool} are co-resident on the
+# build drive. Archives unpack to a SECOND copy on the build drive (~3.6x measured: a
+# 66 GB title peaked at 239.8 GB). Plain folders / disk images are read in place — no
+# second copy — so ~2.3x (image + spool over the source). Auto-patch makes a FULL extra
+# game copy plus image + spool (~5x). Safe envelopes; the backend pre-pass-2 assert is
+# the final backstop and space_safety_factor() tunes headroom.
+ARCHIVE_PEAK_FACTOR = 3.7
+INPLACE_PEAK_FACTOR = 2.3
+PATCH_PEAK_FACTOR   = 5.0
+
+
+def archive_set_ondisk_size(archive: Path) -> int:
+    """Sum the on-disk bytes of an archive's whole multi-part volume set. A fallback
+    extracted-size proxy when headers can't be read — still COMPRESSED, so a rough floor."""
+    try:
+        base = re.sub(
+            r'(\.part\d+\.rar|\.r\d{2,}|\.7z\.\d+|\.zip\.\d+|\.z\d+|\.\d{3}|\.rar|\.zip|\.7z)$',
+            '', archive.name, flags=re.I)
+        total = 0
+        for p in archive.parent.iterdir():
+            if p.is_file() and p.name.startswith(base):
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        return total or (archive.stat().st_size if archive.exists() else 0)
+    except Exception:
+        try:
+            return archive.stat().st_size
+        except Exception:
+            return 0
+
+
+def _build_size_of(item) -> int:
+    """The honest EXTRACTED size to base space decisions on: the header-read extracted
+    size when known, else item.size (already extracted for folders/disk images)."""
+    return int(getattr(item, "extracted_size", 0) or getattr(item, "size", 0) or 0)
+
+
+def _peak_factor_for(item) -> float:
+    """Scratch peak multiple for this item's source kind (and auto-patch mode)."""
+    try:
+        if getattr(item, "patch_source", None) and load_settings().get("auto_integrate_patch", False):
+            return PATCH_PEAK_FACTOR
+    except Exception:
+        pass
+    return INPLACE_PEAK_FACTOR if getattr(item, "source_kind", "archive") == "inplace" else ARCHIVE_PEAK_FACTOR
+
+
+def estimate_peak_space_needed(extracted_size: int, factor: float = ARCHIVE_PEAK_FACTOR,
+                               same_temp_output_drive: bool = True) -> int:
+    """Peak free space the SCRATCH (build) drive needs. *factor* is the co-resident
+    multiple of the EXTRACTED size for {source + inner image + pass-2 spool}. When the
+    final .ffpfsc also lands on this drive (scratch == output), add ~1x for it."""
+    mult = factor + (1.05 if same_temp_output_drive else 0.0)
+    return int(extracted_size * mult * space_safety_factor())
 
 
 def estimate_output_space_needed(game_size: int) -> int:
@@ -267,8 +322,10 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     and — when output is on a different drive — the output drive for the
     full-size final .ffpfsc."""
     same = same_drive(temp_dir, out_dir)
-    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(item.size, same)
-    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(item.size)
+    size = _build_size_of(item)
+    factor = _peak_factor_for(item)
+    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same)
+    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size)
     return temp_ok and out_ok
 
 
@@ -1021,9 +1078,10 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         temp_free   = get_free_space(temp_dir)
         out_free    = get_free_space(out_dir)
         same        = same_drive(temp_dir, out_dir)
-        peak_needed = estimate_peak_space_needed(item.size, same)
-        out_needed  = estimate_output_space_needed(item.size)
-        final_est   = int(item.size * 0.55)
+        bsize       = _build_size_of(item)
+        peak_needed = estimate_peak_space_needed(bsize, _peak_factor_for(item), same)
+        out_needed  = estimate_output_space_needed(bsize)
+        final_est   = int(bsize * 0.55)
         temp_fs     = get_filesystem_type(temp_dir)   # fast ctypes call
         out_fs      = get_filesystem_type(out_dir)
 
@@ -1678,6 +1736,50 @@ class ArchiveExtractor:
         return []
 
     @staticmethod
+    def uncompressed_size(archive: Path, passwords=None) -> int:
+        """Total UNCOMPRESSED size of the archive's members, read from headers WITHOUT
+        extracting (milliseconds). Resolves a multi-part set to its FIRST volume first,
+        so a directly-dropped later part still reports the whole game (not one 5 GB
+        part). Returns 0 when the size cannot be read (encrypted/solid/odd) so callers
+        fall back to an estimate. This is the honest input to the space pre-check —
+        scene RARs are often compressed ~2:1, so the on-disk size badly undershoots."""
+        suffix = archive.suffix.lower()
+        cands = [p for p in (passwords or []) if p] + [""]
+        try:
+            if suffix == ".zip":
+                with zipfile.ZipFile(archive, "r") as zf:
+                    return sum(int(getattr(zi, "file_size", 0) or 0) for zi in zf.infolist())
+            if suffix == ".rar":
+                resolved = ArchiveExtractor._first_volume(archive)
+                backend_dir = backend_base_dir()
+                if str(backend_dir) not in sys.path:
+                    sys.path.insert(0, str(backend_dir))
+                from unrar import rarfile as _br  # type: ignore
+                for pwd in cands:
+                    try:
+                        with _br.RarFile(str(resolved), pwd=pwd or None) as rf:
+                            return sum(int(getattr(ri, "file_size", 0) or 0) for ri in rf.infolist())
+                    except Exception:
+                        continue
+                return 0
+            if suffix == ".7z":
+                import py7zr  # type: ignore
+                for pwd in cands:
+                    try:
+                        kwargs = {"password": pwd} if pwd else {}
+                        with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
+                            total = sum(int(getattr(f, "uncompressed", 0) or 0) for f in sz.list())
+                            if total <= 0:
+                                total = int(getattr(sz.archiveinfo(), "uncompressed", 0) or 0)
+                            return total
+                    except Exception:
+                        continue
+                return 0
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
     def names_look_like_game(names) -> bool:
         """True if a member-name listing contains the PS5 game signature
         (an eboot.bin plus a sce_sys/param.json), at any depth."""
@@ -2271,21 +2373,36 @@ class GameItem:
         self.files      = file_count(path)
         self.artwork    = find_artwork(path)
         self.status     = "Queued"
+        self.source_kind    = "inplace"   # a folder is packed in place — no second copy
+        self.extracted_size = self.size   # already extracted; honest size for space math
 
     @classmethod
     def from_archive(cls, archive: Path) -> "GameItem":
         """Placeholder item for an archive that has not been extracted yet."""
         obj          = cls.__new__(cls)
+        # Normalize a directly-dropped multi-part volume back to the FIRST volume so the
+        # size and the whole-set logic always cover the entire game, not one part.
+        first = ArchiveExtractor._first_volume(archive)
         obj.path         = None
-        obj.archive_path = archive
+        obj.archive_path = first
         obj.operation    = "pack"
-        obj.name         = archive.stem
+        obj.name         = first.stem
         obj.title_id     = "📦"
-        obj.size         = archive.stat().st_size if archive.exists() else 0
+        obj.size         = archive_set_ondisk_size(first)   # whole compressed volume set
         obj.files        = 0
         obj.artwork      = None
         obj.status       = "Pending Extract"
         obj.password     = None          # optional per-archive password override
+        obj.source_kind  = "archive"     # unpacks a SECOND copy onto the build drive
+        # Honest extracted size from headers (scene RARs compress ~2:1, so the on-disk
+        # size badly undershoots). Pass saved passwords for header-encrypted sets. Leave
+        # 0 only when truly unreadable so the gate defers to the post-extraction re-check.
+        try:
+            pw = load_settings().get("archive_passwords") or []
+        except Exception:
+            pw = []
+        hdr = ArchiveExtractor.uncompressed_size(first, pw)
+        obj.extracted_size = hdr if hdr and hdr > obj.size else 0
         return obj
 
     @classmethod
@@ -2323,6 +2440,8 @@ class GameItem:
         obj.files        = 1
         obj.artwork      = None
         obj.status       = "Queued"
+        obj.source_kind    = "inplace"   # disk image is read in place — no second copy
+        obj.extracted_size = obj.size
         return obj
 
     @classmethod
@@ -2338,6 +2457,8 @@ class GameItem:
         obj.files        = 1
         obj.artwork      = None
         obj.status       = "Queued"
+        obj.source_kind    = "inplace"   # unpack op — no second copy on the build drive
+        obj.extracted_size = obj.size
         return obj
 
 
@@ -3242,6 +3363,12 @@ class App:
         self._batch_running = False
         self._details_item  = None   # GameItem currently shown in the details panel
         self._settings_win  = None
+        self._active_item   = None   # item handed to the current worker (cleanup fallback)
+        # Reclaim accounting: the batch must not re-check free space until all in-flight
+        # cleanup rmtrees finish, or it reads stale (still-full) space and false-skips.
+        self._cleanup_inflight = 0
+        self._cleanup_lock     = threading.Lock()
+        self._cleanup_wait_ticks = 0
 
         self.log_q      = queue.Queue()
         self.progress_q = queue.Queue()
@@ -3263,6 +3390,8 @@ class App:
         self.root.after(4000, self._check_pending_compat_reports)
         # Restore the user's saved section widths once the layout has settled.
         self.root.after(600, self._restore_sashes)
+        # Offer to reclaim leftover scratch from a crashed/cancelled previous run.
+        self.root.after(1500, self._offer_startup_sweep)
 
     def _restore_window_geometry(self):
         """Reapply the last saved window position/size, if valid. Vertically clamp so
@@ -4147,6 +4276,7 @@ class App:
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.status_update("Patching", f"Patching {item.name}…", "Creating Temp PFS", 0, 0, "00:00", "—", "—")
+        self._active_item = item
         self.worker = CLIWorker(self, item, cmd, cwd, out_dir, temp_dir)
         self.worker.start()
 
@@ -4436,6 +4566,11 @@ class App:
         target.files        = source.files
         target.artwork      = source.artwork
         target.status       = source.status
+        # After extraction the source is a real folder on the build drive: it becomes
+        # 'inplace' (packed in place), so the post-extraction re-gate sizes only the
+        # remaining image+spool (~2.3x) rather than re-counting the already-written tree.
+        target.source_kind    = getattr(source, "source_kind", "inplace")
+        target.extracted_size = getattr(source, "extracted_size", source.size)
 
     def add_source_to_queue(self):
         src_str = self._clean_path_str(self.source_var.get())
@@ -4675,47 +4810,85 @@ class App:
             except Exception:
                 return 0
 
-    def _resolve_extract_root(self, archive: Path) -> Path:
-        """Decide where to extract *archive*, per the Drive-usage mode (drive_mode_var):
-          temp   -> <temp>/_extracted              (everything on the temp drive)
-          spread -> <output drive>/_ffpfsc_extract  (keep the extracted source off temp)
-          auto   -> spread when the temp drive can't hold extracted-source + inner image,
-                    else temp.
-        Never extracts onto the SOURCE drive (the HDD read+write contention the user
-        flagged); falls back to temp if no usable output drive is set or it shares the
-        source's drive."""
+    def _resolve_extract_root(self, item) -> Path:
+        """Choose ONE drive for this run's WHOLE scratch footprint (extracted source +
+        inner image + pass-2 spool) and record it on the item: _build_root (where the
+        source extracts) and _build_temp (the backend --temp-dir for image + spool), so
+        build_command and all cleanup follow the same drive — never split across drives.
+
+        Per drive_mode_var:
+          temp   -> force the SSD/temp drive (gate skips if the real footprint won't fit).
+          spread -> force the output drive.
+          auto   -> SSD/temp fast-path ONLY when the FULL real footprint fits; otherwise
+                    build everything on the output drive (slower, but it COMPLETES).
+        Prefers not to extract onto the source drive (read+write contention), but will if
+        that is the only drive with room — completing beats skipping. Never silently
+        dead-ends: when nothing fits it leaves temp and lets the space gate skip/abort
+        with real need-vs-free numbers."""
+        archive = getattr(item, "archive_path", None)
         temp_base = self.temp_var.get().strip()
         if not temp_base:
-            temp_base = str(archive.parent / "_ffpfsc_temp")
+            anchor = archive.parent if archive else Path.home()
+            temp_base = str(anchor / "_ffpfsc_temp")
             self.temp_var.set(temp_base)
-        temp_root = Path(temp_base) / "_extracted"
+        temp_base_p = Path(temp_base)
+        temp_root = temp_base_p / "_extracted"
+
+        def set_temp():
+            item._build_root = temp_root
+            item._build_temp = temp_base_p
+        set_temp()   # default
+
         mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
         out_str = self.output_var.get().strip()
-        if mode == "temp" or not out_str:
+        size = _build_size_of(item)
+        factor = _peak_factor_for(item)
+        if not out_str:
             return temp_root
+
         out_dir = Path(out_str)
+        spread_root = out_dir / "_ffpfsc_extract"
+        spread_temp = out_dir / "_ffpfsc_temp"
+
+        def set_spread():
+            item._build_root = spread_root
+            item._build_temp = spread_temp
         try:
             probe_out = out_dir if out_dir.exists() else out_dir.parent
-            if same_drive(probe_out, archive.parent):
-                return temp_root   # output drive == source drive → avoid HDD contention
+            out_is_source = bool(archive) and same_drive(probe_out, archive.parent)
         except Exception:
+            probe_out, out_is_source = out_dir, False
+
+        # Free space the build drive must have: temp keeps the final on the OTHER drive
+        # (unless temp==output), the output drive holds the final too (same drive).
+        temp_need = estimate_peak_space_needed(size, factor, same_drive(temp_base_p, out_dir))
+        out_need  = estimate_peak_space_needed(size, factor, True)
+        temp_free = get_free_space(temp_base_p)
+        out_free  = get_free_space(probe_out)
+        szs = format_size(size) if size else "?"
+        contention = " (output is the source drive: read+write contention, slower)" if out_is_source else ""
+
+        if mode == "temp":
+            if size and temp_free < temp_need:
+                self.log("WARN", f"Drive 'temp': {item.name} needs ~{format_size(temp_need)} on temp, "
+                                  f"only {format_size(temp_free)} free — the space gate will handle it.")
             return temp_root
-        spread_root = out_dir / "_ffpfsc_extract"
         if mode == "spread":
-            self.log("INFO", f"Drive mode 'spread': extracting to the output drive — {out_dir}")
+            set_spread()
+            self.log("INFO", f"Drive 'spread': building on the output drive {out_dir}{contention}.")
             return spread_root
-        # auto: keep the extracted source off temp only when temp can't hold ~2x it
-        est = self._archive_set_size(archive)
-        try:
-            if get_free_space(Path(temp_base)) >= int(est * 2.10 * space_safety_factor()):
-                return temp_root   # temp holds extracted source + inner image comfortably
-            if get_free_space(probe_out) >= int(est * 1.10):
-                self.log("INFO",
-                         "Auto drive mode: temp is tight — extracting to the output drive "
-                         "so the SSD only needs the compressed image.")
-                return spread_root
-        except Exception:
-            pass
+        # AUTO ---------------------------------------------------------------------
+        if size > 0 and temp_free >= temp_need:
+            return temp_root   # SSD/temp fast-path: the full real footprint fits
+        if out_free >= out_need:
+            set_spread()
+            why = "too big for the SSD temp" if size > 0 else "unknown size — using the larger drive for safety"
+            self.log("INFO", f"Auto: {item.name} (~{szs}) {why} → building on {out_dir}"
+                             f"{contention or ' (mechanical drive, slower, but it completes)'}.")
+            return spread_root
+        # Nothing fits — leave temp; the space gate aborts/skips with real numbers.
+        self.log("WARN", f"Auto: {item.name} (~{szs}) fits neither temp (~{format_size(temp_need)}) "
+                          f"nor output (~{format_size(out_need)}) — the space gate will skip/abort it.")
         return temp_root
 
     def _extract_dir_for_item(self, item):
@@ -4755,11 +4928,12 @@ class App:
                         pass
             except Exception:
                 pass
-        threading.Thread(target=_work, daemon=True).start()
+        self._run_cleanup(_work)
 
     def _extract_and_queue_archive(self, archive: Path):
-        """Extract *archive* (background thread) with live progress, then queue."""
-        extract_root = self._resolve_extract_root(archive)
+        """Extract *archive* (background thread) with live progress, then queue.
+        (Currently unreachable — the queue path _extract_queued_item is used instead.)"""
+        extract_root = self._resolve_extract_root(GameItem.from_archive(archive))
 
         self.log("INFO", f"Extracting archive: {archive.name}")
         self.cancel_requested = False
@@ -4858,7 +5032,7 @@ class App:
     def _extract_queued_item(self, item):
         """Extract item.archive_path in a background thread, then call start() again."""
         archive = item.archive_path
-        extract_root = self._resolve_extract_root(archive)
+        extract_root = self._resolve_extract_root(item)
 
         item.status = "Extracting"
         self.cancel_requested = False
@@ -5080,10 +5254,10 @@ class App:
             temp_dir = Path(tp) if tp else None
             out_dir  = Path(op) if op else None
             if temp_dir is None:
-                self.temp_space_var.set(f"Peak Needed: ~{format_size(item.size * 2.2)}")
+                self.temp_space_var.set(f"Peak Needed: ~{format_size(int(_build_size_of(item) * _peak_factor_for(item)))}")
                 return
             same  = same_drive(temp_dir, out_dir) if out_dir else True
-            peak  = estimate_peak_space_needed(item.size, same)
+            peak  = estimate_peak_space_needed(_build_size_of(item), _peak_factor_for(item), same)
             free  = get_free_space(temp_dir)
             out_free = get_free_space(out_dir) if out_dir else 0
             ok    = free >= peak
@@ -5181,42 +5355,79 @@ class App:
             cmd += ["--block-size", block_size]
         if self.verbose_var.get():
             cmd.append("--verbose")
-        # Pass user temp dir so mkpfs uses the fast drive too
-        temp_str = self.temp_var.get().strip()
+        # Route the backend scratch (inner image + pass-2 spool) to the SAME drive this
+        # run was placed on (item._build_temp), so ALL artifacts follow one drive. Folder
+        # and folder+patch jobs are never extracted, so resolve their placement here (the
+        # PATCH factor applies for auto-patch jobs); archives carry _build_temp from
+        # extraction / the post-extraction re-gate. Falls back to the user temp folder.
+        patch_src = getattr(item, "patch_source", None)
+        is_patch_job = (bool(patch_src) and self.auto_integrate_patch_var.get()
+                        and bool(getattr(item, "path", None)) and item.path.is_dir())
+        if getattr(item, "_build_temp", None) is None:
+            try:
+                self._resolve_extract_root(item)   # sets item._build_temp via the right factor
+            except Exception:
+                pass
+        build_temp = getattr(item, "_build_temp", None)
+        if build_temp is not None:
+            temp = Path(build_temp)
+        temp_str = str(temp) if str(temp) else ""
         if temp_str:
             cmd += ["--temp-dir", temp_str]
         # Auto-patch: overlay a detected patch sibling onto the game before packing,
-        # via the backend's PATCH MODE. Only once the game has resolved to a folder
-        # (archive games are extracted first; PATCH MODE needs a folder or .ffpfsc).
-        patch_src = getattr(item, "patch_source", None)
-        if patch_src and self.auto_integrate_patch_var.get() and item.path.is_dir():
+        # via the backend's PATCH MODE (now routed to the chosen --temp-dir above).
+        if is_patch_job:
             cmd += ["--patch", str(patch_src)]
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() != ".ffpfsc" else out.parent, temp
 
+    def _run_cleanup(self, work) -> None:
+        """Run a cleanup function in a daemon thread, counted so the batch can wait for
+        all in-flight reclaims to finish before re-reading free space (a boolean cannot
+        represent N concurrent rmtrees)."""
+        with self._cleanup_lock:
+            self._cleanup_inflight += 1
+        def _wrapped():
+            try:
+                work()
+            finally:
+                with self._cleanup_lock:
+                    self._cleanup_inflight = max(0, self._cleanup_inflight - 1)
+        threading.Thread(target=_wrapped, daemon=True).start()
+
     def _cleanup_after_failure(self, item) -> None:
-        """Reclaim a failed run's temp artifacts so large leftovers don't stack up:
-        the mkpfs tmp* working dirs (the orphaned uncompressed image) and THIS item's
-        own _extracted source subdir. Identified by path, so it never removes another
-        queued item's source or a real (non-temp) game folder. Runs in a background
-        thread (rmtree of a ~150 GB tree must not freeze the UI)."""
-        tp = self.temp_var.get().strip()
-        if not tp:
-            return
-        temp_dir = Path(tp)
-        if not temp_dir.exists():
+        """Reclaim a failed/skipped/cancelled run's scratch: the mkpfs tmp* working dirs
+        (orphaned inner image + pass-2 spool) AND this item's own extracted-source subdir
+        — scoped to the drive the run actually built on (item._build_temp), and also the
+        user temp folder so an earlier SSD strand is reclaimed too. Counted so the next
+        batch gate waits for the reclaim. Threaded (rmtree of a ~150 GB tree must not
+        freeze the UI)."""
+        roots, seen = [], set()
+        for cand in (getattr(item, "_build_temp", None), self.temp_var.get().strip()):
+            if not cand:
+                continue
+            r = Path(cand)
+            try:
+                key = str(r.resolve())
+            except Exception:
+                key = str(r)
+            if key not in seen and r.exists():
+                seen.add(key)
+                roots.append(r)
+        if not roots and self._extract_dir_for_item(item) is None:
             return
 
         def _work():
             freed = 0
-            try:
-                for p in temp_dir.iterdir():
-                    if p.is_dir() and p.name.lower().startswith("tmp"):
-                        sz = get_folder_size(p)
-                        shutil.rmtree(str(p), ignore_errors=True)
-                        freed += sz
-            except Exception:
-                pass
+            for root in roots:
+                try:
+                    for p in root.iterdir():
+                        if p.is_dir() and p.name.lower().startswith("tmp"):
+                            sz = get_folder_size(p)
+                            shutil.rmtree(str(p), ignore_errors=True)
+                            freed += sz
+                except Exception:
+                    pass
             try:
                 own = self._extract_dir_for_item(item)   # temp/_extracted OR output/_ffpfsc_extract
                 if own is not None and own.exists():
@@ -5232,11 +5443,75 @@ class App:
             except Exception:
                 pass
             if freed:
-                self.log("INFO", f"Cleaned {format_size(freed)} of temp data from the failed run.")
+                self.log("INFO", f"Cleaned {format_size(freed)} of scratch from the failed/skipped run.")
 
-        threading.Thread(target=_work, daemon=True).start()
+        self._run_cleanup(_work)
 
     # ── Feature 5: Auto-clear temp ────────────────────────────────────────────
+    def _offer_startup_sweep(self):
+        """On launch, look for orphaned scratch from a crashed/cancelled run — tmp* and
+        _extracted on the temp drive, plus _ffpfsc_temp / _ffpfsc_extract on the output
+        drive — and offer to reclaim it. Sizing walks large trees, so it runs in a
+        background thread; the confirm prompt + delete are marshalled to the main thread.
+        Only this app's own working dirs are ever touched."""
+        NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp")
+
+        def _scan():
+            targets, seen = [], set()
+            for base_str in (self.temp_var.get().strip(), self.output_var.get().strip()):
+                if not base_str:
+                    continue
+                base = Path(base_str)
+                if not base.exists():
+                    continue
+                try:
+                    for p in base.iterdir():
+                        if p.is_dir() and (p.name.lower().startswith("tmp") or p.name in NAMES):
+                            try:
+                                key = str(p.resolve())
+                            except Exception:
+                                key = str(p)
+                            if key not in seen:
+                                seen.add(key)
+                                targets.append(p)
+                except Exception:
+                    continue
+            total = 0
+            for p in targets:
+                try:
+                    total += get_folder_size(p)
+                except Exception:
+                    pass
+            if targets and total >= 1 * 1024**3:   # ignore trivial (<1 GiB) leftovers
+                self.root.after(0, lambda: self._prompt_startup_sweep(targets, total))
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _prompt_startup_sweep(self, targets, total):
+        try:
+            n = len(targets)
+            listing = "\n".join(f"  • {p}" for p in targets[:8]) + ("\n  • …" if n > 8 else "")
+            msg = (f"Found ~{format_size(total)} of leftover working data from a previous "
+                   f"run in {n} folder(s):\n\n{listing}\n\nDelete it now to reclaim the space?")
+            if not messagebox.askyesno("Reclaim leftover temp space?", msg):
+                return
+
+            def _work():
+                freed = 0
+                for p in targets:
+                    try:
+                        sz = get_folder_size(p)
+                        shutil.rmtree(str(p), ignore_errors=True)
+                        freed += sz
+                    except Exception:
+                        pass
+                if freed:
+                    self.log("OK", f"Startup sweep: reclaimed {format_size(freed)} of leftover scratch.")
+            self._run_cleanup(_work)
+            self.log("INFO", "Reclaiming leftover scratch in the background…")
+        except Exception:
+            pass
+
     def _auto_clear_temp(self):
         """Silently clear temp folder contents after a successful compression."""
         tp = self.temp_var.get().strip()
@@ -5276,13 +5551,22 @@ class App:
             f"Game {current}/{self._batch_total}  |  ✓ {self._batch_done}  ✗ {self._batch_failed}"
         )
 
-    def _space_gate(self, item, temp_dir, out_dir):
-        """Pre-flight space decision shared by single-start and batch. Returns
-        'proceed', 'skip', or 'cancel', based on free space, the low-space policy
-        (ask / auto / skip), and whether the diagnostics dialog is enabled. The
-        free-space test already honours the user's safety factor."""
+    def _space_gate(self, item, out_dir):
+        """Place the run on a drive sized for its REAL footprint (sets item._build_root /
+        _build_temp via _resolve_extract_root), then decide go/skip/cancel against THAT
+        drive. Returns 'proceed', 'skip', or 'cancel' per free space, the low-space policy
+        (ask / auto / skip) and the diagnostics-dialog toggle. Honest extracted size +
+        per-kind factor + safety factor feed the check, so a game that fits a drive (the
+        big HDD) is routed there and proceeds; only a game that fits NO drive is skipped."""
         if getattr(item, "operation", "pack") == "unpack":
             return "proceed"
+        out_dir = Path(out_dir)
+        try:
+            self._resolve_extract_root(item)   # the single place that picks the build drive
+        except Exception as e:
+            self.log("WARN", f"Placement failed ({e}); using temp.")
+        temp_dir = Path(getattr(item, "_build_temp", None)
+                        or (self.temp_var.get().strip() or str(Path.home())))
         try:
             ok = _space_preflight_ok(item, temp_dir, out_dir)
         except Exception as e:
@@ -5301,7 +5585,8 @@ class App:
             self.log("WARN", f"Low space — proceeding anyway (policy: auto): {item.name}")
             return "proceed"
         if policy == "skip":
-            self.log("WARN", f"Low space — skipping (policy: skip): {item.name}")
+            self.log("WARN", f"Low space — {item.name} fits no available drive; "
+                             f"skipping (policy: skip).")
             return "skip"
         return _ask()   # 'ask' — show the dialog and let the user decide
 
@@ -5319,6 +5604,19 @@ class App:
             self.status_update("Ready", "Batch cancelled.", "Ready", 0, 0, "00:00", "—", "—")
             self.log("WARN", "Batch cancelled by user.")
             return
+        # Wait for any in-flight scratch reclaim to finish before re-reading free space —
+        # otherwise the gate sees a still-full drive and false-skips the next game. Cap the
+        # wait generously (~10 min) for a slow exFAT rmtree of a 150-260 GB tree.
+        if getattr(self, "_cleanup_inflight", 0) > 0:
+            self._cleanup_wait_ticks += 1
+            if self._cleanup_wait_ticks <= 1200:   # 1200 * 500 ms ≈ 10 min
+                if self._cleanup_wait_ticks == 1:
+                    self.status_update("Cleaning up", "Reclaiming temp space before the next game…",
+                                        "Cleaning", 0, 0, "—", "—", "—")
+                self.root.after(500, self._batch_auto_start)
+                return
+            self.log("WARN", "Cleanup still running past the wait cap — continuing; the space gate decides.")
+        self._cleanup_wait_ticks = 0
         if not self.queue:
             self._batch_running = False
             self.start_btn.configure(state="normal")
@@ -5328,20 +5626,20 @@ class App:
         item = self.queue[0]
         self.update_game_details(item)   # refreshes art + space stats for next game
 
-        # ── Space pre-flight gate (dialog / policy / safety factor configurable) ──
+        # ── Space pre-flight gate — places the run on a drive sized for its real
+        #    footprint, then go/skip/cancel. Skip cleans any partial scratch and keeps
+        #    the batch moving; a big game that fits the HDD is routed there, not skipped.
         try:
-            tp = self.temp_var.get().strip()
             op = self.output_var.get().strip()
-            if tp and op and getattr(item, "operation", "pack") != "unpack":
-                td = Path(tp); od = Path(op)
-                peak = estimate_peak_space_needed(item.size, same_drive(td, od))
-                free = get_free_space(td)
-                self.log("INFO",
-                    f"Space check — {item.name}: "
-                    f"Need {format_size(peak)} | Temp free {format_size(free)} "
-                    f"| {'✓ OK' if free >= peak else '⚠ LOW'}"
-                )
-                gate = self._space_gate(item, td, od)
+            if op and getattr(item, "operation", "pack") != "unpack":
+                od = Path(op)
+                gate = self._space_gate(item, od)
+                bt = getattr(item, "_build_temp", None)
+                if bt is not None:
+                    need = estimate_peak_space_needed(_build_size_of(item), _peak_factor_for(item),
+                                                      same_drive(Path(bt), od))
+                    self.log("INFO", f"Space check — {item.name}: build on {bt} | "
+                                     f"need ~{format_size(need)} | free {format_size(get_free_space(bt))} | {gate}")
                 if gate == "cancel":
                     self._batch_running = False
                     self.start_btn.configure(state="normal")
@@ -5349,7 +5647,7 @@ class App:
                     self._update_batch_counter()
                     return
                 if gate == "skip":
-                    # Skip this game but keep the batch going (low-space policy: skip).
+                    self._cleanup_after_failure(item)   # reclaim any partial scratch
                     self.queue.pop(0)
                     self._batch_failed += 1
                     self._update_batch_counter()
@@ -5388,6 +5686,7 @@ class App:
         )
         self.log("INFO", f"── Batch auto-advance: game {current}/{self._batch_total} — {item.name}")
         self.cancel_requested = False
+        self._active_item = item
         self.worker = CLIWorker(self, item, cmd, cwd, out_dir, temp_dir)
         self.worker.start()
 
@@ -5431,7 +5730,34 @@ class App:
 
         item = self.queue[0]
 
-        # ── Archive placeholder — extract first, then compress ────────────────
+        # ── Pre-flight space gate FIRST — place the run on a drive sized for its real
+        #    footprint and decide go/skip/cancel BEFORE any extraction or packing, so a
+        #    too-big archive is judged on its true extracted size (from headers) rather
+        #    than extracted onto a full SSD and only then failing. ─────────────────────
+        gate = self._space_gate(item, Path(self.output_var.get().strip()))
+        if gate == "cancel":
+            if self._batch_running:
+                self._batch_running = False
+                self.start_btn.configure(state="normal")
+                self.cancel_btn.configure(state="disabled")
+                self._update_batch_counter()
+            self.status_update("Ready", "Drive check cancelled.", "Ready", 0, 0, "00:00", "—", "—")
+            return
+        if gate == "skip":
+            # Reclaim any scratch this item already wrote (e.g. an archive extracted
+            # before the post-extraction re-gate), then skip — advancing the batch.
+            self._cleanup_after_failure(item)
+            if self._batch_running:
+                self.queue.pop(0)
+                self._batch_failed += 1
+                self._update_batch_counter()
+                self.update_queue_box()
+                self.root.after(600, self._batch_auto_start)
+            else:
+                self.status_update("Ready", f"Skipped — low space: {item.name}", "Ready", 0, 0, "00:00", "—", "—")
+            return
+
+        # ── Archive placeholder — extract first, then compress (re-gates after) ──────
         if getattr(item, "archive_path", None):
             self._extract_queued_item(item)
             return
@@ -5440,16 +5766,6 @@ class App:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
         except Exception as e:
             messagebox.showerror("Cannot start", str(e))
-            return
-
-        # Pre-flight space gate — dialog / low-space policy / safety factor are all
-        # configurable (Settings → Drive & Space). 'skip' here just declines to start.
-        gate = self._space_gate(item, temp_dir, out_dir)
-        if gate == "cancel":
-            self.status_update("Ready", "Drive check cancelled.", "Ready", 0, 0, "00:00", "—", "—")
-            return
-        if gate == "skip":
-            self.status_update("Ready", f"Skipped — low space: {item.name}", "Ready", 0, 0, "00:00", "—", "—")
             return
 
         # Stale temp data warning
@@ -5506,14 +5822,27 @@ class App:
         self.cancel_btn.configure(state="normal")
         label = f"Game 1/{self._batch_total}" if self._batch_total > 1 else "Starting"
         self.status_update(label, "Launching backend.", "Starting", 0, 0, "00:00", "—", "—")
+        self._active_item = item
         self.worker = CLIWorker(self, item, cmd, cwd, out_dir, temp_dir)
         self.worker.start()
 
     def cancel(self):
         self.cancel_requested = True
         self.extract_cancel_event.set()
+        # Immediate, main-thread visual feedback — don't wait for the ~100 ms poll tick,
+        # and repaint the big status + footer + button NOW so it isn't masked by the
+        # worker's still-queued progress updates (the "Cancel does nothing" symptom).
+        try:
+            self.cancel_btn.configure(state="disabled")
+            self.big_status_var.set("Cancelling…")
+            self.big_detail_var.set("Stopping the current job and reclaiming temp space…")
+            self.footer_var.set("● Cancelling…")
+            self.header_status_var.set(f"v{APP_VERSION}  |  Cancelling…")
+            self.root.update_idletasks()
+        except Exception:
+            pass
         _kill_process_tree(self.current_process)
-        self.status_update("Cancelling", "Cancel requested.", "Cancelling", 0, 0, "—", "—", "—")
+        self.status_update("Cancelling", "Cancel requested — stopping…", "Cancelling", 0, 0, "—", "—", "—")
 
     def status_update(self, title, detail, stage, stage_pct, overall_pct, elapsed, speed, eta):
         if stage == "Creating Temp PFS" and stage_pct >= 100:
@@ -6464,18 +6793,24 @@ class App:
                 # Continue into compression now that the item has a real path
                 self.start()
             elif status == "cancelled":
+                # Cancel = STOP the batch (don't advance). Clean the partial extract of
+                # the item being unpacked (it stays in the queue, marked Cancelled).
+                if self.queue:
+                    self._cleanup_after_failure(self.queue[0])
+                    self.queue[0].status = "Cancelled"
                 self._batch_running = False
                 self.pending_start = False
                 self.start_btn.configure(state="normal")
                 self.cancel_btn.configure(state="disabled")
-                if self.queue:
-                    self.queue[0].status = "Cancelled"
-                    self.update_queue_box()
+                self.update_queue_box()
                 self.status_update("Ready", str(payload), "Ready", 0, 0, "00:00", "—", "—")
                 self.log("WARN", str(payload))
             else:
-                # Extraction failed — pop the stuck archive so the queue doesn't freeze,
-                # then continue or end the batch like a pack failure.
+                # Extraction failed — clean the partial tree, pop the stuck archive so the
+                # queue doesn't freeze, then continue or end the batch like a pack failure.
+                failed_item = self.queue[0] if self.queue else self._active_item
+                if failed_item is not None:
+                    self._cleanup_after_failure(failed_item)
                 if self.queue:
                     self.queue[0].status = "Failed"
                     self.queue.pop(0)
@@ -6503,12 +6838,14 @@ class App:
             success, msg, last_cmd = self.done_q.get_nowait()
             self._last_cmd_str = last_cmd
 
-            # Mark current game done/failed and pop from queue
+            # Mark current game done/failed and pop from queue. When the queue is already
+            # empty (single-game / last-in-batch) fall back to the tracked active item so
+            # a failure still cleans its scratch (otherwise a single-game failure strands).
             if self.queue:
                 self.queue[0].status = "Done" if success else "Failed"
                 completed_item = self.queue.pop(0)
             else:
-                completed_item = None
+                completed_item = self._active_item
 
             if success:
                 self._batch_done += 1
@@ -6584,6 +6921,10 @@ class App:
                 self._update_batch_counter()
                 self.status_update("Ready", "Cancelled by user.", "Ready", 0, 0, "00:00", "—", "—")
                 self.log("WARN", "Cancelled by user.")
+                # Reclaim the cancelled run's scratch (it was popped above, so use it
+                # directly — not _active_item, which would double-handle).
+                if completed_item is not None:
+                    self._cleanup_after_failure(completed_item)
             else:
                 self._batch_failed += 1
                 self.update_queue_box()

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1520,8 +1520,13 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkCheckBox(ds, text="Show drive-space dialog before each pack",
                          variable=self.app.show_space_dialog_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
+        ctk.CTkCheckBox(ds, text="Build via exFAT intermediate (macOS) — PSBrew's most-stable path",
+                         variable=self.app.build_via_exfat_var, fg_color=GREEN,
+                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
         ctk.CTkLabel(ds, text="Safety factor scales only the temp headroom; the output drive must always "
-                              "fit the finished .ffpfsc. 'Skip' applies per game during batch runs.",
+                              "fit the finished .ffpfsc. 'Skip' applies per game during batch runs. "
+                              "exFAT mode wraps a real exFAT volume instead of the folder PFS builder "
+                              "(slower to build; try it if folder-built .ffpfsc crash the console).",
                       text_color=MUTED, justify="left", wraplength=440).pack(anchor="w", padx=14, pady=(0, 10))
 
         # ABOUT
@@ -3648,6 +3653,9 @@ class App:
         # tunable safety factor and the low-space policy live in settings.json and are
         # edited in the Settings window (see SettingsWindow).
         self.show_space_dialog_var = self._persisted_bool(settings, "show_space_dialog", True)
+        # Opt-in: build an exFAT intermediate and compress that (PSBrew's most-stable
+        # exfat->ffpfsc path) instead of the folder PFS builder. macOS only. Default off.
+        self.build_via_exfat_var = self._persisted_bool(settings, "build_via_exfat", False)
         # MkPFS 0.0.8 tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
@@ -5385,6 +5393,13 @@ class App:
         # via the backend's PATCH MODE (now routed to the chosen --temp-dir above).
         if is_patch_job:
             cmd += ["--patch", str(patch_src)]
+        # Opt-in exFAT workflow: only for a plain folder pack (not patch jobs, not a
+        # disk-image source). The backend builds an exFAT image of the folder and
+        # compresses that instead of running the folder PFS builder.
+        if (self.build_via_exfat_var.get() and not is_patch_job
+                and getattr(item, "operation", "pack") == "pack"
+                and getattr(item, "path", None) and Path(item.path).is_dir()):
+            cmd.append("--via-exfat")
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() != ".ffpfsc" else out.parent, temp
 

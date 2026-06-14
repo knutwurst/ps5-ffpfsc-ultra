@@ -271,6 +271,47 @@ def _assert_pass2_spool_space(image_path, temp_dir) -> None:
         sys.exit(1)
 
 
+def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
+    """macOS: build a raw exFAT filesystem image of *folder* (via hdiutil) so it can be
+    compressed straight into a .ffpfsc — PSBrew's most-stable 'exfat -> ffpfsc' workflow,
+    which wraps a real exFAT volume (read natively by the PS5) instead of going through
+    the folder PFS builder. Returns the .exfat path, or None when unsupported (non-macOS,
+    no hdiutil) or hdiutil fails — the caller then falls back to the two-pass folder image."""
+    if sys.platform != "darwin":
+        print("[WARN] --via-exfat needs macOS (hdiutil); using the two-pass folder image instead.", flush=True)
+        return None
+    if shutil.which("hdiutil") is None:
+        print("[WARN] hdiutil not found; using the two-pass folder image instead.", flush=True)
+        return None
+    vol = (re.sub(r"[^A-Za-z0-9_]", "", (title_id or "PS5GAME"))[:15] or "PS5GAME")
+    base = outdir / f"{title_id or 'game'}_exfat"
+    out = outdir / f"{title_id or 'game'}.exfat"
+    print("[INFO] Building exFAT image from the game folder via hdiutil...", flush=True)
+    try:
+        r = subprocess.run(
+            ["hdiutil", "create", "-srcfolder", str(folder), "-fs", "ExFAT",
+             "-volname", vol, "-layout", "NONE", "-format", "UDRW",
+             "-nospotlight", "-ov", "-o", str(base)],
+            capture_output=True, text=True,
+        )
+    except Exception as e:
+        print(f"[WARN] hdiutil failed to start: {e}", flush=True)
+        return None
+    dmg = base.with_suffix(".dmg")
+    if r.returncode != 0 or not dmg.exists():
+        print(f"[WARN] hdiutil exFAT build failed (rc={r.returncode}): {r.stderr.strip()[:300]}", flush=True)
+        try:
+            if dmg.exists():
+                dmg.unlink()
+        except Exception:
+            pass
+        return None
+    # -layout NONE + UDRW yields a raw exFAT volume; rename so the backend treats it as one.
+    dmg.rename(out)
+    print(f"[OK] exFAT image built: {out.name} ({out.stat().st_size // (1024**2)} MiB)", flush=True)
+    return out
+
+
 def pack_folder_uncompressed(
     game_folder: Path,
     pfs_path: Path,
@@ -512,6 +553,10 @@ def main() -> None:
     parser.add_argument("--pack", dest="operation", action="store_const", const="pack", help="Force pack/compress mode")
     parser.add_argument("--unpack", dest="operation", action="store_const", const="unpack", help="Extract .ffpfs/.ffpfsc image(s)")
     parser.add_argument("--keep-pfs",     action="store_true", help="Keep intermediate pfs_image.dat")
+    parser.add_argument("--via-exfat",    action="store_true",
+                        help="Build an exFAT image of the game folder and compress THAT into "
+                             ".ffpfsc (PSBrew's most-stable exfat->ffpfsc path; macOS only, "
+                             "falls back to the two-pass folder image otherwise)")
     parser.add_argument("--verify",       action="store_true", help="Run MkPFS post-build verification (slower, more RAM)")
     parser.add_argument("--batch",        action="store_true", help="Process all supported items found under source")
     parser.add_argument("-f", "--force", "--overwrite", dest="overwrite", action="store_true", help="Overwrite existing files")
@@ -821,6 +866,23 @@ def main() -> None:
                     except Exception as e:
                         print(f"[ERROR] Failed to remove existing output file: {e}")
                         sys.exit(1)
+
+            # OPT-IN exFAT path (--via-exfat): build an exFAT image of the game folder and
+            # compress THAT into the .ffpfsc — PSBrew's most-stable workflow, wrapping a
+            # real exFAT volume the PS5 reads natively instead of the folder PFS builder.
+            # On non-macOS / hdiutil failure it returns None and we fall through to two-pass.
+            if getattr(args, "via_exfat", False) and item.is_dir():
+                with tempfile.TemporaryDirectory(dir=user_temp) as exdir:
+                    exfat_img = _build_exfat_image(item, Path(exdir), title_id)
+                    if exfat_img is not None:
+                        _assert_pass2_spool_space(exfat_img, exdir)
+                        print("[INFO] Compressing exFAT image -> .ffpfsc...", flush=True)
+                        compress_file_to_ffpfsc(
+                            exfat_img, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                            temp_folder=Path(exdir), **pack_kwargs,
+                        )
+                        continue   # done with this item; skip the two-pass folder build
+                print("[WARN] Falling back to the two-pass folder image (exFAT path unavailable).", flush=True)
 
             if item.is_file() and item.suffix.lower() in ('.exfat', '.ffpkg'):
                 # Direct disk image (.exfat / .ffpkg) → .ffpfsc (single-file streaming path)

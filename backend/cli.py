@@ -538,6 +538,20 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # ── PS5 console compatibility: force a 64 KiB PFS block size ─────────────────
+    # The PS5 reads PFS filesystems with the native 64 KiB (0x10000) logical block.
+    # A smaller block — which "auto-fit" picks for many-file games (it chose 4 KiB for
+    # Crimson Desert, saving ~5 MB on a 153 GB image) and which 16384/32768 select
+    # explicitly — builds an image that verifies fine locally but the console MISREADS,
+    # crashing on launch. Everything we pack targets PS5 (--version PS5 is hardcoded in
+    # the mkpfs invocations), so normalise any sub-64K / auto-fit request to 64 KiB here.
+    _bs = str(getattr(args, "block_size", "auto")).strip().lower()
+    _sub64k = _bs in ("auto-fit", "auto_small_files", "auto-small-files") or (_bs.isdigit() and int(_bs) < 0x10000)
+    if _sub64k:
+        print(f"[INFO] Forcing 64 KiB PFS block size for PS5 console compatibility "
+              f"(requested '{args.block_size}'; sub-64K images crash the console).", flush=True)
+        args.block_size = "65536"
+
     if not args.game_folder:
         parser.print_help()
         sys.exit(1)

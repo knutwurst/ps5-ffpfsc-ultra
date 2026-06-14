@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.17"
+APP_VERSION = "1.0.18"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3158,6 +3158,8 @@ class App:
 
         # After the UI is fully loaded, remind user to report any untested games
         self.root.after(4000, self._check_pending_compat_reports)
+        # Restore the user's saved section widths once the layout has settled.
+        self.root.after(600, self._restore_sashes)
 
     def _restore_window_geometry(self):
         """Reapply the last saved window position/size, if valid. Vertically clamp so
@@ -3198,6 +3200,45 @@ class App:
         self._geo_save_after = None
         try:
             save_settings({"window_geometry": self.root.geometry()})
+        except Exception:
+            pass
+
+    def _save_sashes(self):
+        """Persist the positions of the content paned-window dividers so the three
+        sections (queue | progress | details) keep their user-chosen widths across
+        launches. Called on every divider release."""
+        h = getattr(self, "_paned_h", None)
+        if not h:
+            return
+        try:
+            xs = [h.sash_coord(0)[0], h.sash_coord(1)[0]]
+            if all(isinstance(x, int) and x > 0 for x in xs):
+                save_settings({"sash_h": xs})
+        except Exception:
+            pass
+
+    def _restore_sashes(self):
+        """Reapply the saved divider positions for the 3-section content area. On
+        first run (or invalid data) fall back to sensible proportions of the current
+        width; if the layout has not settled yet, retry shortly."""
+        h = getattr(self, "_paned_h", None)
+        if not h:
+            return
+        try:
+            self.root.update_idletasks()
+            W = h.winfo_width()
+            if W < 200:
+                self.root.after(300, self._restore_sashes)
+                return
+            sh = load_settings().get("sash_h")
+            if not (isinstance(sh, list) and len(sh) >= 2
+                    and all(isinstance(x, int) for x in sh)):
+                sh = [int(W * 0.30), int(W * 0.63)]
+            # Clamp into the visible range and keep the two dividers apart.
+            a = max(120, min(int(sh[0]), W - 240))
+            b = max(a + 120, min(int(sh[1]), W - 120))
+            h.sash_place(0, a, 1)
+            h.sash_place(1, b, 1)
         except Exception:
             pass
 
@@ -3330,7 +3371,7 @@ class App:
         self.cancel_btn.grid(row=0, column=4, padx=(0, 6), pady=2, sticky="e")
         self.cancel_btn.configure(state="disabled")
 
-        self._button(header, "🩹  Patch integrieren", self._open_patch_dialog, width=180).grid(row=1, column=0, columnspan=2, padx=12, pady=2, sticky="w")
+        self._button(header, "🩹  Patch integrieren", self._open_patch_dialog, width=170).grid(row=1, column=1, padx=(0, 8), pady=2, sticky="e")
         self._button(header, "☀ Light / 🌙 Dark", self._toggle_theme, width=150).grid(row=1, column=2, padx=12, sticky="e")
         self._button(header, "⚙  Settings", self.open_settings, width=120).grid(row=1, column=3, columnspan=2, padx=(0, 4), sticky="e")
 
@@ -3395,16 +3436,18 @@ class App:
         ctk.CTkEntry(top, textvariable=self.temp_var, placeholder_text="Temp folder on fast drive...",
                       fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=5, sticky="ew", padx=(0, 14), pady=14)
 
-        # ── Content area (3 columns: queue, progress, details)
-        content = ctk.CTkFrame(main, fg_color=BLACK)
+        # ── Content area: 3 user-resizable sections (queue | progress | details).
+        #    A horizontal paned window lets the user drag the two dividers; the sash
+        #    positions are persisted across launches (see _save_sashes/_restore_sashes).
+        content = tk.PanedWindow(main, orient="horizontal", bg="#2a2a2a", sashwidth=8,
+                                 sashrelief="flat", bd=0, opaqueresize=True)
         content.grid(row=2, column=0, sticky="nsew", padx=18, pady=6)
-        content.grid_columnconfigure(0, weight=3, minsize=420)   # left: queue + options
-        content.grid_columnconfigure(1, weight=4, minsize=560)   # center: progress + stages
-        content.grid_columnconfigure(2, weight=5, minsize=460)   # right: game details + cmd
-        content.grid_rowconfigure(0, weight=1)
+        self._paned_h = content
+        content.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
 
         # ── Left: Queue + Options ────────────────────────────────────────────
-        left = self.panel(content, row=0, column=0, sticky="nsew", padx=(0, 10))
+        left = ctk.CTkFrame(content, fg_color=PANEL, border_width=1, border_color=BORDER, corner_radius=10)
+        content.add(left, minsize=300, stretch="always")
         left.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(left, text="QUEUE", font=ctk.CTkFont(size=16, weight="bold"),
@@ -3533,7 +3576,7 @@ class App:
 
         # ── Center: Progress + Stages ────────────────────────────────────────
         center = ctk.CTkFrame(content, fg_color=BLACK)
-        center.grid(row=0, column=1, sticky="nsew", padx=(0, 6))
+        content.add(center, minsize=360, stretch="always")
         center.grid_columnconfigure(0, weight=1)
         center.grid_rowconfigure(0, weight=0)
         center.grid_rowconfigure(1, weight=0)
@@ -3670,7 +3713,7 @@ class App:
 
         # ── Right: Game Details + Command Preview ────────────────────────────
         right = ctk.CTkFrame(content, fg_color=BLACK)
-        right.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+        content.add(right, minsize=300, stretch="always")
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
 

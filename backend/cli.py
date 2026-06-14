@@ -287,17 +287,22 @@ def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
     base = outdir / f"{title_id or 'game'}_exfat"
     out = outdir / f"{title_id or 'game'}.exfat"
     print("[INFO] Building exFAT image from the game folder via hdiutil...", flush=True)
+    # UDTO = a RAW image (no UDIF/koly trailer), so it survives MkPFS's 64 KB padding
+    # round-trip and re-mounts cleanly (UDRW's trailer does NOT). COPYFILE_DISABLE keeps
+    # macOS from injecting AppleDouble ._* sidecars into the volume.
+    env = dict(os.environ)
+    env["COPYFILE_DISABLE"] = "1"
     try:
         r = subprocess.run(
             ["hdiutil", "create", "-srcfolder", str(folder), "-fs", "ExFAT",
-             "-volname", vol, "-layout", "NONE", "-format", "UDRW",
+             "-volname", vol, "-layout", "NONE", "-format", "UDTO",
              "-nospotlight", "-ov", "-o", str(base)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
     except Exception as e:
         print(f"[WARN] hdiutil failed to start: {e}", flush=True)
         return None
-    dmg = base.with_suffix(".dmg")
+    dmg = base.with_suffix(".cdr")   # UDTO output extension
     if r.returncode != 0 or not dmg.exists():
         print(f"[WARN] hdiutil exFAT build failed (rc={r.returncode}): {r.stderr.strip()[:300]}", flush=True)
         try:
@@ -306,10 +311,106 @@ def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
         except Exception:
             pass
         return None
-    # -layout NONE + UDRW yields a raw exFAT volume; rename so the backend treats it as one.
+    # -layout NONE + UDTO yields a RAW exFAT volume; rename so the backend treats it as one.
     dmg.rename(out)
     print(f"[OK] exFAT image built: {out.name} ({out.stat().st_size // (1024**2)} MiB)", flush=True)
     return out
+
+
+def _extract_exfat_to(exfat_path: Path, dest: Path) -> bool:
+    """macOS: mount a RAW exFAT image (CRawDiskImage) read-only and copy its contents
+    into *dest*, skipping AppleDouble/OS junk. Returns True on success. Used to turn a
+    nested exFAT (from a --via-exfat .ffpfsc) back into a plain folder."""
+    if sys.platform != "darwin" or shutil.which("hdiutil") is None:
+        print("[WARN] A nested exFAT image needs macOS (hdiutil) to extract to a folder; "
+              "leaving the .exfat in place.", flush=True)
+        return False
+    mnt = dest / "_exfat_mnt"
+    try:
+        mnt.mkdir(exist_ok=True)
+    except Exception:
+        return False
+    a = subprocess.run(
+        ["hdiutil", "attach", str(exfat_path), "-imagekey", "diskimage-class=CRawDiskImage",
+         "-nobrowse", "-readonly", "-mountpoint", str(mnt)],
+        capture_output=True, text=True,
+    )
+    if a.returncode != 0:
+        print(f"[WARN] Could not mount the nested exFAT image: {a.stderr.strip()[:200]}", flush=True)
+        try:
+            mnt.rmdir()
+        except Exception:
+            pass
+        return False
+    def _ad_ignore(_srcdir, names):
+        # macOS injects AppleDouble ._* sidecars (and Spotlight/Trash dirs) onto exFAT;
+        # drop them at EVERY level so the recovered folder is clean game content only.
+        return [n for n in names if n.startswith("._") or n in (
+            ".DS_Store", ".Spotlight-V100", ".fseventsd", ".Trashes",
+            ".TemporaryItems", "System Volume Information")]
+    ok = True
+    try:
+        for child in mnt.iterdir():
+            if _ad_ignore(mnt, [child.name]):
+                continue
+            target = dest / child.name
+            if child.is_dir():
+                shutil.copytree(child, target, dirs_exist_ok=True, ignore=_ad_ignore)
+            else:
+                shutil.copy2(child, target)
+    except Exception as e:
+        print(f"[WARN] Error copying from the exFAT image: {e}", flush=True)
+        ok = False
+    finally:
+        subprocess.run(["hdiutil", "detach", str(mnt), "-force"], capture_output=True)
+        try:
+            mnt.rmdir()
+        except Exception:
+            pass
+    if ok:
+        try:
+            exfat_path.unlink()
+        except Exception:
+            pass
+    return ok
+
+
+def _fully_unwrap(out_dir: Path, mkpfs_cmd_base, mkpfs_cwd) -> None:
+    """Turn a freshly-unpacked image directory into the actual game FOLDER: keep
+    unwrapping a SINGLE nested image — .ffpfs/.ffpfsc via another PFS unpack, .exfat/
+    .ffpkg via a mount+copy (macOS) — until real files/folders remain. So 'unpack a
+    .ffpfsc' yields a folder in ONE action, whether it was packed folder->ffpfsc (the
+    nested inner .ffpfs) or via exFAT (the nested .exfat)."""
+    for _ in range(8):
+        try:
+            entries = [p for p in out_dir.iterdir()
+                       if not (p.name.startswith("._") or p.name == ".DS_Store")]
+        except Exception:
+            return
+        pfs = [p for p in entries if p.is_file() and p.suffix.lower() in (".ffpfs", ".ffpfsc")]
+        exf = [p for p in entries if p.is_file() and p.suffix.lower() in (".exfat", ".ffpkg")]
+        others = [p for p in entries if p not in pfs and p not in exf]
+        if others:
+            return   # real content present → this IS the folder
+        if len(pfs) == 1 and not exf:
+            img = pfs[0]
+            print(f"[INFO] Unwrapping nested image {img.name} -> folder...", flush=True)
+            with tempfile.TemporaryDirectory(dir=out_dir) as td:
+                sub = Path(td)
+                unpack_pfs_image(img, sub, mkpfs_cmd_base, mkpfs_cwd, overwrite=True)
+                try:
+                    img.unlink()
+                except Exception:
+                    pass
+                for child in list(sub.iterdir()):
+                    shutil.move(str(child), str(out_dir / child.name))
+            continue
+        if len(exf) == 1 and not pfs:
+            print(f"[INFO] Unwrapping nested exFAT {exf[0].name} -> folder...", flush=True)
+            if _extract_exfat_to(exf[0], out_dir):
+                continue
+            return   # couldn't extract (non-macOS) — leave the .exfat for the user
+        return   # nothing single to unwrap (empty / multiple images)
 
 
 def pack_folder_uncompressed(
@@ -557,6 +658,9 @@ def main() -> None:
                         help="Build an exFAT image of the game folder and compress THAT into "
                              ".ffpfsc (PSBrew's most-stable exfat->ffpfsc path; macOS only, "
                              "falls back to the two-pass folder image otherwise)")
+    parser.add_argument("--no-unwrap", dest="unwrap", action="store_false", default=True,
+                        help="When unpacking, stop at the inner image instead of unwrapping "
+                             "all the way to a game folder (default: unwrap to a folder)")
     parser.add_argument("--verify",       action="store_true", help="Run MkPFS post-build verification (slower, more RAM)")
     parser.add_argument("--batch",        action="store_true", help="Process all supported items found under source")
     parser.add_argument("-f", "--force", "--overwrite", dest="overwrite", action="store_true", help="Overwrite existing files")
@@ -803,6 +907,11 @@ def main() -> None:
                 mkpfs_cwd,
                 overwrite=args.overwrite,
             )
+            # Unwrap nested images all the way to a folder (ffpfsc -> inner .ffpfs ->
+            # game files, or ffpfsc -> inner .exfat -> mount+copy), so one unpack action
+            # yields a folder regardless of how the image was packed.
+            if getattr(args, "unwrap", True):
+                _fully_unwrap(current_output_dir, mkpfs_cmd_base, mkpfs_cwd)
         print("\n[SUCCESS] All operations completed successfully!")
         return
 

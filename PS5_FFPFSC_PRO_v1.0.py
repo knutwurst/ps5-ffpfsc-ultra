@@ -11,6 +11,7 @@ import hashlib
 import zipfile
 import threading
 import subprocess
+import signal
 import shutil
 import multiprocessing
 from pathlib import Path
@@ -92,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.11"
+APP_VERSION = "1.0.12"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1490,8 +1491,12 @@ class ArchiveExtractor:
         Type checks first; the string match is phrase-anchored so an unrelated
         error mentioning a file like ``passwords.txt`` or an offset like
         ``error 224`` does not get misread as a password failure."""
-        if isinstance(e, PermissionError):
-            return True
+        # A bare PermissionError is a real filesystem permission problem, NOT a wrong
+        # password — no archive lib here reports a bad password that way (ZIP raises
+        # RuntimeError("Bad password"), py7zr/RAR raise their own types or error 22/24).
+        # Letting it fall through to the message regex below means a password-mentioning
+        # error still counts, but a genuine FS error surfaces correctly instead of being
+        # mislabelled "wrong password" (which would also burn every saved password).
         if type(e).__name__ in ("RarWrongPassword", "PasswordRequired",
                                  "WrongPassword", "BadPassword", "PasswordError"):
             return True
@@ -2247,6 +2252,12 @@ class CLIWorker(threading.Thread):
         self.last_log_ui = 0
         self.phase = "Starting"
         self.operation = getattr(item, "operation", "pack")
+        # Snapshot the copy-extras toggle on the MAIN thread (CLIWorker is constructed
+        # there); Tk variables are not safe to read from the worker thread.
+        try:
+            self.copy_siblings = bool(app.copy_siblings_var.get())
+        except Exception:
+            self.copy_siblings = True
         self.output_path = ""
         self.final_size = 0
         self.speed = "—"
@@ -2330,6 +2341,9 @@ class CLIWorker(threading.Thread):
                 universal_newlines=True,
                 env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                # Own session/process group on POSIX so cancel/close can kill the
+                # whole tree (backend + mkpfs mp.Pool workers), not just the parent.
+                start_new_session=(os.name != "nt"),
             )
             self.app.current_process = self.proc
 
@@ -2863,8 +2877,7 @@ class CLIWorker(threading.Thread):
         siblings = getattr(self.item, "bundle_siblings", None)
         if not siblings:
             return
-        var = getattr(self.app, "copy_siblings_var", None)
-        if var is not None and not var.get():
+        if not getattr(self, "copy_siblings", True):
             self.app.log("INFO", "Copy extras is off — leaving DLC/extra files in the source folder.")
             return
         dest_dir = self.output_dir
@@ -2963,15 +2976,7 @@ class CLIWorker(threading.Thread):
         )
 
     def _terminate(self):
-        try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-        except Exception:
-            pass
+        _kill_process_tree(self.proc)
 
 
 # Stage definitions: (full backend name, short display label)
@@ -2987,11 +2992,49 @@ _STAGE_DEFS = [
     ("Complete",            "Done"),
 ]
 
+def _kill_process_tree(proc) -> None:
+    """Terminate a backend subprocess AND its child process group (the mkpfs
+    multiprocessing Pool workers). The backend is launched with start_new_session,
+    so its pgid == its pid; killing the group stops the forked workers too — a bare
+    proc.terminate() leaves them orphaned, burning CPU and writing temp with no UI."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
+    except Exception:
+        pass
+
+
 # ─── Main Application ──────────────────────────────────────────────────────────
 
 class App:
     def __init__(self, root):
         self.root = root
+        # Capture first-run BEFORE _setup() seeds settings.json — is_first_run() is a
+        # file-existence check, so once _setup writes the file it would always be False
+        # and the wizard would never appear for a genuinely new user.
+        self._is_first_run = is_first_run()
         self.queue = []
         self.current_process = None
         self.cancel_requested = False
@@ -3021,7 +3064,7 @@ class App:
         self._build()
         self._poll()
 
-        if is_first_run():
+        if self._is_first_run:
             self.root.after(200, self._show_first_run_wizard)
 
         # After the UI is fully loaded, remind user to report any untested games
@@ -3070,6 +3113,19 @@ class App:
             pass
 
     def _on_close(self):
+        # If a job is running, confirm and stop it (kill the whole backend tree)
+        # before quitting — otherwise the backend + mkpfs Pool keep running headless.
+        try:
+            if self.current_process and self.current_process.poll() is None:
+                if not messagebox.askyesno(
+                    "Quit?", "A job is still running.\n\nQuit and stop it?"
+                ):
+                    return
+                self.cancel_requested = True
+                self.extract_cancel_event.set()
+                _kill_process_tree(self.current_process)
+        except Exception:
+            pass
         self._save_window_geometry()
         try:
             self.root.destroy()
@@ -3956,6 +4012,17 @@ class App:
             self.log("INFO", "Archive payload detected: PS5 game folder")
             return "game", [extracted_root]
 
+        # Nested archive (archive inside the archive) — give a clear, actionable error
+        # instead of the misleading generic "no payload" message.
+        inner_archives = find_files_by_suffix(extracted_root, {".zip", ".rar", ".7z"})
+        if inner_archives:
+            names = ", ".join(sorted({a.name for a in inner_archives})[:5])
+            raise RuntimeError(
+                f"{archive_name} contains another archive ({names}), not a game.\n\n"
+                "Nested archives are not unpacked automatically — extract the inner "
+                "archive yourself first, then add the resulting game folder or disk image."
+            )
+
         raise RuntimeError(
             f"No supported payload found after extracting {archive_name}.\n\n"
             "Expected one of these inside the archive:\n"
@@ -4149,7 +4216,32 @@ class App:
                     self.scan_q.put(("archives_found", archives))
                     return
 
-                # 3. Nothing useful found
+                # 3a. Split .7z/.zip volumes (.7z.001 / .zip.001 / .z01) — not
+                #     recombined automatically. Recognise them so the user gets clear
+                #     guidance instead of a confusing "nothing found".
+                split_parts = []
+                try:
+                    for f in p.iterdir():
+                        n = f.name.lower()
+                        if f.is_file() and (re.search(r"\.7z\.\d{2,}$", n)
+                                            or re.search(r"\.zip\.\d{2,}$", n)
+                                            or re.search(r"\.z\d{2,}$", n)):
+                            split_parts.append(f.name)
+                except Exception:
+                    pass
+                if split_parts:
+                    sample = ", ".join(sorted(split_parts)[:4])
+                    self.scan_q.put((
+                        "error",
+                        f"Found split-archive parts in:\n{p}\n\n  {sample}\n\n"
+                        "Split .7z / .zip volumes are not recombined automatically. "
+                        "Recombine them into a single .7z, .zip or .rar first "
+                        "(e.g. with 7-Zip or Keka), then add that file.\n"
+                        "(Multi-part RAR — .partN.rar or .rNN — is supported directly.)"
+                    ))
+                    return
+
+                # 3b. Nothing useful found
                 self.log("WARN", f"No games, disk images, or archives found in {p}")
                 self.scan_q.put((
                     "error",
@@ -4543,15 +4635,15 @@ class App:
 
     def build_command(self, item):
         out = Path(self.output_var.get().strip())
-        # Give a single (non-batch) pack job a findable, descriptive output name
-        # "<Game> [v<ver>] [<TITLEID>].ffpfsc" when the user picked an output
-        # FOLDER. The backend honours an explicit .ffpfsc path (it only auto-names
-        # by title id when handed a directory). Batch keeps per-title-id names;
-        # an explicit .ffpfsc the user typed is respected as-is.
+        # Give every pack job a findable, descriptive, collision-resistant output name
+        # "<Game> [v<ver>] [<TITLEID>].ffpfsc" when the user picked an output FOLDER.
+        # The backend honours an explicit .ffpfsc path (it only auto-names by title id
+        # when handed a directory) — so naming by title id alone would let two queued
+        # games with the same title id overwrite each other in a batch. An explicit
+        # .ffpfsc the user typed is respected as-is.
         sub = getattr(item, "bundle_subfolder", None)
         if (getattr(item, "operation", "pack") == "pack"
-                and out.suffix.lower() != ".ffpfsc"
-                and (sub or not self.batch_var.get())):
+                and out.suffix.lower() != ".ffpfsc"):
             # Bundle: recreate the source folder under the output dir. Bundle
             # naming applies even in batch (each item has its own subfolder).
             base = (out / sanitize_filename(sub)) if sub else out
@@ -4874,11 +4966,7 @@ class App:
     def cancel(self):
         self.cancel_requested = True
         self.extract_cancel_event.set()
-        try:
-            if self.current_process and self.current_process.poll() is None:
-                self.current_process.terminate()
-        except Exception:
-            pass
+        _kill_process_tree(self.current_process)
         self.status_update("Cancelling", "Cancel requested.", "Cancelling", 0, 0, "—", "—", "—")
 
     def status_update(self, title, detail, stage, stage_pct, overall_pct, elapsed, speed, eta):
@@ -5469,13 +5557,17 @@ class App:
 
     # ── Sound + Summary ───────────────────────────────────────────────────────
     def play_complete_sound(self, success=True):
-        if not winsound:
-            return
         try:
-            if success and self.sound_complete_var.get():
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            elif not success and self.sound_error_var.get():
-                winsound.MessageBeep(winsound.MB_ICONHAND)
+            want = (success and self.sound_complete_var.get()) or \
+                   (not success and self.sound_error_var.get())
+            if not want:
+                return
+            if winsound:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK if success else winsound.MB_ICONHAND)
+            elif sys.platform == "darwin":
+                snd = "/System/Library/Sounds/Glass.aiff" if success else "/System/Library/Sounds/Basso.aiff"
+                subprocess.Popen(["afplay", snd],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
@@ -5510,6 +5602,16 @@ class App:
         open_path(RAW_LOG_FILE)
 
     def open_output_folder(self):
+        # Prefer the actual result location — a bundle lands in its own subfolder, not
+        # directly in the chosen output dir — then fall back to the output folder.
+        try:
+            out = getattr(self.worker, "output_path", "") if getattr(self, "worker", None) else ""
+            if out and Path(out).exists():
+                target = Path(out).parent if Path(out).is_file() else Path(out)
+                open_path(str(target))
+                return
+        except Exception:
+            pass
         p = self.output_var.get()
         if p and Path(p).exists():
             open_path(p)

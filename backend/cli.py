@@ -302,7 +302,8 @@ def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
     except Exception as e:
         print(f"[WARN] hdiutil failed to start: {e}", flush=True)
         return None
-    dmg = base.with_suffix(".cdr")   # UDTO output extension
+    dmg = Path(str(base) + ".cdr")   # hdiutil UDTO APPENDS .cdr; with_suffix() would
+                                     # mangle a title id containing a dot (e.g. 'Game v1.05')
     if r.returncode != 0 or not dmg.exists():
         print(f"[WARN] hdiutil exFAT build failed (rc={r.returncode}): {r.stderr.strip()[:300]}", flush=True)
         try:
@@ -325,9 +326,11 @@ def _extract_exfat_to(exfat_path: Path, dest: Path) -> bool:
         print("[WARN] A nested exFAT image needs macOS (hdiutil) to extract to a folder; "
               "leaving the .exfat in place.", flush=True)
         return False
-    mnt = dest / "_exfat_mnt"
+    # Mount OUTSIDE the destination so the mountpoint can never end up among the
+    # recovered files (a stranded _exfat_mnt inside dest would pollute the folder and
+    # _fully_unwrap would mistake it for real content).
     try:
-        mnt.mkdir(exist_ok=True)
+        mnt = Path(tempfile.mkdtemp(prefix="ffpfsc_exfatmnt_", dir=str(dest.parent)))
     except Exception:
         return False
     a = subprocess.run(
@@ -384,7 +387,8 @@ def _fully_unwrap(out_dir: Path, mkpfs_cmd_base, mkpfs_cwd) -> None:
     for _ in range(8):
         try:
             entries = [p for p in out_dir.iterdir()
-                       if not (p.name.startswith("._") or p.name == ".DS_Store")]
+                       if not (p.name.startswith("._") or p.name == ".DS_Store"
+                               or p.name == "_exfat_mnt" or p.name.startswith("ffpfsc_exfatmnt_"))]
         except Exception:
             return
         pfs = [p for p in entries if p.is_file() and p.suffix.lower() in (".ffpfs", ".ffpfsc")]
@@ -410,6 +414,9 @@ def _fully_unwrap(out_dir: Path, mkpfs_cmd_base, mkpfs_cwd) -> None:
             if _extract_exfat_to(exf[0], out_dir):
                 continue
             return   # couldn't extract (non-macOS) — leave the .exfat for the user
+        if pfs or exf:
+            print(f"[WARN] Stopped unwrapping — nested image(s) left in place: "
+                  f"{[p.name for p in (pfs + exf)]}. The output is NOT a plain folder.", flush=True)
         return   # nothing single to unwrap (empty / multiple images)
 
 
@@ -813,19 +820,35 @@ def main() -> None:
                 patch_dir = td / "_patch"
                 patch_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[INFO] Extracting patch archive '{patch_arg.name}'...", flush=True)
-                if patch_arg.suffix.lower() == ".zip":
-                    with zipfile.ZipFile(patch_arg) as zf:
-                        zf.extractall(patch_dir, pwd=args.password.encode() if args.password else None)
-                else:
-                    first = patch_arg
-                    m = re.match(r"^(?P<b>.*\.part)(?P<n>\d+)(?P<e>\.rar)$", patch_arg.name, re.I)
-                    if m:
-                        cand = patch_arg.with_name(f"{m.group('b')}{'1'.zfill(len(m.group('n')))}{m.group('e')}")
-                        if cand.exists():
-                            first = cand
-                    from unrar import rarfile
-                    with rarfile.RarFile(first, pwd=args.password or None) as rf:
-                        rf.extractall(str(patch_dir))
+                try:
+                    if patch_arg.suffix.lower() == ".zip":
+                        with zipfile.ZipFile(patch_arg) as zf:
+                            # Guard against Zip-Slip: every member must resolve inside patch_dir.
+                            root = patch_dir.resolve()
+                            for member in zf.infolist():
+                                dest = (patch_dir / member.filename).resolve()
+                                try:
+                                    dest.relative_to(root)
+                                except ValueError:
+                                    print(f"[ERROR] Patch ZIP path traversal blocked: {member.filename}")
+                                    sys.exit(1)
+                            zf.extractall(patch_dir, pwd=args.password.encode() if args.password else None)
+                    else:
+                        first = patch_arg
+                        m = re.match(r"^(?P<b>.*\.part)(?P<n>\d+)(?P<e>\.rar)$", patch_arg.name, re.I)
+                        if m:
+                            cand = patch_arg.with_name(f"{m.group('b')}{'1'.zfill(len(m.group('n')))}{m.group('e')}")
+                            if cand.exists():
+                                first = cand
+                        from unrar import rarfile  # bundled extractall already guards traversal
+                        with rarfile.RarFile(first, pwd=args.password or None) as rf:
+                            rf.extractall(str(patch_dir))
+                except SystemExit:
+                    raise
+                except Exception as exc:
+                    print(f"[ERROR] Patch archive extraction failed ('{patch_arg.name}'): {exc} "
+                          "(corrupt archive, or wrong/missing password)")
+                    sys.exit(1)
             if game_folder.is_file() and game_folder.suffix.lower() == ".ffpfsc":
                 print("[INFO] Unpacking the existing .ffpfsc to patch it (outer → inner → files)...", flush=True)
                 outer = td / "_outer"
@@ -931,6 +954,13 @@ def main() -> None:
         # directory, even under --batch. (--batch is a backend folder-scan mode that
         # expects a directory output; the GUI hands a descriptive .ffpfsc file path.)
         explicit_ffpfsc = ffpfs_path.suffix.lower() == ".ffpfsc"
+        # Guard: --batch writes one file per game; a single explicit .ffpfsc path would
+        # make every game overwrite the SAME file (only the last survives). Refuse it.
+        if args.batch and explicit_ffpfsc and len(game_items) > 1:
+            print(f"[ERROR] --batch with a single .ffpfsc output would overwrite all "
+                  f"{len(game_items)} games into one file. Point the output at a DIRECTORY "
+                  f"for batch mode.")
+            sys.exit(1)
         if args.batch and not explicit_ffpfsc:
             ffpfs_path.mkdir(parents=True, exist_ok=True)
         elif not ffpfs_path.is_dir() and not ffpfs_path.suffix:

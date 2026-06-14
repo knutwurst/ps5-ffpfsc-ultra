@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -519,7 +519,10 @@ def file_count(path: Path) -> int:
 
 
 def parse_title_id(path: Path) -> str:
-    m = TITLE_RE.search(str(path))
+    # Prefer the game's OWN folder name, then its param.json; only fall back to the
+    # full path last — a title id in a PARENT directory (e.g. a "[CUSA12345]" dump
+    # folder) must not win over the game's own id.
+    m = TITLE_RE.search(path.name)
     if m:
         return m.group(1).upper()
     try:
@@ -530,6 +533,9 @@ def parse_title_id(path: Path) -> str:
                 return m.group(1).upper()
     except Exception:
         pass
+    m = TITLE_RE.search(str(path))   # last resort: anywhere in the path
+    if m:
+        return m.group(1).upper()
     return "Unknown"
 
 
@@ -595,18 +601,26 @@ def descriptive_ffpfsc_name(item) -> str:
     """Build a findable output filename for *item*:
     '<Game Name> [v<version>] [<TITLEID>].ffpfsc'  (version omitted if unknown).
     Falls back to the title id alone if the name is missing."""
+    PLACEHOLDERS = {"Unknown", "📦", "💾", "📤", ""}
     tid = (getattr(item, "title_id", "") or "").strip()
+    if tid in PLACEHOLDERS:
+        tid = ""
     name = (getattr(item, "name", "") or "").strip()
-    if not name or name in ("Unknown", "📦") or name == tid:
+    if name in PLACEHOLDERS or name == tid:
         name = tid or "output"
-    parts = [name]
+    suffix_parts = []
     src = getattr(item, "path", None)
     ver = guess_game_version(src) if isinstance(src, Path) else ""
     if ver:
-        parts.append(f"[v{ver}]")
-    if tid and tid not in ("Unknown", "📦") and tid.lower() not in name.lower():
-        parts.append(f"[{tid}]")
-    return sanitize_filename(" ".join(parts)) + ".ffpfsc"
+        suffix_parts.append(f"[v{ver}]")
+    if tid and tid.lower() not in name.lower():
+        suffix_parts.append(f"[{tid}]")
+    suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
+    # Reserve room for the [v..][TITLEID] suffix + extension so those collision-resistant
+    # tags survive the filename-length cap instead of being truncated away.
+    name_budget = max(20, 180 - len(suffix) - len(".ffpfsc"))
+    name = sanitize_filename(name)[:name_budget].strip() or "output"
+    return sanitize_filename(name + suffix) + ".ffpfsc"
 
 
 def find_artwork(path: Path):
@@ -944,7 +958,7 @@ class SummaryDialog(ctk.CTkToplevel):
             self.clipboard_clear()
             self.clipboard_append(report)
             copy_btn.configure(text="✓ Copied!")
-            self.after(2000, lambda: copy_btn.configure(text="📋  Copy Result"))
+            self.after(2000, lambda: copy_btn.winfo_exists() and copy_btn.configure(text="📋  Copy Result"))
 
         copy_btn = ctk.CTkButton(btn_row, text="📋  Copy Result", command=_copy,
                                   fg_color=CARD2, hover_color=("#b0b0b0", "#2a2a2a"),
@@ -1281,9 +1295,11 @@ class SettingsWindow(ctk.CTkToplevel):
                                  text_color=GREEN, font=ctk.CTkFont(size=11, weight="bold"), width=24)
         _cl_lbl.grid(row=0, column=2)
         def _cl_cb(*_):
-            v = self.app.compression_level_var.get()
-            _cl_lbl.configure(text=str(v))
-            save_settings({"compression_level": v})
+            # The app-level var already persists on write (trace added at creation);
+            # this callback only refreshes the window-local label. Guard against firing
+            # after this Settings window was closed (the trace can outlive the label).
+            if _cl_lbl.winfo_exists():
+                _cl_lbl.configure(text=str(self.app.compression_level_var.get()))
         self.app.compression_level_var.trace_add("write", _cl_cb)
 
         ctk.CTkLabel(_st, text="CPU cores (0=auto):", text_color=WHITE,
@@ -1296,9 +1312,9 @@ class SettingsWindow(ctk.CTkToplevel):
                                   text_color=GREEN, font=ctk.CTkFont(size=11, weight="bold"), width=24)
         _cpu_lbl.grid(row=1, column=2)
         def _cpu_cb(*_):
-            v = self.app.cpu_count_var.get()
-            _cpu_lbl.configure(text="auto" if v == 0 else str(v))
-            save_settings({"cpu_count": v})
+            if _cpu_lbl.winfo_exists():
+                v = self.app.cpu_count_var.get()
+                _cpu_lbl.configure(text="auto" if v == 0 else str(v))
         self.app.cpu_count_var.trace_add("write", _cpu_cb)
 
         ctk.CTkLabel(_st, text="Block size:", text_color=WHITE,
@@ -4052,11 +4068,13 @@ class App:
     def add_source_to_queue(self):
         src_str = self._clean_path_str(self.source_var.get())
         if not src_str:
+            self.pending_start = False
             messagebox.showerror("Nothing selected",
                                   "Enter or browse to a game folder, archive, disk image, or PFS image (.ffpfs/.ffpfsc).")
             return
         src = Path(src_str)
         if not src.exists():
+            self.pending_start = False
             messagebox.showerror("Path not found",
                                   f"This path does not exist:\n{src}")
             return
@@ -4126,6 +4144,7 @@ class App:
                     f"Potential issues detected:\n\n{msg}\n\n"
                     "Expected: sce_sys/param.json and eboot.bin\n\nAdd anyway?"
                 ):
+                    self.pending_start = False
                     return
             self.status_update("Scanning", f"Reading {src.name}…",
                                 "Scanning Files", 0, 0, "00:00", "—", "—")
@@ -4465,8 +4484,8 @@ class App:
 
     def queue_remove_selected(self):
         idx = self._queue_sel_idx()
-        if idx is None:
-            return
+        if idx is None or not self.queue or idx >= len(self.queue):
+            return  # nothing selectable (e.g. the "Queue is empty" placeholder row)
         # Don't allow removing the currently running game
         if self._batch_running and idx == 0:
             messagebox.showwarning("In Progress",
@@ -4883,6 +4902,13 @@ class App:
         if not self.queue:
             self.pending_start = True
             self.add_source_to_queue()
+            # A synchronous path (single file in the Source field) queues immediately —
+            # honor the Start intent now. Async scans leave the queue empty and let the
+            # scan_q handler consume pending_start instead; failed adds clear it (below),
+            # so it can't linger and silently auto-start a later, unrelated add.
+            if self.queue and self.pending_start:
+                self.pending_start = False
+                self.start()
             return
 
         item = self.queue[0]
@@ -5210,13 +5236,22 @@ class App:
                                       headers={"Content-Type": "application/json"})
                     with _ur.urlopen(req, timeout=15) as resp:
                         resp.read()
-                    win.after(0, lambda: status_lbl.configure(
-                        text="✓ Sent! Thank you for contributing.", text_color=("#1a7a40", "#4ade80")))
+                    try:
+                        win.after(0, lambda: status_lbl.configure(
+                            text="✓ Sent! Thank you for contributing.", text_color=("#1a7a40", "#4ade80")))
+                    except Exception:
+                        pass   # dialog already closed
                     self.log("OK", f"Compat report sent: {item.name} — {report['status']}")
-                    win.after(2000, win.destroy)
+                    try:
+                        win.after(2000, win.destroy)
+                    except Exception:
+                        pass
                 except Exception as e:
-                    win.after(0, lambda: status_lbl.configure(
-                        text=f"⚠ Send failed: {e}", text_color=RED))
+                    try:
+                        win.after(0, lambda: status_lbl.configure(
+                            text=f"⚠ Send failed: {e}", text_color=RED))
+                    except Exception:
+                        pass
                     self.log("WARN", f"Community share failed: {e}")
             threading.Thread(target=_post, daemon=True).start()
 
@@ -5624,12 +5659,16 @@ class App:
     def update_stages_display(self, current_stage, pct):
         full_names   = [s[0] for s in _STAGE_DEFS]
         current_idx  = full_names.index(current_stage) if current_stage in full_names else -1
+        # Only tick a prior stage ✓ if it was ACTUALLY entered — pack and unpack use
+        # disjoint subsets of _STAGE_DEFS, so a raw index check would mark e.g.
+        # "✓ Compress" during an unpack or "✓ Extract" during a pack.
+        sp = getattr(self.worker, "stage_progress", {}) if getattr(self, "worker", None) else {}
         for i, (lbl, (full, short)) in enumerate(zip(self._stage_labels, _STAGE_DEFS)):
-            if current_idx >= 0 and i < current_idx:
-                lbl.configure(text=f"✓ {short}", text_color=("#1a7a40", "#4ade80"))
-            elif i == current_idx:
+            if i == current_idx:
                 dp = min(int(pct), 99) if full == "Creating Temp PFS" else int(pct)
                 lbl.configure(text=f"▶ {short} {dp}%", text_color=YELLOW)
+            elif current_idx >= 0 and i < current_idx and sp.get(full, 0) >= 100:
+                lbl.configure(text=f"✓ {short}", text_color=("#1a7a40", "#4ade80"))
             else:
                 lbl.configure(text=f"○ {short}", text_color=MUTED)
 
@@ -5997,9 +6036,18 @@ class App:
                         if self.summary_popup_var.get():
                             self.show_summary_popup()
 
-                # Prompt user to share compatibility data
+                # Prompt user to share compatibility data — but never stacked on top of
+                # the summary popup; wait until no modal dialog is grabbing input.
                 if completed_operation != "unpack":
-                    self.root.after(400, lambda: self._prompt_compat_share(completed_item, _final_sz))
+                    def _share_when_free(_i=completed_item, _s=_final_sz):
+                        try:
+                            if self.root.grab_current() is not None:
+                                self.root.after(500, _share_when_free)
+                                return
+                        except Exception:
+                            pass
+                        self._prompt_compat_share(_i, _s)
+                    self.root.after(400, _share_when_free)
             elif self.cancel_requested or self.extract_cancel_event.is_set():
                 # A user cancel surfaces here as a failed result — treat it as a cancel,
                 # not a failure: stop the batch and don't inflate the failed count.

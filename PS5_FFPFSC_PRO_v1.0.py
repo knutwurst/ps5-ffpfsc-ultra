@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.15"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3284,6 +3284,9 @@ class App:
         self.unpack_mode_var = tk.BooleanVar(value=False)  # session state — not persisted
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
+        # Drive-usage mode: auto | temp | spread (where archives get extracted).
+        self.drive_mode_var = tk.StringVar(value=settings.get("drive_mode", "auto"))
+        self.drive_mode_var.trace_add("write", lambda *_: save_settings({"drive_mode": self.drive_mode_var.get()}))
         # MkPFS 0.0.8 tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
@@ -3430,6 +3433,25 @@ class App:
         ]:
             ctk.CTkCheckBox(opts, text=textv, variable=var, fg_color=GREEN, hover_color=GREEN2,
                              text_color=WHITE).pack(anchor="w", pady=5)
+
+        # Drive usage mode — where archives get extracted (temp/SSD vs the output drive)
+        _dm_row = ctk.CTkFrame(opts, fg_color=PANEL)
+        _dm_row.pack(fill="x", anchor="w", pady=(8, 2))
+        ctk.CTkLabel(_dm_row, text="Drive usage:", text_color=WHITE,
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
+        _dm_labels = {"auto": "Auto (smart)", "temp": "Temp drive only", "spread": "Spread across drives"}
+        _dm_rev = {v: k for k, v in _dm_labels.items()}
+        _dm_menu = ctk.CTkOptionMenu(
+            _dm_row, values=list(_dm_labels.values()), width=190,
+            fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2, text_color=WHITE,
+            dropdown_fg_color=CARD2, dropdown_text_color=WHITE,
+            command=lambda disp: self.drive_mode_var.set(_dm_rev.get(disp, "auto")))
+        _dm_menu.set(_dm_labels.get(self.drive_mode_var.get(), "Auto (smart)"))
+        _dm_menu.pack(side="left")
+        ctk.CTkLabel(opts,
+                      text="  Auto: extract to the output drive when the temp/SSD is too small for a big archive.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11),
+                      justify="left").pack(anchor="w", padx=4, pady=(0, 4))
 
         ctk.CTkLabel(opts,
                       text="  FOLDER button detects single games and multi-dump parent folders.",
@@ -4279,13 +4301,112 @@ class App:
 
         threading.Thread(target=_scan_folder, daemon=True).start()
 
-    def _extract_and_queue_archive(self, archive: Path):
-        """Extract *archive* to the temp folder (background thread) with live progress, then queue."""
+    def _archive_set_size(self, archive: Path) -> int:
+        """Total on-disk size of the archive's volume set (scene archives are usually
+        stored, so this ~= the extracted payload size). Used for the auto drive decision."""
+        try:
+            base = re.sub(
+                r'(\.part\d+\.rar|\.r\d{2,}|\.7z\.\d+|\.zip\.\d+|\.z\d+|\.\d{3}|\.rar|\.zip|\.7z)$',
+                '', archive.name, flags=re.I)
+            total = 0
+            for p in archive.parent.iterdir():
+                if p.is_file() and p.name.startswith(base):
+                    try:
+                        total += p.stat().st_size
+                    except OSError:
+                        pass
+            return total or archive.stat().st_size
+        except Exception:
+            try:
+                return archive.stat().st_size
+            except Exception:
+                return 0
+
+    def _resolve_extract_root(self, archive: Path) -> Path:
+        """Decide where to extract *archive*, per the Drive-usage mode (drive_mode_var):
+          temp   -> <temp>/_extracted              (everything on the temp drive)
+          spread -> <output drive>/_ffpfsc_extract  (keep the extracted source off temp)
+          auto   -> spread when the temp drive can't hold extracted-source + inner image,
+                    else temp.
+        Never extracts onto the SOURCE drive (the HDD read+write contention the user
+        flagged); falls back to temp if no usable output drive is set or it shares the
+        source's drive."""
         temp_base = self.temp_var.get().strip()
         if not temp_base:
             temp_base = str(archive.parent / "_ffpfsc_temp")
             self.temp_var.set(temp_base)
-        extract_root = Path(temp_base) / "_extracted"
+        temp_root = Path(temp_base) / "_extracted"
+        mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
+        out_str = self.output_var.get().strip()
+        if mode == "temp" or not out_str:
+            return temp_root
+        out_dir = Path(out_str)
+        try:
+            probe_out = out_dir if out_dir.exists() else out_dir.parent
+            if same_drive(probe_out, archive.parent):
+                return temp_root   # output drive == source drive → avoid HDD contention
+        except Exception:
+            return temp_root
+        spread_root = out_dir / "_ffpfsc_extract"
+        if mode == "spread":
+            self.log("INFO", f"Drive mode 'spread': extracting to the output drive — {out_dir}")
+            return spread_root
+        # auto: keep the extracted source off temp only when temp can't hold ~2x it
+        est = self._archive_set_size(archive)
+        try:
+            if get_free_space(Path(temp_base)) >= int(est * 2.10):
+                return temp_root   # temp holds extracted source + inner image comfortably
+            if get_free_space(probe_out) >= int(est * 1.10):
+                self.log("INFO",
+                         "Auto drive mode: temp is tight — extracting to the output drive "
+                         "so the SSD only needs the compressed image.")
+                return spread_root
+        except Exception:
+            pass
+        return temp_root
+
+    def _extract_dir_for_item(self, item):
+        """The extract subdir THIS item was unpacked into (under a temp '_extracted' or
+        an output-drive '_ffpfsc_extract' folder), or None for a plain (non-extracted)
+        source. Used so cleanup only ever removes this item's own data."""
+        try:
+            src = Path(getattr(item, "path", "") or "").resolve()
+        except Exception:
+            return None
+        for parent in src.parents:
+            if parent.name in ("_extracted", "_ffpfsc_extract"):
+                try:
+                    return parent / src.relative_to(parent).parts[0]
+                except Exception:
+                    return None
+        return None
+
+    def _cleanup_item_extract(self, item) -> None:
+        """After an item finishes, remove ITS OWN extracted-source subdir (temp or output
+        drive). Safe — only this item's subdir, never another's. Threaded (rmtree large)."""
+        own = self._extract_dir_for_item(item)
+        if own is None:
+            return
+        def _work(d=own):
+            try:
+                if d.exists():
+                    sz = get_folder_size(d)
+                    shutil.rmtree(str(d), ignore_errors=True)
+                    if sz:
+                        self.log("INFO", f"Cleaned {format_size(sz)} extracted source from {d.parent.name}.")
+                if d.parent.name == "_ffpfsc_extract":
+                    try:
+                        if not any(d.parent.iterdir()):
+                            d.parent.rmdir()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _extract_and_queue_archive(self, archive: Path):
+        """Extract *archive* (background thread) with live progress, then queue."""
+        extract_root = self._resolve_extract_root(archive)
 
         self.log("INFO", f"Extracting archive: {archive.name}")
         self.cancel_requested = False
@@ -4384,11 +4505,7 @@ class App:
     def _extract_queued_item(self, item):
         """Extract item.archive_path in a background thread, then call start() again."""
         archive = item.archive_path
-        temp_base = self.temp_var.get().strip()
-        if not temp_base:
-            temp_base = str(archive.parent / "_ffpfsc_temp")
-            self.temp_var.set(temp_base)
-        extract_root = Path(temp_base) / "_extracted"
+        extract_root = self._resolve_extract_root(archive)
 
         item.status = "Extracting"
         self.cancel_requested = False
@@ -4742,14 +4859,17 @@ class App:
             except Exception:
                 pass
             try:
-                ex_root = (temp_dir / "_extracted").resolve()
-                src = Path(getattr(item, "path", "") or "").resolve()
-                if ex_root in src.parents:
-                    own = ex_root / src.relative_to(ex_root).parts[0]
-                    if own.exists():
-                        sz = get_folder_size(own)
-                        shutil.rmtree(str(own), ignore_errors=True)
-                        freed += sz
+                own = self._extract_dir_for_item(item)   # temp/_extracted OR output/_ffpfsc_extract
+                if own is not None and own.exists():
+                    sz = get_folder_size(own)
+                    shutil.rmtree(str(own), ignore_errors=True)
+                    freed += sz
+                    if own.parent.name == "_ffpfsc_extract":
+                        try:
+                            if not any(own.parent.iterdir()):
+                                own.parent.rmdir()
+                        except Exception:
+                            pass
             except Exception:
                 pass
             if freed:
@@ -6019,6 +6139,10 @@ class App:
                 # Feature 5: auto-clear temp after success
                 if self.auto_clear_temp_var.get():
                     self._auto_clear_temp()
+                # Always reclaim THIS item's extracted source — covers the spread-mode
+                # extract on the OUTPUT drive, which _auto_clear_temp (temp only) misses.
+                if completed_item is not None:
+                    self._cleanup_item_extract(completed_item)
 
                 # Feature 4: batch auto-advance
                 if self._batch_running and self.queue:

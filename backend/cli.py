@@ -563,7 +563,11 @@ def main() -> None:
     with prepare_source_path(game_folder) as active_source_path:
         game_items = find_game_items(active_source_path, args.batch)
 
-        if args.batch:
+        # An explicit .ffpfsc output is a single-FILE target — never mkdir it into a
+        # directory, even under --batch. (--batch is a backend folder-scan mode that
+        # expects a directory output; the GUI hands a descriptive .ffpfsc file path.)
+        explicit_ffpfsc = ffpfs_path.suffix.lower() == ".ffpfsc"
+        if args.batch and not explicit_ffpfsc:
             ffpfs_path.mkdir(parents=True, exist_ok=True)
         elif not ffpfs_path.is_dir() and not ffpfs_path.suffix:
             ffpfs_path.mkdir(parents=True, exist_ok=True)
@@ -572,7 +576,7 @@ def main() -> None:
             title_id = get_title_id(item)
             ext = ".ffpfsc"
 
-            if args.batch or ffpfs_path.is_dir():
+            if (args.batch and not explicit_ffpfsc) or ffpfs_path.is_dir():
                 current_ffpfs_path = ffpfs_path / f"{title_id}{ext}"
             else:
                 current_ffpfs_path = ffpfs_path.with_suffix(ext)

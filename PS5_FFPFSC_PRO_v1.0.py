@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.25"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -285,8 +285,26 @@ def archive_set_ondisk_size(archive: Path) -> int:
 
 def _build_size_of(item) -> int:
     """The honest EXTRACTED size to base space decisions on: the header-read extracted
-    size when known, else item.size (already extracted for folders/disk images)."""
-    return int(getattr(item, "extracted_size", 0) or getattr(item, "size", 0) or 0)
+    size when known, else item.size (already extracted for folders/disk images). For an
+    ARCHIVE whose header could not be read (extracted_size == 0), return 0 = UNKNOWN so
+    the gate/placement take the safe path (route to the larger drive / defer) instead of
+    silently using the much-smaller COMPRESSED size and false-passing onto a small SSD."""
+    es = getattr(item, "extracted_size", 0)
+    if es:
+        return int(es)
+    if getattr(item, "source_kind", None) == "archive":
+        return 0   # unknown extracted size — do NOT fall back to compressed size
+    return int(getattr(item, "size", 0) or 0)
+
+
+# A tempfile.mkdtemp()-created scratch dir is "tmp" + exactly 8 chars from [a-z0-9_]
+# (the prefix mkpfs/the backend use). Match that EXACTLY so cleanup never rmtrees an
+# unrelated user folder that merely starts with "tmp" (e.g. "tmp_notes", "Tmp Renders").
+_APP_TMP_RE = re.compile(r"tmp[a-z0-9_]{8}$")
+
+
+def _is_app_tmp_dir(name: str) -> bool:
+    return bool(_APP_TMP_RE.fullmatch(name))
 
 
 def _peak_factor_for(item) -> float:
@@ -2231,7 +2249,7 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None, dete
     try:
         entries = list(folder.iterdir())
     except Exception:
-        return None, [], []
+        return None, [], [], None   # 4-tuple — callers unpack (game, siblings, all_games, patch)
     files = [p for p in entries if p.is_file()]
     subdirs = [p for p in entries if p.is_dir()]
 
@@ -3465,7 +3483,11 @@ class App:
             self.root.update_idletasks()
             W = h.winfo_width()
             if W < 200:
-                self.root.after(300, self._restore_sashes)
+                # Layout not settled yet — retry a bounded number of times, then give up
+                # (a degenerate <200px width must not arm a perpetual 300 ms timer).
+                self._sash_restore_tries = getattr(self, "_sash_restore_tries", 0) + 1
+                if self._sash_restore_tries <= 12:
+                    self.root.after(300, self._restore_sashes)
                 return
             sh = load_settings().get("sash_h")
             if not (isinstance(sh, list) and len(sh) >= 2
@@ -3518,8 +3540,15 @@ class App:
         self._saved_output = settings.get("output_folder", "")
         self._saved_temp = settings.get("temp_folder", "")
         self._saved_auto_clear_temp = settings.get("auto_clear_temp", False)
-        self._saved_compression_level = settings.get("compression_level", 7)
-        self._saved_cpu_count = settings.get("cpu_count", 0)
+        def _safe_int(v, default):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+        # Coerce defensively: a hand-edited / corrupt non-numeric value here would make
+        # tk.IntVar(value=...) raise TclError and hard-crash the GUI at startup.
+        self._saved_compression_level = _safe_int(settings.get("compression_level", 7), 7)
+        self._saved_cpu_count = _safe_int(settings.get("cpu_count", 0), 0)
         self._saved_block_size = settings.get("block_size", "auto")
         # Migrate console-incompatible block sizes: "auto-fit" (picks 4 KiB for many-file
         # games) and explicit sub-64K values build images the PS5 misreads → crash. The
@@ -4317,9 +4346,18 @@ class App:
             pass
         ARCH = (".zip", ".rar", ".7z")
 
+        # Snapshot every Tk var on the MAIN thread — reading tk.*Var.get() from the worker
+        # thread below is cross-thread Tcl access (RuntimeError / corrupt value / segfault,
+        # especially on macOS). Everywhere else in the app already snapshots like this.
+        snap_pw = self._candidate_passwords()
+        snap_cl = self.compression_level_var.get()
+        snap_cpu = self.cpu_count_var.get()
+        snap_bs = self.block_size_var.get()
+        snap_verbose = self.verbose_var.get()
+
         def work():
             try:
-                pw = self._candidate_passwords()
+                pw = snap_pw
                 patch_inplace = False
                 gsfx = game.suffix.lower()
                 # resolve the GAME to something the backend --patch understands
@@ -4364,13 +4402,10 @@ class App:
                 cmd = head + ["--patch", str(patch_dir), "--temp-dir", temp_base, "--overwrite"]
                 if patch_inplace:
                     cmd += ["--patch-inplace"]
-                cl = self.compression_level_var.get()
-                if cl != 7: cmd += ["--compression-level", str(cl)]
-                cpu = self.cpu_count_var.get()
-                if cpu != 0: cmd += ["--cpu-count", str(cpu)]
-                bs = self.block_size_var.get()
-                if bs and bs != "auto": cmd += ["--block-size", bs]
-                if self.verbose_var.get(): cmd.append("--verbose")
+                if snap_cl != 7: cmd += ["--compression-level", str(snap_cl)]
+                if snap_cpu != 0: cmd += ["--cpu-count", str(snap_cpu)]
+                if snap_bs and snap_bs != "auto": cmd += ["--block-size", snap_bs]
+                if snap_verbose: cmd.append("--verbose")
                 # lightweight item for progress / report / history
                 item = GameItem.__new__(GameItem)
                 item.path = Path(game_arg)
@@ -5049,6 +5084,7 @@ class App:
         archive = item.archive_path
         extract_root = self._resolve_extract_root(item)
 
+        self._active_item = item   # so terminal handlers can clean THIS item if the queue changed
         item.status = "Extracting"
         self.cancel_requested = False
         self.extract_cancel_event.clear()
@@ -5444,7 +5480,7 @@ class App:
             for root in roots:
                 try:
                     for p in root.iterdir():
-                        if p.is_dir() and p.name.lower().startswith("tmp"):
+                        if p.is_dir() and _is_app_tmp_dir(p.name):
                             sz = get_folder_size(p)
                             shutil.rmtree(str(p), ignore_errors=True)
                             freed += sz
@@ -5488,7 +5524,7 @@ class App:
                     continue
                 try:
                     for p in base.iterdir():
-                        if p.is_dir() and (p.name.lower().startswith("tmp") or p.name in NAMES):
+                        if p.is_dir() and (_is_app_tmp_dir(p.name) or p.name in NAMES):
                             try:
                                 key = str(p.resolve())
                             except Exception:
@@ -5547,7 +5583,7 @@ class App:
         for p in list(temp_dir.iterdir()):
             # Only remove THIS app's working data (mkpfs tmp* dirs and the _extracted
             # tree); never wipe unrelated files a user may keep in their temp folder.
-            if not (p.name.lower().startswith("tmp") or p.name == "_extracted"):
+            if not (_is_app_tmp_dir(p.name) or p.name == "_extracted"):
                 continue
             try:
                 sz = get_folder_size(p) if p.is_dir() else (p.stat().st_size if p.is_file() else 0)
@@ -5760,14 +5796,16 @@ class App:
         if gate == "cancel":
             if self._batch_running:
                 self._batch_running = False
-                self.start_btn.configure(state="normal")
-                self.cancel_btn.configure(state="disabled")
-                self._update_batch_counter()
+            # Always return to idle — start() may run after extraction (buttons left
+            # in the running state), so a single-game cancel here must reset them too.
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self._update_batch_counter()
             self.status_update("Ready", "Drive check cancelled.", "Ready", 0, 0, "00:00", "—", "—")
             return
         if gate == "skip":
             # Reclaim any scratch this item already wrote (e.g. an archive extracted
-            # before the post-extraction re-gate), then skip — advancing the batch.
+            # before the post-extraction re-gate), then skip.
             self._cleanup_after_failure(item)
             if self._batch_running:
                 self.queue.pop(0)
@@ -5776,6 +5814,12 @@ class App:
                 self.update_queue_box()
                 self.root.after(600, self._batch_auto_start)
             else:
+                # Single run: reset to idle (Start was disabled / Cancel enabled by the
+                # extraction step) and mark the item, so the UI isn't left frozen.
+                item.status = "Skipped"
+                self.start_btn.configure(state="normal")
+                self.cancel_btn.configure(state="disabled")
+                self.update_queue_box()
                 self.status_update("Ready", f"Skipped — low space: {item.name}", "Ready", 0, 0, "00:00", "—", "—")
             return
 
@@ -5810,7 +5854,7 @@ class App:
                         for child in p.iterdir():
                             if cur_src is None or child.resolve() != cur_src:
                                 stale_items.append(child)
-                    elif p.name.lower().startswith("tmp"):
+                    elif _is_app_tmp_dir(p.name):
                         stale_items.append(p)
                 if stale_items:
                     stale_size = sum(folder_size(p) for p in stale_items)
@@ -6836,7 +6880,7 @@ class App:
                 if self.queue:
                     self.queue[0].status = "Failed"
                     self.queue.pop(0)
-                self._batch_failed += 1
+                    self._batch_failed += 1   # only count when an item was actually popped
                 self.update_queue_box()
                 self.log("ERROR", f"Extraction failed: {payload}")
                 if self._batch_running and self.queue:

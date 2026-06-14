@@ -343,6 +343,76 @@ def _looks_incompressible(path: Path, *, samples: int = 24, chunk: int = 1 << 20
     return gain_pct < min_gain_pct
 
 
+_PATCH_TITLE_RE = re.compile(r'\b(PPSA\d{5}|CUSA\d{5})\b')
+_PATCH_JUNK = ("__MACOSX", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd")
+
+
+def _patch_descend_wrapper(root: Path) -> Path:
+    """Descend folders that hold exactly one subdir and no files, so a patch or game
+    wrapped in an extra folder (e.g. <CUSA...>/eboot.bin) resolves to its real root."""
+    cur = root
+    for _ in range(8):
+        try:
+            entries = list(cur.iterdir())
+        except Exception:
+            break
+        files = [p for p in entries if p.is_file()]
+        dirs = [p for p in entries if p.is_dir()]
+        if not files and len(dirs) == 1:
+            cur = dirs[0]
+        else:
+            break
+    return cur
+
+
+def _patch_find_game_root(folder: Path) -> Path:
+    """Locate the game root (the dir holding sce_sys/eboot.bin) inside an unpacked tree."""
+    cand = _patch_descend_wrapper(folder)
+    if (cand / "sce_sys").exists() or (cand / "eboot.bin").exists():
+        return cand
+    for p in sorted(folder.rglob("sce_sys")):
+        if p.is_dir():
+            return p.parent
+    return cand
+
+
+def _patch_dir_title_id(d: Path) -> str:
+    """Best-effort title id for a game/patch directory (param.json, else folder name)."""
+    try:
+        pj = d / "sce_sys" / "param.json"
+        if pj.is_file():
+            m = _PATCH_TITLE_RE.search(pj.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                return m.group(1).upper()
+    except Exception:
+        pass
+    m = _PATCH_TITLE_RE.search(d.name)
+    return m.group(1).upper() if m else ""
+
+
+def overlay_patch(game_root: Path, patch_dir: Path) -> int:
+    """Copy every file from the patch onto the game at matching relative paths,
+    overwriting existing files and adding new ones. Skips OS/archiver junk. Returns
+    the number of files applied."""
+    src_root = _patch_descend_wrapper(patch_dir)
+    count = 0
+    for src in sorted(src_root.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(src_root)
+        if (rel.name == ".DS_Store" or rel.name in ("Thumbs.db", "desktop.ini")
+                or rel.name.startswith("._") or any(part in _PATCH_JUNK for part in rel.parts)):
+            continue
+        dst = game_root / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            count += 1
+        except Exception as e:
+            print(f"[WARN] Could not apply patch file {rel}: {e}", flush=True)
+    return count
+
+
 def compress_file_to_ffpfsc(
     source_file: Path,
     ffpfsc_path: Path,
@@ -440,6 +510,12 @@ def main() -> None:
     parser.add_argument("--temp-dir",     type=str, default=None,
                         help="Temp folder for intermediate files (default: system temp). "
                              "Use a fast NVMe drive for best performance.")
+    parser.add_argument("--patch",        type=str, default=None, metavar="DIR",
+                        help="PATCH MODE: overlay the loose files in DIR onto the game "
+                             "(a folder or an existing .ffpfsc), then (re)pack to OUTPUT.")
+    parser.add_argument("--patch-inplace", action="store_true",
+                        help="The game folder is a throwaway temp extract — overlay in "
+                             "place instead of copying it first.")
 
     args = parser.parse_args()
 
@@ -527,6 +603,85 @@ def main() -> None:
         print(f"[INFO] MkPFS: {ver.stdout.strip() or ver.stderr.strip()}", flush=True)
     except Exception:
         pass
+
+    # ── PATCH MODE: overlay loose patch files onto a game, then (re)pack ──────────
+    if args.patch:
+        patch_dir = Path(args.patch).resolve()
+        if not patch_dir.exists():
+            print(f"[ERROR] Patch source not found: {patch_dir}")
+            sys.exit(1)
+        if ffpfs_path.exists() and not args.overwrite:
+            print(f"[ERROR] Output already exists: {ffpfs_path}  (use --overwrite)")
+            sys.exit(1)
+        patch_pack_kwargs = dict(
+            compression_level=max(0, min(9, args.compression_level)),
+            cpu_count=max(0, args.cpu_count),
+            threshold_gain=max(0, args.threshold_gain),
+            block_size=args.block_size,
+            verbose=args.verbose,
+        )
+        print(f"[INFO] PATCH MODE: overlay '{patch_dir.name}' onto '{game_folder.name}'", flush=True)
+        with tempfile.TemporaryDirectory(dir=user_temp) as td:
+            td = Path(td)
+            if game_folder.is_file() and game_folder.suffix.lower() == ".ffpfsc":
+                print("[INFO] Unpacking the existing .ffpfsc to patch it (outer → inner → files)...", flush=True)
+                outer = td / "_outer"
+                unpack_pfs_image(game_folder, outer, mkpfs_cmd_base, mkpfs_cwd, overwrite=True)
+                inner = next((p for p in sorted(outer.rglob("*"))
+                              if p.is_file() and p.suffix.lower() == ".ffpfs"), None)
+                if inner is None:
+                    print("[ERROR] No inner .ffpfs image found inside the .ffpfsc.")
+                    sys.exit(1)
+                game_unpacked = td / "_game"
+                unpack_pfs_image(inner, game_unpacked, mkpfs_cmd_base, mkpfs_cwd, overwrite=True)
+                game_root = _patch_find_game_root(game_unpacked)
+            elif game_folder.is_dir():
+                if args.patch_inplace:
+                    game_root = _patch_find_game_root(game_folder)
+                else:
+                    print("[INFO] Copying the game folder to temp before patching (source untouched)...", flush=True)
+                    game_copy = td / "_game"
+                    shutil.copytree(game_folder, game_copy)
+                    game_root = _patch_find_game_root(game_copy)
+            else:
+                print(f"[ERROR] Patch game must be a folder or a .ffpfsc: {game_folder}")
+                sys.exit(1)
+
+            applied = overlay_patch(game_root, patch_dir)
+            print(f"[OK] Applied {applied} patch file(s) onto the game.", flush=True)
+            if applied == 0:
+                print("[ERROR] The patch contained no files to overlay — nothing to do.")
+                sys.exit(1)
+            try:
+                gtid = _patch_dir_title_id(game_root)
+                ptid = _patch_dir_title_id(_patch_descend_wrapper(patch_dir))
+                if gtid and ptid and gtid != ptid:
+                    print(f"[WARN] Patch title id {ptid} differs from the game {gtid} — packing anyway.", flush=True)
+            except Exception:
+                pass
+
+            title_id = _patch_dir_title_id(game_root) or "patched"
+            with tempfile.TemporaryDirectory(dir=user_temp) as td2:
+                temp_pfs = Path(td2) / f"{title_id}.ffpfs"
+                pack_folder_uncompressed(
+                    game_root, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
+                    verify_enabled=args.verify, temp_folder=Path(td2), **patch_pack_kwargs,
+                )
+                pass2_kwargs = dict(patch_pack_kwargs)
+                if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
+                    print("[INFO] Patched image sampled as incompressible — storing without compression.", flush=True)
+                    pass2_kwargs["compression_level"] = 0
+                if ffpfs_path.exists() and args.overwrite:
+                    try:
+                        ffpfs_path.unlink()
+                    except Exception:
+                        pass
+                compress_file_to_ffpfsc(
+                    temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                    temp_folder=Path(td2), **pass2_kwargs,
+                )
+        print("\n[SUCCESS] Patch integrated successfully!")
+        return
 
     if operation == "unpack":
         images = find_pfs_images(game_folder, args.batch)

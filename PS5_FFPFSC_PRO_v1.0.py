@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.15"
+APP_VERSION = "1.0.16"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3043,6 +3043,78 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
+class PatchDialog(ctk.CTkToplevel):
+    """Collect a game (.ffpfsc / folder / archive) + a patch (folder / archive) and
+    kick off 'patch into game' — unpack the game, overlay the patch files, repack."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Patch in Spiel integrieren")
+        self.geometry("640x360")
+        self.configure(fg_color=BLACK)
+        self.resizable(False, False)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+        self.game_var = tk.StringVar()
+        self.patch_var = tk.StringVar()
+        self.mode_var = tk.StringVar(value="new")
+
+        ctk.CTkLabel(self, text="🩹  Patch in Spiel integrieren",
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text="Entpackt das Spiel, legt die Patch-Dateien drüber (überschreiben + neue) und packt neu.",
+                      text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+
+        self._file_row("Spiel  (.ffpfsc, Ordner oder Archiv):", self.game_var,
+                       [("Spiel / Archiv", "*.ffpfsc *.zip *.rar *.7z")])
+        self._file_row("Patch  (Archiv oder Ordner mit losen Dateien):", self.patch_var,
+                       [("Archiv", "*.zip *.rar *.7z")])
+
+        mode_row = ctk.CTkFrame(self, fg_color=BLACK); mode_row.pack(fill="x", padx=20, pady=(10, 4))
+        ctk.CTkLabel(mode_row, text="Ausgabe:", text_color=WHITE).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(mode_row, text="Neue Datei ( … [patched].ffpfsc )", variable=self.mode_var,
+                            value="new", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+        ctk.CTkRadioButton(mode_row, text="Original überschreiben", variable=self.mode_var,
+                            value="overwrite", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btns, text="▶  Patch starten", fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+                       command=self._go).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Abbrechen", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+
+    def _file_row(self, label, var, filetypes):
+        row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); row.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(row, text=label, text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        inner = ctk.CTkFrame(row, fg_color=PANEL); inner.pack(fill="x", padx=10, pady=(2, 8))
+        ctk.CTkEntry(inner, textvariable=var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(inner, text="Datei", width=58, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=lambda: self._pick_file(var, filetypes)).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(inner, text="Ordner", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=lambda: self._pick_dir(var)).pack(side="left", padx=(6, 0))
+
+    def _pick_file(self, var, filetypes):
+        p = filedialog.askopenfilename(filetypes=filetypes + [("Alle Dateien", "*.*")])
+        if p:
+            var.set(p)
+
+    def _pick_dir(self, var):
+        p = filedialog.askdirectory()
+        if p:
+            var.set(p)
+
+    def _go(self):
+        g = self.game_var.get().strip(); p = self.patch_var.get().strip()
+        if not g or not p:
+            messagebox.showerror("Fehlt", "Bitte Spiel UND Patch auswählen.", parent=self)
+            return
+        overwrite = self.mode_var.get() == "overwrite"
+        self.destroy()
+        self.app._start_patch(g, p, overwrite)
+
+
 # ─── Main Application ──────────────────────────────────────────────────────────
 
 class App:
@@ -3258,6 +3330,7 @@ class App:
         self.cancel_btn.grid(row=0, column=4, padx=(0, 6), pady=2, sticky="e")
         self.cancel_btn.configure(state="disabled")
 
+        self._button(header, "🩹  Patch integrieren", self._open_patch_dialog, width=180).grid(row=1, column=0, columnspan=2, padx=12, pady=2, sticky="w")
         self._button(header, "☀ Light / 🌙 Dark", self._toggle_theme, width=150).grid(row=1, column=2, padx=12, sticky="e")
         self._button(header, "⚙  Settings", self.open_settings, width=120).grid(row=1, column=3, columnspan=2, padx=(0, 4), sticky="e")
 
@@ -3896,6 +3969,125 @@ class App:
         save_settings({"appearance_mode": self._theme})
         # No manual recoloring needed — all color constants are (light, dark) tuples
         # so CTk picks the correct value automatically on appearance mode change.
+
+    def _open_patch_dialog(self):
+        if getattr(self, "_batch_running", False) or (getattr(self, "worker", None) and self.worker and self.worker.is_alive()):
+            messagebox.showinfo("Bitte warten", "Es läuft gerade ein Vorgang. Erst abwarten oder abbrechen.")
+            return
+        PatchDialog(self)
+
+    def _patch_failed(self, msg: str):
+        self.start_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self.status_update("Failed", msg, "Failed", 0, 0, "00:00", "—", "—")
+        self.log("ERROR", f"Patch failed: {msg}")
+        messagebox.showerror("Patch fehlgeschlagen", msg)
+
+    def _launch_patch_worker(self, item, cmd, cwd, out_dir, temp_dir):
+        self._batch_total = 1; self._batch_done = 0; self._batch_failed = 0
+        self._batch_running = False
+        self._update_batch_counter()
+        self._last_cmd_str = " ".join(str(c) for c in cmd)
+        self.cancel_requested = False
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.status_update("Patching", f"Patching {item.name}…", "Creating Temp PFS", 0, 0, "00:00", "—", "—")
+        self.worker = CLIWorker(self, item, cmd, cwd, out_dir, temp_dir)
+        self.worker.start()
+
+    def _start_patch(self, game_str: str, patch_str: str, overwrite: bool):
+        """Integrate a patch into a game: unpack the game (.ffpfsc/folder/archive),
+        overlay the patch files, repack. Extraction of any archives runs in a worker
+        thread; the actual unpack→overlay→repack is the backend --patch flow."""
+        game = Path(self._clean_path_str(game_str))
+        patch = Path(self._clean_path_str(patch_str))
+        if not game.exists():
+            messagebox.showerror("Nicht gefunden", f"Spiel nicht gefunden:\n{game}"); return
+        if not patch.exists():
+            messagebox.showerror("Nicht gefunden", f"Patch nicht gefunden:\n{patch}"); return
+        temp_base = self.temp_var.get().strip() or str(game.parent / "_ffpfsc_temp")
+        self.temp_var.set(temp_base)
+        out_base = self.output_var.get().strip()
+        self.start_btn.configure(state="disabled"); self.cancel_btn.configure(state="normal")
+        self.cancel_requested = False; self.extract_cancel_event.clear()
+        self.status_update("Patching", f"Patch wird vorbereitet: {game.name}…", "Scanning Files", 0, 0, "00:00", "—", "—")
+        try:
+            self.bottom_tabs.set("Logs")
+        except Exception:
+            pass
+        ARCH = (".zip", ".rar", ".7z")
+
+        def work():
+            try:
+                pw = self._candidate_passwords()
+                patch_inplace = False
+                gsfx = game.suffix.lower()
+                # resolve the GAME to something the backend --patch understands
+                if gsfx == ".ffpfsc" or game.is_dir():
+                    game_arg = game
+                elif gsfx in ARCH:
+                    self.log("INFO", f"Extracting game archive: {game.name}")
+                    self.status_update("Extracting", f"Spiel entpacken: {game.name}…", "Scanning Files", 0, 0, "—", "—", "—")
+                    game_arg = ArchiveExtractor.extract_with_passwords(
+                        game, Path(temp_base) / "_patch_game", pw,
+                        log_fn=self.log, cancel_event=self.extract_cancel_event)
+                    patch_inplace = True   # extracted to a throwaway temp dir → overlay in place
+                else:
+                    raise RuntimeError(f"Nicht unterstützter Spiel-Typ: {game.name}")
+                # resolve the PATCH to a folder of loose files
+                if patch.is_dir():
+                    patch_dir = patch
+                elif patch.suffix.lower() in ARCH:
+                    self.log("INFO", f"Extracting patch archive: {patch.name}")
+                    self.status_update("Extracting", f"Patch entpacken: {patch.name}…", "Scanning Files", 0, 0, "—", "—", "—")
+                    patch_dir = ArchiveExtractor.extract_with_passwords(
+                        patch, Path(temp_base) / "_patch_files", pw,
+                        log_fn=self.log, cancel_event=self.extract_cancel_event)
+                else:
+                    raise RuntimeError(f"Patch muss ein Ordner oder Archiv sein: {patch.name}")
+                if self.cancel_requested:
+                    raise ArchiveExtractionCancelled("Cancelled by user.")
+                # output path (ask-per-run choice from the dialog)
+                if overwrite and gsfx == ".ffpfsc":
+                    out = game
+                else:
+                    stem = game.stem if gsfx == ".ffpfsc" else game.name
+                    folder = Path(out_base) if out_base else game.parent
+                    out = folder / f"{sanitize_filename(stem)} [patched].ffpfsc"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                # build the backend command
+                pycmd = get_backend_python_command()
+                backend = backend_base_dir()
+                cli_py = backend / "cli.py"
+                head = (pycmd + [str(game_arg), str(out)] if getattr(sys, "frozen", False)
+                        else pycmd + ["-u", str(cli_py), str(game_arg), str(out)])
+                cmd = head + ["--patch", str(patch_dir), "--temp-dir", temp_base, "--overwrite"]
+                if patch_inplace:
+                    cmd += ["--patch-inplace"]
+                cl = self.compression_level_var.get()
+                if cl != 7: cmd += ["--compression-level", str(cl)]
+                cpu = self.cpu_count_var.get()
+                if cpu != 0: cmd += ["--cpu-count", str(cpu)]
+                bs = self.block_size_var.get()
+                if bs and bs != "auto": cmd += ["--block-size", bs]
+                if self.verbose_var.get(): cmd.append("--verbose")
+                # lightweight item for progress / report / history
+                item = GameItem.__new__(GameItem)
+                item.path = Path(game_arg)
+                item.archive_path = None
+                item.operation = "pack"
+                item.name = (game.stem if gsfx == ".ffpfsc" else game.name) + " (patched)"
+                try:
+                    item.title_id = parse_title_id(Path(game_arg)) if Path(game_arg).is_dir() else "🩹"
+                except Exception:
+                    item.title_id = "🩹"
+                item.size = 0; item.files = 0; item.artwork = None; item.status = "Patching"
+                self.root.after(0, lambda: self._launch_patch_worker(item, cmd, backend, out.parent, Path(temp_base)))
+            except ArchiveExtractionCancelled as e:
+                self.root.after(0, lambda m=str(e): self._patch_failed(m))
+            except Exception as e:
+                self.root.after(0, lambda m=str(e): self._patch_failed(m))
+        threading.Thread(target=work, daemon=True).start()
 
     def open_settings(self):
         if self._settings_win and self._settings_win.winfo_exists():

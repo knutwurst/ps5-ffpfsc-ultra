@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.16"
+APP_VERSION = "1.0.17"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -599,7 +599,7 @@ def sanitize_filename(s: str) -> str:
 
 def descriptive_ffpfsc_name(item) -> str:
     """Build a findable output filename for *item*:
-    '<Game Name> [v<version>] [<TITLEID>].ffpfsc'  (version omitted if unknown).
+    '<Game Name> [<TITLEID>] [v<version>].ffpfsc'  (version omitted if unknown).
     Falls back to the title id alone if the name is missing."""
     PLACEHOLDERS = {"Unknown", "📦", "💾", "📤", ""}
     tid = (getattr(item, "title_id", "") or "").strip()
@@ -609,12 +609,12 @@ def descriptive_ffpfsc_name(item) -> str:
     if name in PLACEHOLDERS or name == tid:
         name = tid or "output"
     suffix_parts = []
+    if tid and tid.lower() not in name.lower():
+        suffix_parts.append(f"[{tid}]")
     src = getattr(item, "path", None)
     ver = guess_game_version(src) if isinstance(src, Path) else ""
     if ver:
         suffix_parts.append(f"[v{ver}]")
-    if tid and tid.lower() not in name.lower():
-        suffix_parts.append(f"[{tid}]")
     suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
     # Reserve room for the [v..][TITLEID] suffix + extension so those collision-resistant
     # tags survive the filename-length cap instead of being truncated away.

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -238,8 +238,19 @@ def same_drive(path_a: Path, path_b: Path) -> bool:
             return str(path_a)[:2].lower() == str(path_b)[:2].lower()
 
 
+def space_safety_factor() -> float:
+    """User-tunable multiplier on the *temp* free-space requirement: 1.0 keeps the
+    recommended worst-case headroom; below 1.0 allows tighter fits (higher risk of
+    an out-of-space failure mid-pack). Clamped to [0.5, 2.0]. Output-drive needs are
+    never scaled down — the final container can be as large as the source."""
+    try:
+        return min(2.0, max(0.5, float(load_settings().get("space_safety_factor", 1.0))))
+    except Exception:
+        return 1.0
+
+
 def estimate_peak_space_needed(game_size: int, same_temp_output_drive: bool = True) -> int:
-    return int(game_size * (2.20 if same_temp_output_drive else 1.20))
+    return int(game_size * (2.20 if same_temp_output_drive else 1.20) * space_safety_factor())
 
 
 def estimate_output_space_needed(game_size: int) -> int:
@@ -1403,6 +1414,57 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(theme_row, text="Theme:", text_color=WHITE).pack(side="left", padx=(0, 10))
         ctk.CTkButton(theme_row, text="Toggle Dark / Light", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), width=160, command=self.app._toggle_theme).pack(side="left")
+
+        # DRIVE & SPACE
+        self._section_label(scroll, "DRIVE & SPACE")
+        ds = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
+        ds.pack(fill="x", pady=(4, 12))
+        s = load_settings()
+
+        def _ds_row(label):
+            row = ctk.CTkFrame(ds, fg_color=PANEL)
+            row.pack(fill="x", padx=14, pady=6)
+            ctk.CTkLabel(row, text=label, text_color=WHITE, width=180, anchor="w").pack(side="left")
+            return row
+
+        # Drive usage — where archives get extracted (shared with the main panel).
+        dm_labels = {"auto": "Auto (smart)", "temp": "Temp drive only", "spread": "Spread across drives"}
+        dm_rev = {v: k for k, v in dm_labels.items()}
+        dm_menu = ctk.CTkOptionMenu(
+            _ds_row("Drive usage:"), values=list(dm_labels.values()), width=200,
+            command=lambda disp: self.app.drive_mode_var.set(dm_rev.get(disp, "auto")))
+        dm_menu.set(dm_labels.get(self.app.drive_mode_var.get(), "Auto (smart)"))
+        dm_menu.pack(side="left")
+
+        # Temp space safety factor — scales only the temp headroom requirement.
+        sf_labels = {0.7: "70% (risky)", 0.85: "85%", 1.0: "100% (recommended)",
+                     1.2: "120%", 1.5: "150% (cautious)"}
+        sf_rev = {v: k for k, v in sf_labels.items()}
+        sf_menu = ctk.CTkOptionMenu(
+            _ds_row("Temp space safety:"), values=list(sf_labels.values()), width=200,
+            command=lambda disp: save_settings({"space_safety_factor": sf_rev.get(disp, 1.0)}))
+        try:
+            _cur_sf = min(sf_labels, key=lambda k: abs(k - float(s.get("space_safety_factor", 1.0))))
+        except Exception:
+            _cur_sf = 1.0
+        sf_menu.set(sf_labels[_cur_sf])
+        sf_menu.pack(side="left")
+
+        # What to do when temp/output is too small for the game.
+        lp_labels = {"ask": "Ask me", "auto": "Proceed anyway", "skip": "Skip the game"}
+        lp_rev = {v: k for k, v in lp_labels.items()}
+        lp_menu = ctk.CTkOptionMenu(
+            _ds_row("When space is low:"), values=list(lp_labels.values()), width=200,
+            command=lambda disp: save_settings({"low_space_policy": lp_rev.get(disp, "ask")}))
+        lp_menu.set(lp_labels.get(s.get("low_space_policy", "ask"), "Ask me"))
+        lp_menu.pack(side="left")
+
+        ctk.CTkCheckBox(ds, text="Show drive-space dialog before each pack",
+                         variable=self.app.show_space_dialog_var, fg_color=GREEN,
+                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
+        ctk.CTkLabel(ds, text="Safety factor scales only the temp headroom; the output drive must always "
+                              "fit the finished .ffpfsc. 'Skip' applies per game during batch runs.",
+                      text_color=MUTED, justify="left", wraplength=440).pack(anchor="w", padx=14, pady=(0, 10))
 
         # ABOUT
         self._section_label(scroll, "ABOUT")
@@ -3446,6 +3508,10 @@ class App:
         # Drive-usage mode: auto | temp | spread (where archives get extracted).
         self.drive_mode_var = tk.StringVar(value=settings.get("drive_mode", "auto"))
         self.drive_mode_var.trace_add("write", lambda *_: save_settings({"drive_mode": self.drive_mode_var.get()}))
+        # Show the drive-space pre-flight dialog before each pack (default on). The
+        # tunable safety factor and the low-space policy live in settings.json and are
+        # edited in the Settings window (see SettingsWindow).
+        self.show_space_dialog_var = self._persisted_bool(settings, "show_space_dialog", True)
         # MkPFS 0.0.8 tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
@@ -4641,7 +4707,7 @@ class App:
         # auto: keep the extracted source off temp only when temp can't hold ~2x it
         est = self._archive_set_size(archive)
         try:
-            if get_free_space(Path(temp_base)) >= int(est * 2.10):
+            if get_free_space(Path(temp_base)) >= int(est * 2.10 * space_safety_factor()):
                 return temp_root   # temp holds extracted source + inner image comfortably
             if get_free_space(probe_out) >= int(est * 1.10):
                 self.log("INFO",
@@ -5210,6 +5276,35 @@ class App:
             f"Game {current}/{self._batch_total}  |  ✓ {self._batch_done}  ✗ {self._batch_failed}"
         )
 
+    def _space_gate(self, item, temp_dir, out_dir):
+        """Pre-flight space decision shared by single-start and batch. Returns
+        'proceed', 'skip', or 'cancel', based on free space, the low-space policy
+        (ask / auto / skip), and whether the diagnostics dialog is enabled. The
+        free-space test already honours the user's safety factor."""
+        if getattr(item, "operation", "pack") == "unpack":
+            return "proceed"
+        try:
+            ok = _space_preflight_ok(item, temp_dir, out_dir)
+        except Exception as e:
+            self.log("WARN", f"Space pre-check skipped: {e}")
+            return "proceed"
+
+        def _ask():
+            diag = SpaceDiagnosticsDialog(self.root, item, temp_dir, out_dir)
+            self.root.wait_window(diag)
+            return "proceed" if diag.proceed else "cancel"
+
+        if ok:
+            return _ask() if self.show_space_dialog_var.get() else "proceed"
+        policy = (load_settings().get("low_space_policy", "ask") or "ask").lower()
+        if policy == "auto":
+            self.log("WARN", f"Low space — proceeding anyway (policy: auto): {item.name}")
+            return "proceed"
+        if policy == "skip":
+            self.log("WARN", f"Low space — skipping (policy: skip): {item.name}")
+            return "skip"
+        return _ask()   # 'ask' — show the dialog and let the user decide
+
     def _batch_auto_start(self):
         """Start the next game in the queue — rechecks disk space before each game."""
         # Honor a cancel requested during the 600 ms advance gap (cancel_requested is
@@ -5233,7 +5328,7 @@ class App:
         item = self.queue[0]
         self.update_game_details(item)   # refreshes art + space stats for next game
 
-        # ── Space pre-flight dialog (auto-dismisses if OK, waits if LOW) ─────────
+        # ── Space pre-flight gate (dialog / policy / safety factor configurable) ──
         try:
             tp = self.temp_var.get().strip()
             op = self.output_var.get().strip()
@@ -5246,13 +5341,20 @@ class App:
                     f"Need {format_size(peak)} | Temp free {format_size(free)} "
                     f"| {'✓ OK' if free >= peak else '⚠ LOW'}"
                 )
-                diag = SpaceDiagnosticsDialog(self.root, item, td, od)
-                self.root.wait_window(diag)
-                if not diag.proceed:
+                gate = self._space_gate(item, td, od)
+                if gate == "cancel":
                     self._batch_running = False
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
                     self._update_batch_counter()
+                    return
+                if gate == "skip":
+                    # Skip this game but keep the batch going (low-space policy: skip).
+                    self.queue.pop(0)
+                    self._batch_failed += 1
+                    self._update_batch_counter()
+                    self.update_queue_box()
+                    self.root.after(600, self._batch_auto_start)
                     return
         except Exception as e:
             self.log("WARN", f"Space pre-check skipped: {e}")
@@ -5340,13 +5442,15 @@ class App:
             messagebox.showerror("Cannot start", str(e))
             return
 
-        # Show space diagnostics dialog — opens instantly, drive type detects in background
-        if getattr(item, "operation", "pack") != "unpack":
-            diag = SpaceDiagnosticsDialog(self.root, item, temp_dir, out_dir)
-            self.root.wait_window(diag)
-            if not diag.proceed:
-                self.status_update("Ready", "Drive check cancelled.", "Ready", 0, 0, "00:00", "—", "—")
-                return
+        # Pre-flight space gate — dialog / low-space policy / safety factor are all
+        # configurable (Settings → Drive & Space). 'skip' here just declines to start.
+        gate = self._space_gate(item, temp_dir, out_dir)
+        if gate == "cancel":
+            self.status_update("Ready", "Drive check cancelled.", "Ready", 0, 0, "00:00", "—", "—")
+            return
+        if gate == "skip":
+            self.status_update("Ready", f"Skipped — low space: {item.name}", "Ready", 0, 0, "00:00", "—", "—")
+            return
 
         # Stale temp data warning
         try:

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1394,6 +1394,7 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Play sound on completion",     self.app.sound_complete_var),
             ("Play sound on errors",         self.app.sound_error_var),
             ("Open output folder when done", self.app.open_output_var),
+            ("Auto-integrate patch from release folder", self.app.auto_integrate_patch_var),
         ]:
             ctk.CTkCheckBox(ui, text=text, variable=var, fg_color=GREEN,
                              hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=6)
@@ -2044,15 +2045,18 @@ def is_fs_junk_name(name: str) -> bool:
     return name in FS_JUNK_NAMES or name.startswith("._")
 
 
-def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
+def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None, detect_patch=False):
     """Inspect *folder* for the 'game + extras' layout.
 
-    Returns (game_source, siblings, all_games):
+    Returns (game_source, siblings, all_games, patch_source):
       • game_source — the single game (a game subfolder, a disk image, or an
         archive whose listing shows a PS5 game), or None.
       • siblings    — the other files to copy next to the output (scene junk and
         the game's own multi-part volumes removed).
       • all_games   — every game candidate found (so the caller can warn on >1).
+      • patch_source — when *detect_patch* is set and the folder holds a base game
+        plus one clearly-smaller game-like sibling (a patch carries eboot.bin, so it
+        reads as a 'game' too), that sibling — to be overlaid via --patch. Else None.
     Archives are only *listed* here (peeked), never extracted.
     """
     try:
@@ -2104,28 +2108,61 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None):
                 elif log_fn:
                     log_fn("INFO", f"  Not a game (kept as extra): {a.name}")
 
-    if len(games) != 1:
-        return None, [], games
-    game = games[0]
+    def _vol_set(cand: Path) -> set:
+        """Every on-disk file belonging to *cand* — an archive's whole volume set,
+        or the single file. Empty for a folder candidate."""
+        s: set = set()
+        if cand.is_file() and cand.suffix.lower() in (".zip", ".rar", ".7z"):
+            for a in archive_files:
+                if a == cand or ArchiveExtractor._first_volume(a) == cand:
+                    s.add(a.resolve())
+        elif cand.is_file():
+            s.add(cand.resolve())
+        return s
 
-    # Exclude the game itself (and, for an archive, every volume of its set) from
-    # the siblings; drop scene junk too.
-    game_volume_set: set[Path] = set()
-    if game.is_file() and game.suffix.lower() in (".zip", ".rar", ".7z"):
-        for a in archive_files:
-            if a == game or ArchiveExtractor._first_volume(a) == game:
-                game_volume_set.add(a.resolve())
-    elif game.is_file():
-        game_volume_set.add(game.resolve())
+    def _cand_size(cand: Path) -> int:
+        try:
+            if cand.is_dir():
+                return folder_size(cand)
+            return sum((p.stat().st_size for p in _vol_set(cand)), 0) or cand.stat().st_size
+        except Exception:
+            return 0
 
-    siblings = [f for f in files
-                if f.resolve() not in game_volume_set
+    def _siblings_excluding(*cands: Path) -> list:
+        exclude: set = set()
+        for c in cands:
+            exclude |= _vol_set(c)
+        return [f for f in files
+                if f.resolve() not in exclude
                 and f.suffix.lower() not in SCENE_JUNK_EXTS
                 and not is_fs_junk_name(f.name)]
-    return game, siblings, games
+
+    # Normal case: exactly one game in the folder.
+    if len(games) == 1:
+        game = games[0]
+        return game, _siblings_excluding(game), games, None
+
+    # Auto-patch: a base game plus a single, clearly-smaller game-like sibling. A
+    # patch carries eboot.bin, so it also reads as a 'game'; pick the larger as the
+    # base and the smaller (a folder, or a zip/rar the backend can unpack) as the
+    # patch — only when it is distinctly smaller, so two real games are not mistaken
+    # for a base+patch pair.
+    if detect_patch and len(games) == 2:
+        base, other = sorted(games, key=_cand_size, reverse=True)
+        bs, ps = _cand_size(base), _cand_size(other)
+        # The patch must be a folder or a zip/rar the backend can unpack; the base
+        # must resolve to a game folder (a disk image can't be overlaid this way).
+        patchable = other.is_dir() or other.suffix.lower() in (".zip", ".rar")
+        base_ok = base.is_dir() or base.suffix.lower() in (".zip", ".rar", ".7z")
+        if patchable and base_ok and bs > 0 and ps <= 0.7 * bs:
+            if log_fn:
+                log_fn("INFO", f"  Auto-patch: base '{base.name}', patch '{other.name}'")
+            return base, _siblings_excluding(base, other), games, other
+
+    return None, [], games, None
 
 
-def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None):
+def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None, detect_patch=False):
     """Treat *parent* as a library of games: every immediate subfolder that holds
     a game becomes its own bundle, so its folder is recreated at the destination
     with just the .ffpfsc (plus any extras) inside. Returns a list of bundle
@@ -2137,22 +2174,23 @@ def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None)
     except Exception:
         return items
     for child in children:
-        game, siblings = None, []
+        game, siblings, patch = None, [], None
         if is_game_folder(child):
             game = child                       # the subfolder itself is the dump
         else:
-            g, sib, _all = detect_game_bundle(child, candidate_passwords, log_fn)
+            g, sib, _all, p = detect_game_bundle(child, candidate_passwords, log_fn, detect_patch)
             if g is not None:
-                game, siblings = g, sib
+                game, siblings, patch = g, sib, p
             else:
                 inner = find_game_folders(child, max_depth=2)
                 if len(inner) == 1:
                     game = inner[0]
         if game is not None:
             try:
-                items.append(GameItem.from_bundle(child, game, siblings))
+                items.append(GameItem.from_bundle(child, game, siblings, patch))
                 if log_fn:
                     extra = f" + {len(siblings)} extra(s)" if siblings else ""
+                    extra += " + patch" if patch else ""
                     log_fn("INFO", f"  Library game: {child.name}{extra}")
             except Exception as e:
                 if log_fn:
@@ -2189,11 +2227,13 @@ class GameItem:
         return obj
 
     @classmethod
-    def from_bundle(cls, bundle_dir: Path, game_source: Path, siblings) -> "GameItem":
+    def from_bundle(cls, bundle_dir: Path, game_source: Path, siblings, patch_source=None) -> "GameItem":
         """A source folder holding one game (archive / game folder / disk image)
         plus extra files (DLCs etc.). The game is packed into a recreated
         '<bundle_dir name>' folder at the destination; the extras are copied next
-        to the .ffpfsc. Reuses the archive/folder/image item, then tags it."""
+        to the .ffpfsc. Reuses the archive/folder/image item, then tags it. When
+        *patch_source* is set (auto-patch), it is overlaid onto the game via --patch
+        before packing and is kept out of the copied siblings."""
         suffix = game_source.suffix.lower()
         if game_source.is_dir():
             obj = cls(game_source)
@@ -2204,6 +2244,7 @@ class GameItem:
         obj.bundle_dir       = bundle_dir
         obj.bundle_subfolder = bundle_dir.name
         obj.bundle_siblings  = list(siblings)
+        obj.patch_source     = patch_source
         obj.name             = bundle_dir.name   # nicer queue label until extraction
         return obj
 
@@ -3398,6 +3439,10 @@ class App:
         self.unpack_mode_var = tk.BooleanVar(value=False)  # session state — not persisted
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
+        # Auto-patch: when a release folder holds a base game plus a clearly-smaller
+        # game-like sibling (a patch), overlay it onto the game before packing. Off
+        # by default — opt in knowingly, since it changes what lands in the .ffpfsc.
+        self.auto_integrate_patch_var = self._persisted_bool(settings, "auto_integrate_patch", False)
         # Drive-usage mode: auto | temp | spread (where archives get extracted).
         self.drive_mode_var = tk.StringVar(value=settings.get("drive_mode", "auto"))
         self.drive_mode_var.trace_add("write", lambda *_: save_settings({"drive_mode": self.drive_mode_var.get()}))
@@ -3545,6 +3590,7 @@ class App:
             ("Keep intermediate PFS",              self.keep_pfs_var),
             ("Verify Output (Slower, Uses More RAM)", self.verify_output_var),
             ("Auto-clear temp after success",      self.auto_clear_temp_var),
+            ("Auto-integrate patch from release folder", self.auto_integrate_patch_var),
             ("Verbose mkpfs output (debug)",       self.verbose_var),
         ]:
             ctk.CTkCheckBox(opts, text=textv, variable=var, fg_color=GREEN, hover_color=GREEN2,
@@ -4423,23 +4469,29 @@ class App:
         self.log("INFO", f"Scanning folder: {src}")
         cand_pw = self._candidate_passwords()   # built on the Tk thread, for archive peeking
 
-        def _scan_folder(p=src, cand_pw=cand_pw):
+        def _scan_folder(p=src, cand_pw=cand_pw, detect_patch=self.auto_integrate_patch_var.get()):
             try:
                 # 0. Bundle: one game (archive / game folder / disk image) plus
                 #    extra files (DLCs etc.). Pack the game into a recreated copy
                 #    of this folder and copy the extras next to it. Only triggers
                 #    when there ARE extras — a plain game still packs normally.
-                game, siblings, all_games = detect_game_bundle(p, cand_pw, self.log)
-                if game is not None and siblings:
-                    self.log("OK", f"Folder bundle: 1 game + {len(siblings)} extra file(s) — "
-                                   "the folder will be recreated at the destination with the extras alongside.")
-                    self.scan_q.put(("ok", GameItem.from_bundle(p, game, siblings)))
+                #    With auto-patch on, a clearly-smaller game-like sibling is
+                #    detected as a patch and overlaid, so a bundle can be just
+                #    base + patch with no other extras.
+                game, siblings, all_games, patch = detect_game_bundle(p, cand_pw, self.log, detect_patch)
+                if game is not None and (siblings or patch):
+                    extra = f"1 game + {len(siblings)} extra file(s)"
+                    if patch:
+                        extra += f" + patch '{patch.name}' (integrated)"
+                    self.log("OK", f"Folder bundle: {extra} — "
+                                   "the folder will be recreated at the destination.")
+                    self.scan_q.put(("ok", GameItem.from_bundle(p, game, siblings, patch)))
                     return
                 # 0b. Library: each immediate subfolder holds its own game →
                 #     one bundle per subfolder (each recreated at the destination
                 #     with only the .ffpfsc plus extras inside). Covers "select
                 #     /…/PS5 Spiele and convert every game".
-                lib = scan_parent_for_bundles(p, cand_pw, self.log)
+                lib = scan_parent_for_bundles(p, cand_pw, self.log, detect_patch)
                 if lib:
                     self.log("OK", f"Library scan: {len(lib)} game folder(s) found — each will be "
                                    "mirrored at the destination.")
@@ -5067,6 +5119,12 @@ class App:
         temp_str = self.temp_var.get().strip()
         if temp_str:
             cmd += ["--temp-dir", temp_str]
+        # Auto-patch: overlay a detected patch sibling onto the game before packing,
+        # via the backend's PATCH MODE. Only once the game has resolved to a folder
+        # (archive games are extracted first; PATCH MODE needs a folder or .ffpfsc).
+        patch_src = getattr(item, "patch_source", None)
+        if patch_src and self.auto_integrate_patch_var.get() and item.path.is_dir():
+            cmd += ["--patch", str(patch_src)]
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() != ".ffpfsc" else out.parent, temp
 

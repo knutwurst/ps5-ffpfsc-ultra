@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1388,7 +1388,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(_st, text="Block size:", text_color=WHITE,
                       font=ctk.CTkFont(size=11)).grid(row=2, column=0, sticky="w", pady=4)
-        _bs_opts = ["auto", "auto-fit", "65536", "32768", "16384"]
+        _bs_opts = ["auto", "65536"]
         _bs_menu = ctk.CTkOptionMenu(
             _st, values=_bs_opts, variable=self.app.block_size_var,
             fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2,
@@ -1398,7 +1398,7 @@ class SettingsWindow(ctk.CTkToplevel):
             command=lambda v: save_settings({"block_size": v}),
         )
         _bs_menu.grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        ctk.CTkLabel(_st, text="auto=65536  auto-fit=minimise waste  16384/32768=small-file games",
+        ctk.CTkLabel(_st, text="PS5 needs 64 KiB. auto = 65536 (recommended). Smaller blocks crash the console.",
                       text_color=MUTED, font=ctk.CTkFont(size=10)).grid(
             row=2, column=2, sticky="w", pady=4)
 
@@ -3515,7 +3515,14 @@ class App:
         self._saved_auto_clear_temp = settings.get("auto_clear_temp", False)
         self._saved_compression_level = settings.get("compression_level", 7)
         self._saved_cpu_count = settings.get("cpu_count", 0)
-        self._saved_block_size = settings.get("block_size", "auto-fit")
+        self._saved_block_size = settings.get("block_size", "auto")
+        # Migrate console-incompatible block sizes: "auto-fit" (picks 4 KiB for many-file
+        # games) and explicit sub-64K values build images the PS5 misreads → crash. The
+        # native size is 64 KiB; normalise to "auto" (= 65536). The backend enforces this
+        # too, but fixing the saved value keeps the UI honest.
+        if self._saved_block_size in ("auto-fit", "4096", "8192", "16384", "32768"):
+            self._saved_block_size = "auto"
+            save_settings({"block_size": "auto"})
         # Global, auto-tried archive password list. Seed once with the most
         # common PS5-scene password so it never has to be typed again. `is None`
         # (not falsiness) so an intentionally-emptied list is not re-seeded.
@@ -3941,7 +3948,7 @@ class App:
         ctk.CTkLabel(tune_bar, text="Block size:", text_color=MUTED,
                       font=ctk.CTkFont(size=11), anchor="e").grid(
             row=1, column=6, sticky="e", padx=(14, 4), pady=(0, 8))
-        _block_opts = ["auto", "auto-fit", "65536", "32768", "16384"]
+        _block_opts = ["auto", "65536"]
         _block_menu = ctk.CTkOptionMenu(
             tune_bar, values=_block_opts, variable=self.block_size_var,
             fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2,

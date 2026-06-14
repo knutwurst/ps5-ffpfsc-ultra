@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.0.14"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1390,6 +1390,7 @@ class SettingsWindow(ctk.CTkToplevel):
         ui.pack(fill="x", pady=(4, 12))
         for text, var in [
             ("Show summary popup when done", self.app.summary_popup_var),
+            ("Ask to share compatibility data after packing", self.app.compat_prompt_var),
             ("Play sound on completion",     self.app.sound_complete_var),
             ("Play sound on errors",         self.app.sound_error_var),
             ("Open output folder when done", self.app.open_output_var),
@@ -3276,6 +3277,7 @@ class App:
         self.keep_pfs_var        = self._persisted_bool(settings, "keep_pfs", False)
         self.open_output_var     = self._persisted_bool(settings, "open_output", False)
         self.summary_popup_var   = self._persisted_bool(settings, "summary_popup", True)
+        self.compat_prompt_var   = self._persisted_bool(settings, "compat_prompt", True)
         self.sound_complete_var  = self._persisted_bool(settings, "sound_complete", True)
         self.sound_error_var     = self._persisted_bool(settings, "sound_error", True)
         self.batch_var = tk.BooleanVar(value=False)        # session state — not persisted
@@ -3417,6 +3419,7 @@ class App:
         for textv, var in [
             ("Open output folder when done",       self.open_output_var),
             ("Show summary popup",                 self.summary_popup_var),
+            ("Ask to share compatibility data",    self.compat_prompt_var),
             ("Play sound on completion",           self.sound_complete_var),
             ("Play sound on errors",               self.sound_error_var),
             ("Unpack PFS images (.ffpfs / .ffpfsc)", self.unpack_mode_var),
@@ -6036,9 +6039,9 @@ class App:
                         if self.summary_popup_var.get():
                             self.show_summary_popup()
 
-                # Prompt user to share compatibility data — but never stacked on top of
-                # the summary popup; wait until no modal dialog is grabbing input.
-                if completed_operation != "unpack":
+                # Prompt user to share compatibility data — only if enabled, and never
+                # stacked on top of the summary popup (wait until no modal is grabbing).
+                if completed_operation != "unpack" and self.compat_prompt_var.get():
                     def _share_when_free(_i=completed_item, _s=_final_sz):
                         try:
                             if self.root.grab_current() is not None:

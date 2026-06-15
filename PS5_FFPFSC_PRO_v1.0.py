@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.27"
+APP_VERSION = "1.0.28"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3877,8 +3877,12 @@ class App:
         # grabs the mouse-wheel inside its OWN canvas subtree, so a listbox that is not a
         # descendant keeps its own wheel/scrollbar and the outer scroll can't fight it.
         left.grid_rowconfigure(2, weight=1)
+        # Subtle scrollbar: with the duplicate options gone the body fits without
+        # scrolling in normal use, so the bar should recede (dark, matches the border)
+        # and only matter if the content area is dragged very short. ctk 5.2.2 has no
+        # auto-hide, so a muted colour is how we keep it unobtrusive.
         body = ctk.CTkScrollableFrame(left, fg_color=PANEL, corner_radius=0,
-                                      scrollbar_button_color=GREEN, scrollbar_button_hover_color=GREEN2)
+                                      scrollbar_button_color=BORDER2, scrollbar_button_hover_color=GREEN)
         body.grid(row=2, column=0, sticky="nsew", padx=0, pady=(2, 0))
         body.grid_columnconfigure(0, weight=1)
 
@@ -3929,50 +3933,18 @@ class App:
                       show="*", fg_color=CARD, border_color=BORDER2,
                       text_color=WHITE).grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 4))
 
-        # ── Options ───────────────────────────────────────────────────────────
-        ctk.CTkLabel(body, text="OPTIONS", font=ctk.CTkFont(size=16, weight="bold"),
-                      text_color=WHITE).grid(row=7, column=0, sticky="w", padx=14, pady=(10, 6))
-        opts = ctk.CTkFrame(body, fg_color=PANEL)
-        opts.grid(row=8, column=0, sticky="ew", padx=14, pady=(0, 10))
-        for textv, var in [
-            ("Open output folder when done",       self.open_output_var),
-            ("Show summary popup",                 self.summary_popup_var),
-            ("Ask to share compatibility data",    self.compat_prompt_var),
-            ("Play sound on completion",           self.sound_complete_var),
-            ("Play sound on errors",               self.sound_error_var),
-            ("Unpack PFS images (.ffpfs / .ffpfsc)", self.unpack_mode_var),
-            ("Keep intermediate PFS",              self.keep_pfs_var),
-            ("Verify Output (Slower, Uses More RAM)", self.verify_output_var),
-            ("Auto-clear temp after success",      self.auto_clear_temp_var),
-            ("Auto-integrate patch from release folder", self.auto_integrate_patch_var),
-            ("Verbose mkpfs output (debug)",       self.verbose_var),
-        ]:
-            ctk.CTkCheckBox(opts, text=textv, variable=var, fg_color=GREEN, hover_color=GREEN2,
-                             text_color=WHITE).pack(anchor="w", pady=5)
-
-        # Drive usage mode — where archives get extracted (temp/SSD vs the output drive)
-        _dm_row = ctk.CTkFrame(opts, fg_color=PANEL)
-        _dm_row.pack(fill="x", anchor="w", pady=(8, 2))
-        ctk.CTkLabel(_dm_row, text="Drive usage:", text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
-        _dm_labels = {"auto": "Auto (smart)", "temp": "Temp drive only", "spread": "Spread across drives"}
-        _dm_rev = {v: k for k, v in _dm_labels.items()}
-        _dm_menu = ctk.CTkOptionMenu(
-            _dm_row, values=list(_dm_labels.values()), width=190,
-            fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2, text_color=WHITE,
-            dropdown_fg_color=CARD2, dropdown_text_color=WHITE,
-            command=lambda disp: self.drive_mode_var.set(_dm_rev.get(disp, "auto")))
-        _dm_menu.set(_dm_labels.get(self.drive_mode_var.get(), "Auto (smart)"))
-        _dm_menu.pack(side="left")
-        ctk.CTkLabel(opts,
-                      text="  Auto: extract to the output drive when the temp/SSD is too small for a big archive.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11),
-                      justify="left").pack(anchor="w", padx=4, pady=(0, 4))
-
-        ctk.CTkLabel(opts,
-                      text="  FOLDER button detects single games and multi-dump parent folders.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11),
-                      justify="left").pack(anchor="w", padx=4, pady=(4, 6))
+        # ── Mode ──────────────────────────────────────────────────────────────
+        # The persistent options (sounds, summary, verify, keep-PFS, auto-clear,
+        # auto-patch, drive usage, verbose, output/temp/compression…) ALL live in the
+        # ⚙ Settings window now — no point duplicating them here and forcing a scroll.
+        # Only the per-job Unpack mode stays in the main flow: it isn't a persistent
+        # setting and it auto-enables when a .ffpfs/.ffpfsc is added to the queue.
+        ctk.CTkCheckBox(body, text="Unpack PFS images (.ffpfs / .ffpfsc) to a folder",
+                         variable=self.unpack_mode_var, fg_color=GREEN, hover_color=GREEN2,
+                         text_color=WHITE).grid(row=7, column=0, sticky="w", padx=18, pady=(14, 4))
+        ctk.CTkLabel(body, text="All other options live in  ⚙ Settings (top-right).",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).grid(
+                          row=8, column=0, sticky="w", padx=18, pady=(0, 12))
 
         # ── Center: Progress + Stages ────────────────────────────────────────
         center = ctk.CTkFrame(content, fg_color=BLACK)

@@ -4,7 +4,7 @@ A desktop app that packs PS5 game dumps into `.ffpfsc` containers for ShadowMoun
 
 Built by Knutwurst on top of the Bizkut `ps5-ffpfs-cli` backend. Runs on macOS, Windows, and Linux.
 
-Current version: 1.0.28
+Current version: 1.0.29
 
 ## What it does
 

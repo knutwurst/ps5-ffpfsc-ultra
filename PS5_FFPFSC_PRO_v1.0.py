@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.28"
+APP_VERSION = "1.0.29"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -282,16 +282,24 @@ def space_safety_factor() -> float:
         return 1.0
 
 
-# Peak SCRATCH-drive multiples of the EXTRACTED game size for one packing run, where
-# {extracted source + inner .ffpfs image + pass-2 PFSC spool} are co-resident on the
-# build drive. Archives unpack to a SECOND copy on the build drive (~3.6x measured: a
-# 66 GB title peaked at 239.8 GB). Plain folders / disk images are read in place — no
-# second copy — so ~2.3x (image + spool over the source). Auto-patch makes a FULL extra
-# game copy plus image + spool (~5x). Safe envelopes; the backend pre-pass-2 assert is
-# the final backstop and space_safety_factor() tunes headroom.
-ARCHIVE_PEAK_FACTOR = 3.7
-INPLACE_PEAK_FACTOR = 2.3
-PATCH_PEAK_FACTOR   = 5.0
+# Peak SCRATCH-drive multiples of the EXTRACTED game size for one packing run.
+# CRUCIAL: for our config (PS5 / 64 KiB blocks / 32-bit inodes / unsigned) MkPFS pass-2
+# uses the direct-to-image STREAMING builder — it writes the final container straight to
+# the OUTPUT drive with NO spool on the temp drive (verified: a 109.6 GB game left only
+# ~113 GB on the temp drive — the inner image alone, no spool). So the temp/build drive
+# only ever holds {extracted source (archives) + inner .ffpfs image}, never a third spool
+# copy. Hence:
+#   ARCHIVE: source(1.0) + image(~1.4 incl. 64 KiB padding) ≈ 2.5x   (was 3.7 — that
+#            over-counted a spool that streaming never creates, which wrongly pushed big
+#            many-file games' sources onto a slow HDD → seek-storm reads).
+#   INPLACE: image only (~1.5x); folder/disk-image sources are read in place, no 2nd copy.
+#   PATCH:   a full game copy + image (~3.5x), no spool.
+# The "+1.05 same_temp_output_drive" term in estimate_peak_space_needed() adds the final
+# container when the build drive IS the output drive. The backend pre-pass-2 assert is the
+# final backstop and space_safety_factor() tunes headroom.
+ARCHIVE_PEAK_FACTOR = 2.5
+INPLACE_PEAK_FACTOR = 1.5
+PATCH_PEAK_FACTOR   = 3.5
 
 # Free-space multiple for JUST the inner uncompressed PFS image (pass 1) on the temp/SSD
 # drive — used by the "image on the SSD, spool routed adaptively" split path. ~1.4x covers
@@ -445,39 +453,104 @@ def compression_rating(saved_pct: float) -> tuple[str, str]:
     return "POOR", "Not worth compressing. This title is already highly compressed or not a good candidate."
 
 
-def get_drive_type(path: Path) -> str:
-    """Detect SSD/NVMe vs HDD using PowerShell. Returns 'SSD', 'HDD', or 'Unknown'."""
-    if os.name != "nt":
-        return "Unknown"
+_DRIVE_TYPE_CACHE: dict = {}
+
+
+def _drive_cache_key(path: Path):
     try:
-        drive_letter = path.resolve().drive.rstrip(":\\")
-        if not drive_letter:
-            return "Unknown"
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"Get-Partition -DriveLetter '{drive_letter}' | Get-Disk | Select-Object -ExpandProperty MediaType"],
-            capture_output=True, text=True, timeout=6,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        media = result.stdout.strip().upper()
-        if "SSD" in media or "NVM" in media:
-            return "SSD"
-        if "HDD" in media or "UNSPECIFIED" in media:
-            # Unspecified on some systems means HDD
-            if "UNSPECIFIED" in media:
-                # Try bus type to distinguish
-                result2 = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     f"Get-Partition -DriveLetter '{drive_letter}' | Get-Disk | Select-Object -ExpandProperty BusType"],
-                    capture_output=True, text=True, timeout=6,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                bus = result2.stdout.strip().upper()
-                if "NVME" in bus or "SATA" in bus:
-                    return "SSD"
-                if "ATA" in bus:
-                    return "HDD"
-            return "HDD"
+        t = path if path.exists() else path.parent
+        return os.stat(str(t)).st_dev
+    except Exception:
+        return str(path)
+
+
+def get_drive_type(path: Path) -> str:
+    """Detect SSD/NVMe vs HDD for the volume holding *path*: 'SSD', 'HDD' or 'Unknown'.
+    Cached per device. This MAY SHELL OUT (PowerShell on Windows, diskutil on macOS), so
+    call it OFF the UI thread; use drive_type_cached() on the main thread."""
+    key = _drive_cache_key(path)
+    if key in _DRIVE_TYPE_CACHE:
+        return _DRIVE_TYPE_CACHE[key]
+    dt = _probe_drive_type(path)
+    _DRIVE_TYPE_CACHE[key] = dt
+    return dt
+
+
+def drive_type_cached(path: Path) -> str:
+    """Non-blocking: the already-probed drive type for *path*, or 'Unknown' if it hasn't
+    been probed yet. Safe on the UI thread — never shells out."""
+    return _DRIVE_TYPE_CACHE.get(_drive_cache_key(path), "Unknown")
+
+
+def temp_drive_label(path: Path) -> str:
+    """Honest label for the temp/scratch drive: 'SSD temp' ONLY when we have actually
+    confirmed solid-state, otherwise the neutral 'temp drive'. We never call a drive an SSD
+    on assumption — an external HDD (or an un-probed drive) must not be mislabelled."""
+    return "SSD temp" if drive_type_cached(path) == "SSD" else "temp drive"
+
+
+def _probe_drive_type(path: Path) -> str:
+    """Actually probe the drive type (may block ~1-2 s). See get_drive_type."""
+    try:
+        target = path if path.exists() else path.parent
+    except Exception:
+        target = path
+    # ── Windows: PowerShell MediaType / BusType ──────────────────────────────
+    if os.name == "nt":
+        try:
+            drive_letter = path.resolve().drive.rstrip(":\\")
+            if not drive_letter:
+                return "Unknown"
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-Partition -DriveLetter '{drive_letter}' | Get-Disk | Select-Object -ExpandProperty MediaType"],
+                capture_output=True, text=True, timeout=6,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            media = result.stdout.strip().upper()
+            if "SSD" in media or "NVM" in media:
+                return "SSD"
+            if "HDD" in media or "UNSPECIFIED" in media:
+                if "UNSPECIFIED" in media:
+                    result2 = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         f"Get-Partition -DriveLetter '{drive_letter}' | Get-Disk | Select-Object -ExpandProperty BusType"],
+                        capture_output=True, text=True, timeout=6,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    bus = result2.stdout.strip().upper()
+                    if "NVME" in bus or "SATA" in bus:
+                        return "SSD"
+                    if "ATA" in bus:
+                        return "HDD"
+                return "HDD"
+        except Exception:
+            pass
+        return "Unknown"
+    # ── macOS: diskutil 'Solid State: Yes/No' on the backing device ──────────
+    if sys.platform == "darwin":
+        try:
+            df = subprocess.run(["df", str(target)], capture_output=True, text=True, timeout=6)
+            dev = df.stdout.strip().splitlines()[-1].split()[0]   # /dev/diskXsY
+            whole = re.sub(r"s\d+$", "", dev)                     # /dev/diskX (whole disk)
+            for d in ([dev, whole] if whole != dev else [dev]):
+                info = subprocess.run(["diskutil", "info", d], capture_output=True, text=True, timeout=8)
+                for line in info.stdout.splitlines():
+                    if "Solid State" in line:
+                        return "SSD" if "Yes" in line else "HDD"
+        except Exception:
+            pass
+        return "Unknown"
+    # ── Linux: /sys/dev/block rotational flag (0 = SSD, 1 = HDD) ──────────────
+    try:
+        st = os.stat(str(target))
+        node = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}")
+        disk = node.resolve()
+        if (disk / "partition").exists():
+            disk = disk.parent
+        rot = disk / "queue" / "rotational"
+        if rot.exists():
+            return "HDD" if rot.read_text().strip() == "1" else "SSD"
     except Exception:
         pass
     return "Unknown"
@@ -3751,6 +3824,12 @@ class App:
         # browsed paths that happened to be saved elsewhere stuck).
         self.output_var.trace_add("write", lambda *_: save_settings({"output_folder": self.output_var.get()}))
         self.temp_var.trace_add("write", lambda *_: save_settings({"temp_folder": self.temp_var.get()}))
+        # Probe (in the background) whether the temp/output drives are SSD or HDD so the
+        # runtime placement labels can be honest WITHOUT blocking the UI thread on
+        # diskutil/PowerShell. Re-probes when the folders change; cached per device.
+        self.temp_var.trace_add("write", lambda *_: self._warm_drive_types())
+        self.output_var.trace_add("write", lambda *_: self._warm_drive_types())
+        self._warm_drive_types()
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
@@ -4949,6 +5028,36 @@ class App:
             except Exception:
                 return 0
 
+    def _mark_no_spotlight(self, *dirs) -> None:
+        """macOS: drop a `.metadata_never_index` marker in each scratch dir so Spotlight
+        skips it. Without this, mdworker indexes every freshly-extracted game file (tens
+        of thousands of them) on the same drive we're reading from, stealing HDD I/O and
+        throttling the pack. Only our scratch dirs are touched — the user's finished
+        outputs stay indexable. Best-effort, idempotent, no-op off macOS."""
+        if sys.platform != "darwin":
+            return
+        for d in dirs:
+            if not d:
+                continue
+            try:
+                p = Path(d)
+                p.mkdir(parents=True, exist_ok=True)
+                marker = p / ".metadata_never_index"
+                if not marker.exists():
+                    marker.touch()
+            except Exception:
+                pass
+
+    def _warm_drive_types(self) -> None:
+        """Kick off background SSD/HDD probes for the temp + output drives so
+        temp_drive_label()/drive_type_cached() have honest data at pack time without ever
+        blocking the UI thread on diskutil/PowerShell. Cached per device, so this is a
+        no-op after the first probe of a given drive."""
+        for p in (self.temp_var.get().strip(), self.output_var.get().strip()):
+            if not p:
+                continue
+            threading.Thread(target=lambda pp=Path(p): get_drive_type(pp), daemon=True).start()
+
     def _resolve_extract_root(self, item) -> Path:
         """Place this run's artifacts across drives to maximise fast (SSD) temp use, and
         record the choice on the item: _build_root (where an archive extracts) and
@@ -4981,6 +5090,15 @@ class App:
             item._build_temp = temp_base_p
             item._image_only_on_temp = False
         set_temp()   # default: whole scratch on the temp drive
+
+        # Placement is resolved several times per item (the space gate, the extraction
+        # step, and the post-extraction re-gate), so log a given decision only ONCE per
+        # item — re-log only if the decision actually changes — to keep the log clean.
+        def _plog(level, msg):
+            if getattr(item, "_last_placement_log", None) == msg:
+                return
+            item._last_placement_log = msg
+            self.log(level, msg)
 
         mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
         out_str = self.output_var.get().strip()
@@ -5018,12 +5136,12 @@ class App:
 
         if mode == "temp":
             if size and temp_free < image_need:
-                self.log("WARN", f"Drive 'temp': {item.name} image needs ~{format_size(image_need)} on temp, "
+                _plog("WARN", f"Drive 'temp': {item.name} image needs ~{format_size(image_need)} on temp, "
                                   f"only {format_size(temp_free)} free — the space gate will handle it.")
             return temp_root
         if mode == "spread":
             set_spread()
-            self.log("INFO", f"Drive 'spread': building on the output drive {out_dir}{contention}.")
+            _plog("INFO", f"Drive 'spread': building on the output drive {out_dir}{contention}.")
             return spread_root
         # AUTO ---------------------------------------------------------------------
         # 1) Everything on the SSD/temp (source + image + spool). Fastest; final on output.
@@ -5036,18 +5154,22 @@ class App:
             item._build_root = spread_root          # source extracts to the big output drive
             item._build_temp = temp_base_p          # inner image (and spool, if it fits) on the SSD
             item._image_only_on_temp = True
-            self.log("INFO", f"Auto: {item.name} (~{szs}) → image on the SSD temp, source on "
-                             f"{out_dir} (spool auto-routed). Avoids same-drive read+write.")
+            # Spell out the ORDER + both drives: the big HDD write you see first is the
+            # SOURCE extraction; the inner image builds on the SSD afterwards. (The old
+            # wording led with "image on the SSD" and looked wrong next to the HDD write.)
+            _plog("INFO", f"Auto: {item.name} (~{szs}): 1) extract source → output drive "
+                             f"({out_dir}); 2) build inner image → {temp_drive_label(temp_base_p)} "
+                             f"({temp_base_p}); spool auto-routed. No same-drive read+write.")
             return spread_root
         # 3) Everything on the output drive (mechanical, slower, but it completes).
         if out_free >= out_full:
             set_spread()
-            why = "too big for the SSD temp" if size > 0 else "unknown size — using the larger drive for safety"
-            self.log("INFO", f"Auto: {item.name} (~{szs}) {why} → building on {out_dir}"
+            why = "too big for the temp drive" if size > 0 else "unknown size — using the larger drive for safety"
+            _plog("INFO", f"Auto: {item.name} (~{szs}) {why} → building on {out_dir}"
                              f"{contention or ' (mechanical drive, slower, but it completes)'}.")
             return spread_root
         # 4) Nothing fits — leave temp; the space gate aborts/skips with real numbers.
-        self.log("WARN", f"Auto: {item.name} (~{szs}) fits neither the SSD image (~{format_size(image_need)}) "
+        _plog("WARN", f"Auto: {item.name} (~{szs}) fits neither the temp drive (~{format_size(image_need)}) "
                           f"nor the output drive (~{format_size(out_full)}) — the space gate will skip/abort it.")
         return temp_root
 
@@ -5193,6 +5315,10 @@ class App:
         """Extract item.archive_path in a background thread, then call start() again."""
         archive = item.archive_path
         extract_root = self._resolve_extract_root(item)
+        # Keep Spotlight off the scratch: indexing the tens of thousands of files we're
+        # about to extract competes for the SAME (often mechanical) drive we then read
+        # them back from — a big throttle. Mark the extract + temp dirs no-index first.
+        self._mark_no_spotlight(extract_root, getattr(item, "_build_temp", None))
 
         self._active_item = item   # so terminal handlers can clean THIS item if the queue changed
         item.status = "Extracting"
@@ -5429,7 +5555,7 @@ class App:
             ok = (size > 0 and free >= image_need) or (out_dir is not None and out_free >= out_full)
             flag = "✓ OK" if ok else "⚠ LOW"
             self.temp_space_var.set(
-                f"SSD image: ~{format_size(image_need)}  |  Temp Free: {format_size(free)}  "
+                f"Temp image: ~{format_size(image_need)}  |  Temp Free: {format_size(free)}  "
                 f"|  Out Free: {format_size(out_free)}  |  {flag}"
             )
         except Exception:
@@ -5821,7 +5947,7 @@ class App:
                     _sz = _build_size_of(item)
                     if getattr(item, "_image_only_on_temp", False):
                         need = estimate_image_space_needed(_sz)
-                        kind = "image on SSD temp (spool auto-routed)"
+                        kind = f"image on {temp_drive_label(Path(bt))} (spool auto-routed)"
                     else:
                         need = estimate_peak_space_needed(_sz, _peak_factor_for(item), same_drive(Path(bt), od))
                         kind = "full scratch"
@@ -5848,6 +5974,9 @@ class App:
         if getattr(item, "archive_path", None):
             self._extract_queued_item(item)
             return
+        # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
+        # user's own — left indexable). Archives were marked in _extract_queued_item.
+        self._mark_no_spotlight(getattr(item, "_build_temp", None))
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
         except Exception as e:
@@ -5957,6 +6086,9 @@ class App:
             self._extract_queued_item(item)
             return
 
+        # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
+        # user's own — left indexable). Archives were marked in _extract_queued_item.
+        self._mark_no_spotlight(getattr(item, "_build_temp", None))
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
         except Exception as e:

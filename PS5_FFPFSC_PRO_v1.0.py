@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.25"
+APP_VERSION = "1.0.26"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -202,6 +202,39 @@ def format_duration(seconds) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def humanize_eta(raw) -> str:
+    """Turn a backend ETA token into hours/minutes/seconds. mkpfs emits raw seconds
+    ('ETA 1695s'), which is unreadable past a minute — convert to '1h 05m' / '28m 15s'
+    / '45s'. Accepts an optional unit (s/m/h); a bare number is treated as seconds.
+    Returns the input unchanged if it can't be parsed, and '—' for the no-ETA marker."""
+    if raw is None:
+        return "—"
+    s = str(raw).strip().lower()
+    if s in ("", "—", "-"):
+        return "—"
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)?$", s)
+    if not m:
+        return str(raw)
+    val = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit.startswith("h"):
+        total = val * 3600
+    elif unit.startswith("m"):   # m / min / minutes
+        total = val * 60
+    else:
+        total = val
+    total = int(round(total))
+    if total <= 0:
+        return "0s"
+    h, r = divmod(total, 3600)
+    mm, ss = divmod(r, 60)
+    if h:
+        return f"{h}h {mm:02d}m"
+    if mm:
+        return f"{mm}m {ss:02d}s"
+    return f"{ss}s"
+
+
 def get_free_space(path: Path) -> int:
     try:
         target = path if path.exists() else path.parent
@@ -259,6 +292,13 @@ def space_safety_factor() -> float:
 ARCHIVE_PEAK_FACTOR = 3.7
 INPLACE_PEAK_FACTOR = 2.3
 PATCH_PEAK_FACTOR   = 5.0
+
+# Free-space multiple for JUST the inner uncompressed PFS image (pass 1) on the temp/SSD
+# drive — used by the "image on the SSD, spool routed adaptively" split path. ~1.4x covers
+# 64 KiB block padding over many files plus a safety margin; the pass-2 spool is placed
+# separately by the backend (SSD if it still fits beside the image, else the output drive),
+# so the SSD no longer has to hold image+spool together for a big game to use it.
+IMAGE_PEAK_FACTOR = 1.4
 
 
 def archive_set_ondisk_size(archive: Path) -> int:
@@ -326,6 +366,12 @@ def estimate_peak_space_needed(extracted_size: int, factor: float = ARCHIVE_PEAK
     return int(extracted_size * mult * space_safety_factor())
 
 
+def estimate_image_space_needed(extracted_size: int) -> int:
+    """Free space the temp/SSD drive needs for JUST the inner uncompressed PFS image
+    (pass 1), in the split path where the pass-2 spool is placed adaptively elsewhere."""
+    return int(extracted_size * IMAGE_PEAK_FACTOR * space_safety_factor())
+
+
 def estimate_output_space_needed(game_size: int) -> int:
     """Worst-case free space the OUTPUT drive must have for the final .ffpfsc.
     A non-compressing title (PFSC gain ~0%, e.g. already-compressed game assets)
@@ -335,12 +381,32 @@ def estimate_output_space_needed(game_size: int) -> int:
 
 
 def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
-    """True only if BOTH drives have room: the temp drive for the uncompressed
-    image (and, on a shared drive, the final container too via the 2.20x peak),
-    and — when output is on a different drive — the output drive for the
-    full-size final .ffpfsc."""
-    same = same_drive(temp_dir, out_dir)
+    """True only if the chosen placement can complete.
+
+    Two shapes, driven by how _resolve_extract_root placed this run:
+      • Split (item._image_only_on_temp): only the inner image lives on temp_dir (the SSD);
+        the pass-2 spool is routed adaptively by the backend (temp if it still fits beside
+        the image, else the output drive) and the source/final live on the output drive. So
+        the SSD only needs the image, and the output drive needs source(when extracted
+        there) + final + a spool fallback (only when temp can't also hold the spool).
+      • One-drive: the whole scratch (source + image + spool) sits on temp_dir; the output
+        drive only needs the final container (skipped when it's the same volume)."""
+    temp_dir, out_dir = Path(temp_dir), Path(out_dir)
     size = _build_size_of(item)
+    if size <= 0:
+        return True   # unknown size — placement used the larger drive; the backend asserts
+    if getattr(item, "_image_only_on_temp", False):
+        temp_free = get_free_space(temp_dir)
+        image_need = estimate_image_space_needed(size)
+        image_ok = temp_free >= image_need
+        spool_need = int(size * 1.10)
+        spool_fits_temp = (temp_free - image_need) >= spool_need
+        # The source copy is reserved only before extraction (archive); afterwards it is
+        # already on the output drive and counted in its free space.
+        src_on_out = size if getattr(item, "source_kind", "") == "archive" else 0
+        out_need = src_on_out + estimate_output_space_needed(size) + (0 if spool_fits_temp else spool_need)
+        return image_ok and get_free_space(out_dir) >= out_need
+    same = same_drive(temp_dir, out_dir)
     factor = _peak_factor_for(item)
     temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same)
     out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size)
@@ -2626,10 +2692,12 @@ class CLIWorker(threading.Thread):
                         self.last_heartbeat = t
                         elapsed = format_duration(t - self.start_time)
                         try:
+                            # Keep the status panel alive (elapsed ticking) during silent
+                            # phases, but DON'T spam the log — a 30 s "Still working" line
+                            # helps no one and buries the useful output.
                             self.app.status_update("Still Working", "Backend is active. Do not close the app.",
                                                     self.phase, self.stage_progress.get(self.phase, 0),
                                                     self._overall(), elapsed, self.speed, "—")
-                            self.app.log("HEARTBEAT", f"Still working | Stage: {self.phase} | Elapsed: {elapsed}")
                         except Exception:
                             pass
             threading.Thread(target=_ticker, daemon=True).start()
@@ -2994,8 +3062,14 @@ class CLIWorker(threading.Thread):
             if sp:
                 self.speed = sp.group(1)
 
+            # Backend reports raw seconds ('ETA 1695s') — show it as 1h 05m / 28m 15s / 45s,
+            # both in the dedicated ETA field AND inside the detail line (label is shown as-is).
             eta_match = re.search(r"ETA\s*([0-9]+\s*(?:s|m|h|sec|secs|seconds|min|mins|minutes)?)", label, re.I)
-            eta = eta_match.group(1).strip() if eta_match else "—"
+            if eta_match:
+                eta = humanize_eta(eta_match.group(1).strip())
+                label = label[:eta_match.start()] + f"ETA {eta}" + label[eta_match.end():]
+            else:
+                eta = "—"
 
             if stage is None:
                 # Unrecognised progress line — update speed/eta but don't change stage
@@ -3459,45 +3533,65 @@ class App:
             pass
 
     def _save_sashes(self):
-        """Persist the positions of the content paned-window dividers so the three
-        sections (queue | progress | details) keep their user-chosen widths across
-        launches. Called on every divider release."""
+        """Persist the divider positions: the horizontal content dividers (queue |
+        progress | details widths, sash_h) AND the vertical content↔log divider (log
+        height, sash_v), so the layout the user set sticks across launches. Called on
+        every divider release."""
         h = getattr(self, "_paned_h", None)
-        if not h:
-            return
-        try:
-            xs = [h.sash_coord(0)[0], h.sash_coord(1)[0]]
-            if all(isinstance(x, int) and x > 0 for x in xs):
-                save_settings({"sash_h": xs})
-        except Exception:
-            pass
+        if h:
+            try:
+                xs = [h.sash_coord(0)[0], h.sash_coord(1)[0]]
+                if all(isinstance(x, int) and x > 0 for x in xs):
+                    save_settings({"sash_h": xs})
+            except Exception:
+                pass
+        v = getattr(self, "_paned_v", None)
+        if v:
+            try:
+                y = v.sash_coord(0)[1]
+                if isinstance(y, int) and y > 0:
+                    save_settings({"sash_v": y})
+            except Exception:
+                pass
 
     def _restore_sashes(self):
-        """Reapply the saved divider positions for the 3-section content area. On
-        first run (or invalid data) fall back to sensible proportions of the current
-        width; if the layout has not settled yet, retry shortly."""
+        """Reapply the saved divider positions: the 3-section content widths (sash_h)
+        and the content↔log split (sash_v). On first run (or invalid data) fall back to
+        sensible proportions of the current size; retry briefly if the layout has not
+        settled yet."""
         h = getattr(self, "_paned_h", None)
-        if not h:
+        v = getattr(self, "_paned_v", None)
+        if not h and not v:
             return
         try:
             self.root.update_idletasks()
-            W = h.winfo_width()
-            if W < 200:
+            W = h.winfo_width() if h else 0
+            if h and W < 200:
                 # Layout not settled yet — retry a bounded number of times, then give up
                 # (a degenerate <200px width must not arm a perpetual 300 ms timer).
                 self._sash_restore_tries = getattr(self, "_sash_restore_tries", 0) + 1
                 if self._sash_restore_tries <= 12:
                     self.root.after(300, self._restore_sashes)
                 return
-            sh = load_settings().get("sash_h")
-            if not (isinstance(sh, list) and len(sh) >= 2
-                    and all(isinstance(x, int) for x in sh)):
-                sh = [int(W * 0.30), int(W * 0.63)]
-            # Clamp into the visible range and keep the two dividers apart.
-            a = max(120, min(int(sh[0]), W - 240))
-            b = max(a + 120, min(int(sh[1]), W - 120))
-            h.sash_place(0, a, 1)
-            h.sash_place(1, b, 1)
+            if h:
+                sh = load_settings().get("sash_h")
+                if not (isinstance(sh, list) and len(sh) >= 2
+                        and all(isinstance(x, int) for x in sh)):
+                    sh = [int(W * 0.30), int(W * 0.63)]
+                # Clamp into the visible range and keep the two dividers apart.
+                a = max(120, min(int(sh[0]), W - 240))
+                b = max(a + 120, min(int(sh[1]), W - 120))
+                h.sash_place(0, a, 1)
+                h.sash_place(1, b, 1)
+            if v:
+                H = v.winfo_height()
+                if H >= 200:
+                    sv = load_settings().get("sash_v")
+                    if not isinstance(sv, int):
+                        sv = int(H * 0.62)          # ~content 62% / log 38% by default
+                    # Keep both panes usable: content ≥160 px tall, log ≥140 px.
+                    y = max(160, min(int(sv), H - 140))
+                    v.sash_place(0, 1, y)
         except Exception:
             pass
 
@@ -3620,8 +3714,9 @@ class App:
         main = ctk.CTkFrame(self.root, fg_color=BLACK, corner_radius=0)
         main.grid(row=0, column=0, sticky="nsew")
         main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(2, weight=2)       # content area — can shrink
-        main.grid_rowconfigure(4, weight=1, minsize=220)  # log always visible
+        # Row 2 holds a VERTICAL paned window with the content area (top) and the log/tabs
+        # area (bottom) — the user drags the horizontal divider to size the log.
+        main.grid_rowconfigure(2, weight=1)
 
         # ── Header ──────────────────────────────────────────────────────────
         header = ctk.CTkFrame(main, fg_color=BLACK)
@@ -3720,12 +3815,21 @@ class App:
         ctk.CTkEntry(top, textvariable=self.temp_var, placeholder_text="Temp folder on fast drive...",
                       fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=5, sticky="ew", padx=(0, 14), pady=14)
 
+        # ── Vertical split: content area (top) ↕ log/tabs area (bottom). A horizontal
+        #    divider the user drags up/down to grow or shrink the log; its position
+        #    persists as sash_v (see _save_sashes/_restore_sashes).
+        vpaned = tk.PanedWindow(main, orient="vertical", bg="#2a2a2a", sashwidth=8,
+                                sashrelief="flat", bd=0, opaqueresize=True)
+        vpaned.grid(row=2, column=0, sticky="nsew", padx=18, pady=(6, 14))
+        self._paned_v = vpaned
+        vpaned.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
+
         # ── Content area: 3 user-resizable sections (queue | progress | details).
         #    A horizontal paned window lets the user drag the two dividers; the sash
         #    positions are persisted across launches (see _save_sashes/_restore_sashes).
-        content = tk.PanedWindow(main, orient="horizontal", bg="#2a2a2a", sashwidth=8,
+        content = tk.PanedWindow(vpaned, orient="horizontal", bg="#2a2a2a", sashwidth=8,
                                  sashrelief="flat", bd=0, opaqueresize=True)
-        content.grid(row=2, column=0, sticky="nsew", padx=18, pady=6)
+        vpaned.add(content, minsize=200, stretch="always")
         self._paned_h = content
         content.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
 
@@ -4048,7 +4152,9 @@ class App:
         self._bind_dynamic_wrap(command, [self.command_label], padding=36, min_width=260)
 
         # ── Bottom: Tabbed Logs / Status / History / Statistics ─────────────
-        bottom = self.panel(main, row=4, column=0, sticky="nsew", padx=18, pady=(10, 14))
+        #    Lives in the vertical paned window as the lower, drag-resizable pane.
+        bottom = ctk.CTkFrame(vpaned, fg_color=PANEL, border_width=1, border_color=BORDER, corner_radius=10)
+        vpaned.add(bottom, minsize=160, stretch="never")
         bottom.grid_columnconfigure(0, weight=1)
         bottom.grid_rowconfigure(0, weight=1)
 
@@ -4861,20 +4967,23 @@ class App:
                 return 0
 
     def _resolve_extract_root(self, item) -> Path:
-        """Choose ONE drive for this run's WHOLE scratch footprint (extracted source +
-        inner image + pass-2 spool) and record it on the item: _build_root (where the
-        source extracts) and _build_temp (the backend --temp-dir for image + spool), so
-        build_command and all cleanup follow the same drive — never split across drives.
+        """Place this run's artifacts across drives to maximise fast (SSD) temp use, and
+        record the choice on the item: _build_root (where an archive extracts) and
+        _build_temp (the backend --temp-dir = where the inner image goes). The pass-2 spool
+        is then placed ADAPTIVELY by the backend (SSD if it still fits beside the image,
+        else the output drive), so the SSD no longer has to hold image+spool together.
 
-        Per drive_mode_var:
-          temp   -> force the SSD/temp drive (gate skips if the real footprint won't fit).
-          spread -> force the output drive.
-          auto   -> SSD/temp fast-path ONLY when the FULL real footprint fits; otherwise
-                    build everything on the output drive (slower, but it COMPLETES).
-        Prefers not to extract onto the source drive (read+write contention), but will if
-        that is the only drive with room — completing beats skipping. Never silently
-        dead-ends: when nothing fits it leaves temp and lets the space gate skip/abort
-        with real need-vs-free numbers."""
+        AUTO weighs three independent placements, each preferring the temp/SSD drive and
+        each falling back to the output drive — and never lets an HDD do a same-drive
+        read+write for the heavy steps:
+          1) Everything on the SSD (source + image + spool) when the full footprint fits.
+          2) SPLIT: inner image on the SSD, source extracted to the output drive (the spool
+             is auto-routed). Used when only the image — not image+spool — fits the SSD.
+          3) Everything on the output drive when the SSD can't even hold the image.
+          4) Nothing fits → leave temp; the space gate skips/aborts with real numbers.
+
+        Modes 'temp'/'spread' force the SSD / the output drive respectively; the backend's
+        adaptive spool still saves a too-tight 'temp' run from failing mid-pass-2."""
         archive = getattr(item, "archive_path", None)
         temp_base = self.temp_var.get().strip()
         if not temp_base:
@@ -4887,7 +4996,8 @@ class App:
         def set_temp():
             item._build_root = temp_root
             item._build_temp = temp_base_p
-        set_temp()   # default
+            item._image_only_on_temp = False
+        set_temp()   # default: whole scratch on the temp drive
 
         mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
         out_str = self.output_var.get().strip()
@@ -4903,24 +5013,29 @@ class App:
         def set_spread():
             item._build_root = spread_root
             item._build_temp = spread_temp
+            item._image_only_on_temp = False
         try:
             probe_out = out_dir if out_dir.exists() else out_dir.parent
             out_is_source = bool(archive) and same_drive(probe_out, archive.parent)
         except Exception:
             probe_out, out_is_source = out_dir, False
 
-        # Free space the build drive must have: temp keeps the final on the OTHER drive
-        # (unless temp==output), the output drive holds the final too (same drive).
-        temp_need = estimate_peak_space_needed(size, factor, same_drive(temp_base_p, out_dir))
-        out_need  = estimate_peak_space_needed(size, factor, True)
+        same_to = same_drive(temp_base_p, out_dir)
+        full_need  = estimate_peak_space_needed(size, factor, same_to)   # src+image+spool on temp
+        image_need = estimate_image_space_needed(size)                   # just the inner image on temp
+        out_full   = estimate_peak_space_needed(size, factor, True)      # everything on the output drive
+        # Output drive must hold, in the split: the source copy extracted there (archives
+        # only) + the final container (the spool only spills here if the SSD can't hold it).
+        src_on_out = size if archive else 0
+        out_split_need = int(src_on_out) + estimate_output_space_needed(size)
         temp_free = get_free_space(temp_base_p)
         out_free  = get_free_space(probe_out)
         szs = format_size(size) if size else "?"
         contention = " (output is the source drive: read+write contention, slower)" if out_is_source else ""
 
         if mode == "temp":
-            if size and temp_free < temp_need:
-                self.log("WARN", f"Drive 'temp': {item.name} needs ~{format_size(temp_need)} on temp, "
+            if size and temp_free < image_need:
+                self.log("WARN", f"Drive 'temp': {item.name} image needs ~{format_size(image_need)} on temp, "
                                   f"only {format_size(temp_free)} free — the space gate will handle it.")
             return temp_root
         if mode == "spread":
@@ -4928,17 +5043,29 @@ class App:
             self.log("INFO", f"Drive 'spread': building on the output drive {out_dir}{contention}.")
             return spread_root
         # AUTO ---------------------------------------------------------------------
-        if size > 0 and temp_free >= temp_need:
-            return temp_root   # SSD/temp fast-path: the full real footprint fits
-        if out_free >= out_need:
+        # 1) Everything on the SSD/temp (source + image + spool). Fastest; final on output.
+        if size > 0 and temp_free >= full_need:
+            return temp_root
+        # 2) SPLIT — inner image on the SSD, source extracted to the output drive; the
+        #    backend routes the spool adaptively. Reads source off one drive while writing
+        #    the image to the other, so neither HDD does a same-drive read+write.
+        if size > 0 and temp_free >= image_need and out_free >= out_split_need:
+            item._build_root = spread_root          # source extracts to the big output drive
+            item._build_temp = temp_base_p          # inner image (and spool, if it fits) on the SSD
+            item._image_only_on_temp = True
+            self.log("INFO", f"Auto: {item.name} (~{szs}) → image on the SSD temp, source on "
+                             f"{out_dir} (spool auto-routed). Avoids same-drive read+write.")
+            return spread_root
+        # 3) Everything on the output drive (mechanical, slower, but it completes).
+        if out_free >= out_full:
             set_spread()
             why = "too big for the SSD temp" if size > 0 else "unknown size — using the larger drive for safety"
             self.log("INFO", f"Auto: {item.name} (~{szs}) {why} → building on {out_dir}"
                              f"{contention or ' (mechanical drive, slower, but it completes)'}.")
             return spread_root
-        # Nothing fits — leave temp; the space gate aborts/skips with real numbers.
-        self.log("WARN", f"Auto: {item.name} (~{szs}) fits neither temp (~{format_size(temp_need)}) "
-                          f"nor output (~{format_size(out_need)}) — the space gate will skip/abort it.")
+        # 4) Nothing fits — leave temp; the space gate aborts/skips with real numbers.
+        self.log("WARN", f"Auto: {item.name} (~{szs}) fits neither the SSD image (~{format_size(image_need)}) "
+                          f"nor the output drive (~{format_size(out_full)}) — the space gate will skip/abort it.")
         return temp_root
 
     def _extract_dir_for_item(self, item):
@@ -5307,14 +5434,19 @@ class App:
             if temp_dir is None:
                 self.temp_space_var.set(f"Peak Needed: ~{format_size(int(_build_size_of(item) * _peak_factor_for(item)))}")
                 return
-            same  = same_drive(temp_dir, out_dir) if out_dir else True
-            peak  = estimate_peak_space_needed(_build_size_of(item), _peak_factor_for(item), same)
-            free  = get_free_space(temp_dir)
+            same   = same_drive(temp_dir, out_dir) if out_dir else True
+            size   = _build_size_of(item)
+            factor = _peak_factor_for(item)
+            free   = get_free_space(temp_dir)
             out_free = get_free_space(out_dir) if out_dir else 0
-            ok    = free >= peak
-            flag  = "✓ OK" if ok else "⚠ LOW"
+            image_need = estimate_image_space_needed(size)     # just the inner image on the SSD
+            out_full   = estimate_peak_space_needed(size, factor, True)
+            # It completes if the SSD can hold the image (split — the spool auto-routes to
+            # the big output drive) OR the output drive can hold the whole build.
+            ok = (size > 0 and free >= image_need) or (out_dir is not None and out_free >= out_full)
+            flag = "✓ OK" if ok else "⚠ LOW"
             self.temp_space_var.set(
-                f"Need: ~{format_size(peak)}  |  Temp Free: {format_size(free)}  "
+                f"SSD image: ~{format_size(image_need)}  |  Temp Free: {format_size(free)}  "
                 f"|  Out Free: {format_size(out_free)}  |  {flag}"
             )
         except Exception:
@@ -5425,6 +5557,13 @@ class App:
         temp_str = str(temp) if str(temp) else ""
         if temp_str:
             cmd += ["--temp-dir", temp_str]
+        # Spill target for the pass-2 spool when --temp-dir can't hold image+spool: the
+        # OUTPUT ROOT (a big drive). The backend writes the spool under <root>/_ffpfsc_temp,
+        # which the startup sweep and failure cleanup already reclaim. Lets a big game keep
+        # its inner image on the fast SSD instead of falling entirely onto the HDD.
+        out_root = self.output_var.get().strip()
+        if out_root:
+            cmd += ["--spool-fallback-dir", out_root]
         # Auto-patch: overlay a detected patch sibling onto the game before packing,
         # via the backend's PATCH MODE (now routed to the chosen --temp-dir above).
         if is_patch_job:
@@ -5456,12 +5595,14 @@ class App:
     def _cleanup_after_failure(self, item) -> None:
         """Reclaim a failed/skipped/cancelled run's scratch: the mkpfs tmp* working dirs
         (orphaned inner image + pass-2 spool) AND this item's own extracted-source subdir
-        — scoped to the drive the run actually built on (item._build_temp), and also the
-        user temp folder so an earlier SSD strand is reclaimed too. Counted so the next
-        batch gate waits for the reclaim. Threaded (rmtree of a ~150 GB tree must not
-        freeze the UI)."""
+        — scoped to the drive the run actually built on (item._build_temp), the user temp
+        folder, AND the output drive's _ffpfsc_temp (where a SPLIT run may have spilled its
+        pass-2 spool, ffpfsc_spool_*). Counted so the next batch gate waits for the reclaim.
+        Threaded (rmtree of a ~150 GB tree must not freeze the UI)."""
         roots, seen = [], set()
-        for cand in (getattr(item, "_build_temp", None), self.temp_var.get().strip()):
+        out_str = self.output_var.get().strip()
+        out_spool = (str(Path(out_str) / "_ffpfsc_temp") if out_str else None)
+        for cand in (getattr(item, "_build_temp", None), self.temp_var.get().strip(), out_spool):
             if not cand:
                 continue
             r = Path(cand)
@@ -5480,7 +5621,7 @@ class App:
             for root in roots:
                 try:
                     for p in root.iterdir():
-                        if p.is_dir() and _is_app_tmp_dir(p.name):
+                        if p.is_dir() and (_is_app_tmp_dir(p.name) or p.name.startswith("ffpfsc_spool_")):
                             sz = get_folder_size(p)
                             shutil.rmtree(str(p), ignore_errors=True)
                             freed += sz
@@ -5694,9 +5835,14 @@ class App:
                 gate = self._space_gate(item, od)
                 bt = getattr(item, "_build_temp", None)
                 if bt is not None:
-                    need = estimate_peak_space_needed(_build_size_of(item), _peak_factor_for(item),
-                                                      same_drive(Path(bt), od))
-                    self.log("INFO", f"Space check — {item.name}: build on {bt} | "
+                    _sz = _build_size_of(item)
+                    if getattr(item, "_image_only_on_temp", False):
+                        need = estimate_image_space_needed(_sz)
+                        kind = "image on SSD temp (spool auto-routed)"
+                    else:
+                        need = estimate_peak_space_needed(_sz, _peak_factor_for(item), same_drive(Path(bt), od))
+                        kind = "full scratch"
+                    self.log("INFO", f"Space check — {item.name}: {kind} on {bt} | "
                                      f"need ~{format_size(need)} | free {format_size(get_free_space(bt))} | {gate}")
                 if gate == "cancel":
                     self._batch_running = False
@@ -6772,6 +6918,18 @@ class App:
         except queue.Empty:
             pass
 
+        # Capture whether the log is scrolled to the bottom BEFORE inserting — yview()
+        # read AFTER an insert always reports < 1.0 (the content grew but the view hasn't
+        # moved yet), so checking it post-insert would never re-follow during active
+        # logging. Empty/short logs read (0.0, 1.0) → treated as "at bottom" → follow.
+        try:
+            was_at_bottom = self.log_box._textbox.yview()[1] >= 0.98
+        except Exception:
+            try:
+                was_at_bottom = self.log_box.yview()[1] >= 0.98
+            except Exception:
+                was_at_bottom = True
+
         processed = 0
         try:
             t = self.log_box._textbox
@@ -6799,21 +6957,16 @@ class App:
                     self.log_box.delete("1.0", "300.0")
                 self.visible_log_lines -= 300
 
-            # Smart auto-scroll: only follow the bottom if the user hasn't scrolled up.
-            # yview() returns (top_fraction, bottom_fraction). If bottom_fraction is
-            # >= 0.98 the scrollbar is at (or very near) the end — keep following.
-            # If the user scrolled up, bottom_fraction < 0.98 — leave their position alone.
-            try:
-                _, bottom = self.log_box._textbox.yview()
-                if bottom >= 0.98:
-                    self.log_box._textbox.see("end")
-            except Exception:
+            # Auto-scroll to the newest line — but only when the user was already at the
+            # bottom (captured above), so scrolling up to read older output isn't yanked back.
+            if was_at_bottom:
                 try:
-                    _, bottom = self.log_box.yview()
-                    if bottom >= 0.98:
-                        self.log_box.see("end")
+                    self.log_box._textbox.see("end")
                 except Exception:
-                    pass
+                    try:
+                        self.log_box.see("end")
+                    except Exception:
+                        pass
 
         try:
             while True:

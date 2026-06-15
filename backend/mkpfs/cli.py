@@ -321,6 +321,20 @@ def _detect_title_id_from_source(source_path: Path) -> str | None:
     return None
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Human-readable elapsed time: '1h 05m 12s' / '15m 52s' / '42.30s'. Keeps the
+    two-decimal seconds for sub-minute runs (where precision is useful); switches to
+    h/m/s once it passes a minute (where raw seconds are hard to read)."""
+    total = int(seconds)
+    h, r = divmod(total, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{seconds:.2f}s"
+
+
 def print_summary(stats: BuildStats) -> None:
     info("" + "=" * 70)
     info("Build Summary")
@@ -354,7 +368,7 @@ def print_summary(stats: BuildStats) -> None:
         f"({waste_pct:.2f}% of file data blocks)"
     )
 
-    info(f"\n  Elapsed time:            {stats.elapsed_seconds:.2f}s")
+    info(f"\n  Elapsed time:            {_fmt_duration(stats.elapsed_seconds)}")
 
     if stats.total_files > 0:
         throughput: float = stats.uncompressed_total_size / (stats.elapsed_seconds + 0.001)

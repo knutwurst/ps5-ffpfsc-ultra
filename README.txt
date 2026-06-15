@@ -1,4 +1,4 @@
-PS5 FFPFSC PRO v1.0.28
+PS5 FFPFSC PRO v1.0.29
 by Knutwurst | Powered by Bizkut Backend
 
 ════════════════════════════════════════════════

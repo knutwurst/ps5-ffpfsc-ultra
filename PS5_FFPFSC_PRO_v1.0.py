@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.26"
+APP_VERSION = "1.0.27"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3871,9 +3871,20 @@ class App:
         self.queue_listbox.bind("<Up>",   self._lb_key_up)
         self.queue_listbox.bind("<Down>", self._lb_key_down)
 
+        # Everything below the queue list goes into a SCROLLABLE body so it never gets
+        # clipped when the pane is short (the OPTIONS block used to fall off the bottom).
+        # The queue Listbox stays OUTSIDE this scroll area (row 1) on purpose: ctk only
+        # grabs the mouse-wheel inside its OWN canvas subtree, so a listbox that is not a
+        # descendant keeps its own wheel/scrollbar and the outer scroll can't fight it.
+        left.grid_rowconfigure(2, weight=1)
+        body = ctk.CTkScrollableFrame(left, fg_color=PANEL, corner_radius=0,
+                                      scrollbar_button_color=GREEN, scrollbar_button_hover_color=GREEN2)
+        body.grid(row=2, column=0, sticky="nsew", padx=0, pady=(2, 0))
+        body.grid_columnconfigure(0, weight=1)
+
         # Queue action buttons — row 0: scan/add, row 1: reorder/remove/clear
-        qbtns = ctk.CTkFrame(left, fg_color=PANEL)
-        qbtns.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 10))
+        qbtns = ctk.CTkFrame(body, fg_color=PANEL)
+        qbtns.grid(row=0, column=0, sticky="ew", padx=14, pady=(4, 10))
         qbtns.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self._button(qbtns, "SCAN / ADD", self.add_source_to_queue, green=True).grid(
@@ -3888,41 +3899,41 @@ class App:
         self._button(qbtns, "🗑 CLEAR",  self.clear_queue, red=True).grid(
             row=1, column=3, sticky="ew", padx=(2, 4), pady=(2, 4))
 
-        # ── row 3: Total / batch counter / drag-drop hint ────────────────────
+        # ── Total / batch counter / drag-drop hint ───────────────────────────
         self.queue_total_var = tk.StringVar(value="Total: 0 game(s)")
-        ctk.CTkLabel(left, textvariable=self.queue_total_var,
-                      text_color=MUTED).grid(row=3, column=0, sticky="w", padx=14, pady=(8, 0))
+        ctk.CTkLabel(body, textvariable=self.queue_total_var,
+                      text_color=MUTED).grid(row=1, column=0, sticky="w", padx=14, pady=(8, 0))
 
         self.batch_counter_var = tk.StringVar(value="")
         self.batch_counter_label = ctk.CTkLabel(
-            left, textvariable=self.batch_counter_var,
+            body, textvariable=self.batch_counter_var,
             text_color=YELLOW, font=ctk.CTkFont(size=12, weight="bold")
         )
-        self.batch_counter_label.grid(row=4, column=0, sticky="w", padx=14, pady=(0, 0))
+        self.batch_counter_label.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 0))
 
         if _HAS_DND:
-            ctk.CTkLabel(left, text="↓ Drag & drop supported", text_color=MUTED,
-                          font=ctk.CTkFont(size=11)).grid(row=5, column=0, sticky="w", padx=14, pady=(0, 4))
+            ctk.CTkLabel(body, text="↓ Drag & drop supported", text_color=MUTED,
+                          font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="w", padx=14, pady=(0, 4))
 
-        # ── row 6: Archive password ───────────────────────────────────────────
-        ctk.CTkLabel(left, text="ARCHIVE PASSWORD (OPTIONAL)",
+        # ── Archive password ──────────────────────────────────────────────────
+        ctk.CTkLabel(body, text="ARCHIVE PASSWORD (OPTIONAL)",
                       font=ctk.CTkFont(size=13, weight="bold"),
-                      text_color=WHITE).grid(row=6, column=0, sticky="w", padx=14, pady=(10, 2))
-        ctk.CTkLabel(left,
+                      text_color=WHITE).grid(row=4, column=0, sticky="w", padx=14, pady=(10, 2))
+        ctk.CTkLabel(body,
                       text="Only needed if your ZIP / RAR / 7z is password-protected.",
                       text_color=MUTED, font=ctk.CTkFont(size=11),
                       justify="left"
-                     ).grid(row=7, column=0, sticky="w", padx=14, pady=(0, 2))
-        ctk.CTkEntry(left, textvariable=self.password_var,
+                     ).grid(row=5, column=0, sticky="w", padx=14, pady=(0, 2))
+        ctk.CTkEntry(body, textvariable=self.password_var,
                       placeholder_text="Archive password (if required)",
                       show="*", fg_color=CARD, border_color=BORDER2,
-                      text_color=WHITE).grid(row=8, column=0, sticky="ew", padx=14, pady=(0, 4))
+                      text_color=WHITE).grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 4))
 
-        # ── row 9: Options ────────────────────────────────────────────────────
-        ctk.CTkLabel(left, text="OPTIONS", font=ctk.CTkFont(size=16, weight="bold"),
-                      text_color=WHITE).grid(row=9, column=0, sticky="w", padx=14, pady=(10, 6))
-        opts = ctk.CTkFrame(left, fg_color=PANEL)
-        opts.grid(row=10, column=0, sticky="ew", padx=14, pady=(0, 10))
+        # ── Options ───────────────────────────────────────────────────────────
+        ctk.CTkLabel(body, text="OPTIONS", font=ctk.CTkFont(size=16, weight="bold"),
+                      text_color=WHITE).grid(row=7, column=0, sticky="w", padx=14, pady=(10, 6))
+        opts = ctk.CTkFrame(body, fg_color=PANEL)
+        opts.grid(row=8, column=0, sticky="ew", padx=14, pady=(0, 10))
         for textv, var in [
             ("Open output folder when done",       self.open_output_var),
             ("Show summary popup",                 self.summary_popup_var),

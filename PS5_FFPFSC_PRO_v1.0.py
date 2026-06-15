@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.29"
+APP_VERSION = "1.0.30"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -288,25 +288,27 @@ def space_safety_factor() -> float:
 # the OUTPUT drive with NO spool on the temp drive (verified: a 109.6 GB game left only
 # ~113 GB on the temp drive — the inner image alone, no spool). So the temp/build drive
 # only ever holds {extracted source (archives) + inner .ffpfs image}, never a third spool
-# copy. Hence:
-#   ARCHIVE: source(1.0) + image(~1.4 incl. 64 KiB padding) ≈ 2.5x   (was 3.7 — that
-#            over-counted a spool that streaming never creates, which wrongly pushed big
-#            many-file games' sources onto a slow HDD → seek-storm reads).
-#   INPLACE: image only (~1.5x); folder/disk-image sources are read in place, no 2nd copy.
-#   PATCH:   a full game copy + image (~3.5x), no spool.
+# copy. The inner image is barely larger than the source — 64 KiB block-alignment waste is
+# only ~1-2% for real games (large asset/audio/video files): MEASURED 109.6 GB → 113 GB
+# image = 1.03x. (Heavy padding only happens for tiny-file games, which fit the SSD anyway.)
+# So image ≈ 1.05x; we budget 1.2x for headroom. Hence:
+#   ARCHIVE: source(1.0) + image(1.2) = 2.2x  (a 150 GB game = 330 GB ≤ a 353 GB SSD → its
+#            source extracts to the SSD too, so the many-file read is fast). Was 2.5/3.7 —
+#            those over-budgeted the image (and a non-existent spool) and needlessly pushed
+#            ~140-160 GB games' sources onto the slow HDD.
+#   INPLACE: image only (1.2x); folder/disk-image sources are read in place, no 2nd copy.
+#   PATCH:   a full game copy + image (~3.0x), no spool.
 # The "+1.05 same_temp_output_drive" term in estimate_peak_space_needed() adds the final
 # container when the build drive IS the output drive. The backend pre-pass-2 assert is the
-# final backstop and space_safety_factor() tunes headroom.
-ARCHIVE_PEAK_FACTOR = 2.5
-INPLACE_PEAK_FACTOR = 1.5
-PATCH_PEAK_FACTOR   = 3.5
+# final backstop and space_safety_factor() tunes headroom (raise it for more margin).
+ARCHIVE_PEAK_FACTOR = 2.2
+INPLACE_PEAK_FACTOR = 1.2
+PATCH_PEAK_FACTOR   = 3.0
 
 # Free-space multiple for JUST the inner uncompressed PFS image (pass 1) on the temp/SSD
-# drive — used by the "image on the SSD, spool routed adaptively" split path. ~1.4x covers
-# 64 KiB block padding over many files plus a safety margin; the pass-2 spool is placed
-# separately by the backend (SSD if it still fits beside the image, else the output drive),
-# so the SSD no longer has to hold image+spool together for a big game to use it.
-IMAGE_PEAK_FACTOR = 1.4
+# drive — used by the split path (image on the SSD, source on the output drive). 1.2x covers
+# 64 KiB block padding (~1-2% measured) plus a safety margin; matches INPLACE above.
+IMAGE_PEAK_FACTOR = 1.2
 
 
 def archive_set_ondisk_size(archive: Path) -> int:
@@ -3519,6 +3521,9 @@ class App:
         # and the wizard would never appear for a genuinely new user.
         self._is_first_run = is_first_run()
         self.queue = []
+        # Gate queue persistence until the saved queue is restored, so the initial
+        # empty render doesn't overwrite the saved queue before we load it.
+        self._queue_restored = False
         self.current_process = None
         self.cancel_requested = False
         self.extract_cancel_event = threading.Event()
@@ -3551,6 +3556,7 @@ class App:
 
         self._setup()
         self._build()
+        self._restore_queue()   # rebuild the saved queue now that the listbox exists
         self._poll()
 
         if self._is_first_run:
@@ -3706,6 +3712,7 @@ class App:
 
         self._saved_output = settings.get("output_folder", "")
         self._saved_temp = settings.get("temp_folder", "")
+        self._saved_source = settings.get("source_path", "")
         self._saved_auto_clear_temp = settings.get("auto_clear_temp", False)
         def _safe_int(v, default):
             try:
@@ -3817,7 +3824,12 @@ class App:
         self._button(header, "⚙  Settings", self.open_settings, width=120).grid(row=1, column=3, columnspan=2, padx=(0, 4), sticky="e")
 
         # ── Variables ────────────────────────────────────────────────────────
-        self.source_var = tk.StringVar()
+        # Remember the last input path across restarts (a browsed folder stays in the
+        # field). Only restore it if it still exists, so a moved/deleted path doesn't
+        # linger. Picking anything new overwrites it via the trace below.
+        _src0 = self._saved_source if (self._saved_source and Path(self._saved_source).exists()) else ""
+        self.source_var = tk.StringVar(value=_src0)
+        self.source_var.trace_add("write", lambda *_: save_settings({"source_path": self.source_var.get()}))
         self.output_var = tk.StringVar(value=self._saved_output)
         self.temp_var = tk.StringVar(value=self._saved_temp)
         # Persist typed/browsed paths so they survive a restart (previously only
@@ -5452,6 +5464,78 @@ class App:
             self.queue.clear()
         self.update_queue_box()
 
+    # GameItem fields that hold a Path (everything else is str/int/None and JSON-safe).
+    _QUEUE_PATH_FIELDS = ("path", "archive_path", "bundle_dir", "patch_source")
+
+    def _save_queue(self):
+        """Persist the current queue (paths + metadata, minus the PIL artwork and the
+        transient _-prefixed placement state) so it survives a restart/crash. Gated until
+        _restore_queue runs so the initial empty render can't clobber the saved queue.
+        Best-effort — never breaks the UI rebuild."""
+        if not getattr(self, "_queue_restored", False):
+            return
+        try:
+            items = []
+            for it in self.queue:
+                d = {}
+                for k, v in vars(it).items():
+                    if k.startswith("_") or k == "artwork":
+                        continue
+                    if isinstance(v, Path):
+                        d[k] = str(v)
+                    elif k == "bundle_siblings":
+                        d[k] = [str(s) for s in (v or [])]
+                    elif v is None or isinstance(v, (str, int, float, bool)):
+                        d[k] = v
+                    # anything else (unexpected) is dropped rather than risk a crash
+                items.append(d)
+            save_settings({"queue": items})
+        except Exception:
+            pass
+
+    def _restore_queue(self):
+        """Rebuild the saved queue on startup. Items whose source path no longer exists
+        are skipped; a mid-run status is reset to pending. Best-effort. Enables saving
+        afterwards (sets _queue_restored)."""
+        saved = []
+        try:
+            saved = load_settings().get("queue") or []
+        except Exception:
+            saved = []
+        restored = skipped = 0
+        for d in saved:
+            try:
+                if not isinstance(d, dict):
+                    skipped += 1
+                    continue
+                obj = GameItem.__new__(GameItem)
+                for k, v in d.items():
+                    if k in self._QUEUE_PATH_FIELDS and v:
+                        setattr(obj, k, Path(v))
+                    elif k == "bundle_siblings":
+                        setattr(obj, k, [Path(s) for s in (v or [])])
+                    else:
+                        setattr(obj, k, v)
+                # The source must still be on disk to be packable/unpackable.
+                probe = getattr(obj, "archive_path", None) or getattr(obj, "path", None)
+                if not probe or not Path(probe).exists():
+                    skipped += 1
+                    continue
+                obj.artwork = None   # re-detected lazily when the row is selected
+                if getattr(obj, "status", "") in ("Running", "Extracting", "Patching"):
+                    obj.status = "Pending Extract" if getattr(obj, "archive_path", None) else "Queued"
+                self.queue.append(obj)
+                restored += 1
+            except Exception:
+                skipped += 1
+        self._queue_restored = True   # from here on, queue mutations persist
+        if self.queue:
+            self.update_queue_box()
+        if restored:
+            self.log("INFO", f"Restored {restored} item(s) from the saved queue.")
+        if skipped:
+            self.log("WARN", f"Saved queue: {skipped} item(s) skipped (source path missing/invalid).")
+
     def update_queue_box(self, select_item=None):
         """Rebuild the listbox.
 
@@ -5460,6 +5544,7 @@ class App:
         though the listbox selection is stale).  When omitted the previously
         selected item is looked up by object identity; falls back to row 0.
         """
+        self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
         if select_item is None:
             prev_idx  = self._queue_sel_idx()

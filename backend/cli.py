@@ -271,6 +271,57 @@ def _assert_pass2_spool_space(image_path, temp_dir) -> None:
         sys.exit(1)
 
 
+def _open_pass2_spool_dir(image_path, default_temp_dir, output_path, spill_base=None):
+    """Pick where the pass-2 PFSC spool lives — the key to using a fast SSD temp even when
+    it can't hold image+spool together.
+
+    The inner image (pass 1) stays on *default_temp_dir* (the --temp-dir the GUI placed on
+    the SSD). The transient spool (~ the image size) goes there too WHEN it still fits
+    beside the image; otherwise it spills onto the OUTPUT drive (a different, usually much
+    larger volume). That keeps the image on the fast drive for the compression read instead
+    of forcing the whole build onto the slow drive. The spool is pure scratch — where it
+    lives does NOT change the resulting .ffpfsc bytes.
+
+    *spill_base* (the GUI's output-root, via --spool-fallback-dir) is the preferred spill
+    location (under <spill_base>/_ffpfsc_temp) so the GUI's startup sweep and failure
+    cleanup find it; it falls back to the output file's own folder.
+
+    Returns (spool_dir, cleanup_ctx): cleanup_ctx is a TemporaryDirectory to .cleanup()
+    (spool spilled to the output drive) or None (spool on default_temp_dir, reclaimed by the
+    caller's own temp dir). Never raises — on any doubt it returns default_temp_dir and the
+    pre-pass-2 assert remains the backstop."""
+    default_temp_dir = Path(default_temp_dir) if default_temp_dir else Path(tempfile.gettempdir())
+    try:
+        need = int(Path(image_path).stat().st_size * 1.10)
+    except Exception:
+        return default_temp_dir, None
+    try:
+        if shutil.disk_usage(str(default_temp_dir)).free >= need:
+            return default_temp_dir, None          # fits beside the image — fastest path
+    except Exception:
+        return default_temp_dir, None
+    # default_temp_dir can't hold image + spool. Spill the spool onto the output drive if it
+    # is a DIFFERENT volume with room (the image keeps reading from the fast temp drive).
+    try:
+        base = Path(spill_base) if spill_base else Path(output_path).parent
+        probe = base if base.exists() else base.parent
+        same = os.stat(str(default_temp_dir)).st_dev == os.stat(str(probe)).st_dev
+    except Exception:
+        return default_temp_dir, None
+    if not same:
+        try:
+            if shutil.disk_usage(str(probe)).free >= need:
+                spill = base / "_ffpfsc_temp"
+                spill.mkdir(parents=True, exist_ok=True)
+                ctx = tempfile.TemporaryDirectory(prefix="ffpfsc_spool_", dir=str(spill))
+                print(f"[INFO] Pass-2 spool routed to the output drive ({spill}) — temp can't "
+                      f"hold image+spool; the inner image stays on temp for fast reads.", flush=True)
+                return Path(ctx.name), ctx
+        except Exception as e:
+            print(f"[WARN] Could not place the pass-2 spool on the output drive: {e}", flush=True)
+    return default_temp_dir, None   # nothing better; the assert below errors cleanly if needed
+
+
 def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
     """macOS: build a raw exFAT filesystem image of *folder* (via hdiutil) so it can be
     compressed straight into a .ffpfsc — PSBrew's most-stable 'exfat -> ffpfsc' workflow,
@@ -685,6 +736,10 @@ def main() -> None:
     parser.add_argument("--temp-dir",     type=str, default=None,
                         help="Temp folder for intermediate files (default: system temp). "
                              "Use a fast NVMe drive for best performance.")
+    parser.add_argument("--spool-fallback-dir", type=str, default=None, metavar="DIR",
+                        help="Output-drive root to spill the pass-2 spool into (under "
+                             "<DIR>/_ffpfsc_temp) when --temp-dir can't hold image+spool. "
+                             "Keeps the inner image on the fast temp drive for big games.")
     parser.add_argument("--patch",        type=str, default=None, metavar="DIR",
                         help="PATCH MODE: overlay the loose files in DIR onto the game "
                              "(a folder or an existing .ffpfsc), then (re)pack to OUTPUT.")
@@ -728,6 +783,9 @@ def main() -> None:
     if user_temp:
         user_temp.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using user-specified temp folder: {user_temp}", flush=True)
+    # Output-drive root the pass-2 spool spills into when --temp-dir can't hold image+spool
+    # (the GUI passes its output root; the spill lands under <root>/_ffpfsc_temp).
+    user_spill: Path | None = Path(args.spool_fallback_dir).resolve() if args.spool_fallback_dir else None
 
     _is_zip = lambda p: p.suffix.lower() == ".zip"
     _is_rar = lambda p: p.suffix.lower() in (".rar", ".r00")
@@ -902,11 +960,16 @@ def main() -> None:
                         ffpfs_path.unlink()
                     except Exception:
                         pass
-                _assert_pass2_spool_space(temp_pfs, td2)
-                compress_file_to_ffpfsc(
-                    temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                    temp_folder=Path(td2), **pass2_kwargs,
-                )
+                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, td2, ffpfs_path, spill_base=user_spill)
+                try:
+                    _assert_pass2_spool_space(temp_pfs, spool_dir)
+                    compress_file_to_ffpfsc(
+                        temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                        temp_folder=spool_dir, **pass2_kwargs,
+                    )
+                finally:
+                    if spool_ctx is not None:
+                        spool_ctx.cleanup()
         print("\n[SUCCESS] Patch integrated successfully!")
         return
 
@@ -1014,22 +1077,34 @@ def main() -> None:
                 with tempfile.TemporaryDirectory(dir=user_temp) as exdir:
                     exfat_img = _build_exfat_image(item, Path(exdir), title_id)
                     if exfat_img is not None:
-                        _assert_pass2_spool_space(exfat_img, exdir)
-                        print("[INFO] Compressing exFAT image -> .ffpfsc...", flush=True)
-                        compress_file_to_ffpfsc(
-                            exfat_img, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                            temp_folder=Path(exdir), **pack_kwargs,
-                        )
+                        spool_dir, spool_ctx = _open_pass2_spool_dir(exfat_img, exdir, current_ffpfs_path, spill_base=user_spill)
+                        try:
+                            _assert_pass2_spool_space(exfat_img, spool_dir)
+                            print("[INFO] Compressing exFAT image -> .ffpfsc...", flush=True)
+                            compress_file_to_ffpfsc(
+                                exfat_img, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                                temp_folder=spool_dir, **pack_kwargs,
+                            )
+                        finally:
+                            if spool_ctx is not None:
+                                spool_ctx.cleanup()
                         continue   # done with this item; skip the two-pass folder build
                 print("[WARN] Falling back to the two-pass folder image (exFAT path unavailable).", flush=True)
 
             if item.is_file() and item.suffix.lower() in ('.exfat', '.ffpkg'):
-                # Direct disk image (.exfat / .ffpkg) → .ffpfsc (single-file streaming path)
-                compress_file_to_ffpfsc(
-                    item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                    temp_folder=user_temp,
-                    **pack_kwargs,
-                )
+                # Direct disk image (.exfat / .ffpkg) → .ffpfsc (single-file streaming path).
+                # The source is read in place; route the spool to the SSD temp if it fits,
+                # else spill onto the output drive (same adaptive rule as the folder path).
+                spool_dir, spool_ctx = _open_pass2_spool_dir(item, user_temp, current_ffpfs_path, spill_base=user_spill)
+                try:
+                    compress_file_to_ffpfsc(
+                        item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                        temp_folder=spool_dir,
+                        **pack_kwargs,
+                    )
+                finally:
+                    if spool_ctx is not None:
+                        spool_ctx.cleanup()
             else:
                 # Game folder: build an UNCOMPRESSED inner PFS image, then wrap it in a
                 # compressed PFSC container (.ffpfsc). This two-pass "wrapper" flow is
@@ -1061,12 +1136,21 @@ def main() -> None:
                               "compression (level 0) to skip wasted CPU; the .ffpfsc is the same "
                               "size either way.", flush=True)
                         pass2_kwargs["compression_level"] = 0
-                    _assert_pass2_spool_space(temp_pfs, temp_dir)
-                    compress_file_to_ffpfsc(
-                        temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                        temp_folder=Path(temp_dir),
-                        **pass2_kwargs,
-                    )
+                    # Adaptive pass-2 spool: keep the inner image on temp_dir (the SSD the
+                    # GUI chose) and put the spool there too if it still fits beside it,
+                    # else spill the spool onto the output drive — so a big game still
+                    # compresses off the fast drive instead of falling entirely to the HDD.
+                    spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, temp_dir, current_ffpfs_path, spill_base=user_spill)
+                    try:
+                        _assert_pass2_spool_space(temp_pfs, spool_dir)
+                        compress_file_to_ffpfsc(
+                            temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                            temp_folder=spool_dir,
+                            **pass2_kwargs,
+                        )
+                    finally:
+                        if spool_ctx is not None:
+                            spool_ctx.cleanup()
 
                     if args.keep_pfs:
                         saved = current_ffpfs_path.parent / f"{title_id}.ffpfs"

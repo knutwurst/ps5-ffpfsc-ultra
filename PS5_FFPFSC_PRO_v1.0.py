@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.31"
+APP_VERSION = "1.0.32"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -816,19 +816,25 @@ def guess_game_name(path: Path) -> str:
 
 
 def guess_game_version(path: Path) -> str:
-    """Best-effort game/content version (e.g. '01.004'), or '' if unknown."""
+    """Best-effort game/content version, or '' if unknown. Prefers the dump's own
+    param.json (contentVersion = authoritative), falling back to the folder name.
+    Accepts both the short form '01.004' AND the full PS5 form '01.200.000' — the old
+    regex rejected the full form, so a patched game's real contentVersion was skipped and
+    it fell back to masterVersion ('01.00'), mislabelling patched games as v01.00."""
+    # X.YY / X.YYY with an optional third group (the full PS5 XX.YYY.ZZZ version).
+    _VER = r"\d{1,2}\.\d{2,3}(?:\.\d{2,3})?"
     try:
         param = path / "sce_sys" / "param.json"
         if param.exists():
             data = json.loads(param.read_text(encoding="utf-8", errors="replace"))
             for key in ("contentVersion", "masterVersion", "appVer", "app_ver", "version"):
                 v = str(data.get(key, "")).strip()
-                if re.fullmatch(r"\d{1,2}\.\d{2,3}", v):
+                if re.fullmatch(_VER, v):
                     return v
     except Exception:
         pass
     # Fall back to a version pattern in the source folder name (e.g. "…01.004…")
-    m = re.search(r"\bv?(\d{1,2}\.\d{2,3})\b", path.name)
+    m = re.search(rf"\bv?({_VER})\b", path.name)
     return m.group(1) if m else ""
 
 

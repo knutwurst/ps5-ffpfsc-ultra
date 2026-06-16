@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.30"
+APP_VERSION = "1.0.31"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -344,6 +344,23 @@ def _build_size_of(item) -> int:
         return int(es)
     if getattr(item, "source_kind", None) == "archive":
         return 0   # unknown extracted size — do NOT fall back to compressed size
+    return int(getattr(item, "size", 0) or 0)
+
+
+def shows_extracted_size(item) -> bool:
+    """True when the size we display is the EXTRACTED (header-read) size, not the on-disk
+    size — i.e. a not-yet-extracted archive with a known uncompressed size. (After
+    extraction the item flips to source_kind='inplace' and .size is the real folder size.)"""
+    return getattr(item, "source_kind", "") == "archive" and getattr(item, "extracted_size", 0) > 0
+
+
+def display_size(item) -> int:
+    """The size to SHOW the user. For an archive, .size is the COMPRESSED volume set; the
+    EXTRACTED size (already read from headers, and what space/placement use) is the
+    meaningful number, so show that. Falls back to the on-disk .size when the header was
+    unreadable (extracted_size == 0). No extra disk I/O — the value is computed at add time."""
+    if shows_extracted_size(item):
+        return int(item.extracted_size)
     return int(getattr(item, "size", 0) or 0)
 
 
@@ -1259,7 +1276,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         space_ok = temp_ok and out_ok
 
         static_rows = [
-            ("Game Size",          format_size(item.size),                  None),
+            ("Game Size",          format_size(display_size(item)),         None),
             ("Temp Drive Free",    format_size(temp_free),
              "ok" if temp_ok else "warn"),
             ("Temp Needs (image)", format_size(peak_needed),                None),
@@ -4046,7 +4063,8 @@ class App:
 
         progress = self.panel(center, row=0, column=0, sticky="ew", pady=(0, 8))
         progress.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(progress, text="OVERALL PROGRESS", text_color=WHITE,
+        self.overall_title_var = tk.StringVar(value="QUEUE")
+        ctk.CTkLabel(progress, textvariable=self.overall_title_var, text_color=WHITE,
                       font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
         self.overall_pct_var = tk.StringVar(value="0%")
         ctk.CTkLabel(progress, textvariable=self.overall_pct_var, text_color=("#1a7a40", "#4ade80"),
@@ -4055,7 +4073,7 @@ class App:
         self.overall_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
         self.overall_bar.set(0)
 
-        ctk.CTkLabel(progress, text="CURRENT STAGE", text_color=WHITE,
+        ctk.CTkLabel(progress, text="CURRENT GAME", text_color=WHITE,
                       font=ctk.CTkFont(size=12, weight="bold")).grid(row=2, column=0, sticky="w", padx=14)
         self.stage_title_var = tk.StringVar(value="Ready")
         self.stage_detail_var = tk.StringVar(value="Add a game and start queue.")
@@ -5564,7 +5582,11 @@ class App:
         for i, item in enumerate(self.queue):
             prefix = "▶ " if (self._batch_running and i == 0) else f"{i + 1}. "
             op = "UNPACK" if getattr(item, "operation", "pack") == "unpack" else "PACK"
-            line = f"{prefix}{op}  {item.title_id}  {item.name}  [{format_size(item.size)}]  {item.status}"
+            # Archives store the COMPRESSED set size in .size; show the EXTRACTED size
+            # (what space/placement actually use), tagged with ~ as a header estimate.
+            _szs = (f"~{format_size(display_size(item))} unpacked"
+                    if shows_extracted_size(item) else format_size(item.size))
+            line = f"{prefix}{op}  {item.title_id}  {item.name}  [{_szs}]  {item.status}"
             self.queue_listbox.insert("end", line)
             if self._batch_running and i == 0:
                 self.queue_listbox.itemconfig(i, fg="#4ade80")
@@ -5596,7 +5618,11 @@ class App:
         mode = "Unpack" if getattr(item, "operation", "pack") == "unpack" else "Pack"
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")
         self.source_detail_var.set(f"Source: {item.path}")
-        self.orig_var.set(f"Original Size: {format_size(item.size)}")
+        if shows_extracted_size(item):
+            self.orig_var.set(f"Original Size: ~{format_size(item.extracted_size)} unpacked  "
+                              f"({format_size(item.size)} packed)")
+        else:
+            self.orig_var.set(f"Original Size: {format_size(item.size)}")
         self.files_var.set(f"Files: {item.files:,}")
         self.load_art(item.artwork)
         self._refresh_space_for_item(item)
@@ -7173,12 +7199,22 @@ class App:
                 title, detail, stage, stage_pct, overall_pct, elapsed, speed, eta = self.status_q.get_nowait()
                 self.big_status_var.set(title)
                 self.big_detail_var.set(detail)
-                self.stage_title_var.set(stage)
+                # Lower bar = CURRENT GAME: this game's progress across ALL its stages
+                # (= overall_pct). The live stage and its % live in the stage chain
+                # (▶ Compress 86%) and the detail line below — not a separate bar.
+                self.stage_title_var.set((self.queue[0].name if self.queue else "") or title)
                 self.stage_detail_var.set(detail)
-                self.stage_pct_var.set(f"{int(stage_pct)}%")
-                self.overall_pct_var.set(f"{int(overall_pct)}%")
-                self.stage_bar.set(max(0, min(1, stage_pct / 100)))
-                self.overall_bar.set(max(0, min(1, overall_pct / 100)))
+                self.stage_pct_var.set(f"{int(overall_pct)}%")
+                self.stage_bar.set(max(0, min(1, overall_pct / 100)))
+                # Upper bar = QUEUE: finished games + the current game's fraction over the
+                # whole batch — reflects TOTAL progress, not just the one running element.
+                _total = max(1, getattr(self, "_batch_total", 1))
+                _done  = getattr(self, "_batch_done", 0) + getattr(self, "_batch_failed", 0)
+                _qfrac = max(0.0, min(1.0, (_done + overall_pct / 100.0) / _total))
+                self.overall_pct_var.set(f"{int(_qfrac * 100)}%")
+                self.overall_bar.set(_qfrac)
+                self.overall_title_var.set(
+                    f"QUEUE  ·  Game {min(_done + 1, _total)}/{_total}" if _total > 1 else "QUEUE")
                 self.speed_var.set(f"Speed: {speed}")
                 self.elapsed_var.set(f"Elapsed: {elapsed}")
                 self.eta_var.set(f"ETA: {eta}")

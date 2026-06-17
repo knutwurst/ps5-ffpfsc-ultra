@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.32"
+APP_VERSION = "1.0.33"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -506,6 +506,27 @@ def temp_drive_label(path: Path) -> str:
     confirmed solid-state, otherwise the neutral 'temp drive'. We never call a drive an SSD
     on assumption — an external HDD (or an un-probed drive) must not be mislabelled."""
     return "SSD temp" if drive_type_cached(path) == "SSD" else "temp drive"
+
+
+KEEP_AWAKE_FILENAME = ".ffpfsc_keepalive"
+
+
+def poke_drive_keepalive(d: Path) -> bool:
+    """Force a tiny physical write to the drive holding *d* and flush it to the device,
+    so an idle external HDD doesn't park its heads / spin down. Bus-powered 2.5" USB
+    drives (e.g. WD Elements) park aggressively after a few seconds idle; that burns
+    through their limited load/unload cycle rating. A flushed write resets the drive's
+    idle timer. Reuses one hidden file (overwrite, not create/delete) to avoid directory
+    churn. Returns True on success. Safe to call only OFF the UI thread."""
+    try:
+        f = d / KEEP_AWAKE_FILENAME
+        with open(f, "wb") as fh:
+            fh.write(b"ffpfsc keep-alive\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except Exception:
+        return False
 
 
 def _probe_drive_type(path: Path) -> str:
@@ -1705,10 +1726,29 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkCheckBox(ds, text="Build via exFAT intermediate (macOS) — PSBrew's most-stable path",
                          variable=self.app.build_via_exfat_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
+        ctk.CTkCheckBox(ds, text="Keep external drives spun-up during a run (bridges gaps between games)",
+                         variable=self.app.keep_drives_awake_var, fg_color=GREEN,
+                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
+        ka_labels = {5: "every 5 s", 8: "every 8 s (recommended)", 10: "every 10 s", 15: "every 15 s"}
+        ka_rev = {v: k for k, v in ka_labels.items()}
+        ka_menu = ctk.CTkOptionMenu(
+            _ds_row("Keep-awake interval:"), values=list(ka_labels.values()), width=200,
+            command=lambda disp: save_settings({"keep_awake_interval": ka_rev.get(disp, 8)}))
+        try:
+            _cur_ka = int(s.get("keep_awake_interval", 8))
+        except (TypeError, ValueError):
+            _cur_ka = 8
+        ka_menu.set(ka_labels.get(_cur_ka, "every 8 s (recommended)"))
+        ka_menu.pack(side="left")
         ctk.CTkLabel(ds, text="Safety factor scales only the temp headroom; the output drive must always "
                               "fit the finished .ffpfsc. 'Skip' applies per game during batch runs. "
                               "exFAT mode wraps a real exFAT volume instead of the folder PFS builder "
-                              "(slower to build; try it if folder-built .ffpfsc crash the console).",
+                              "(slower to build; try it if folder-built .ffpfsc crash the console). "
+                              "Keep-awake only runs WHILE a job is packing: a fast tiny write keeps "
+                              "bus-powered HDDs (WD Elements) spun-up across the gaps between games, so "
+                              "each game skips a fresh spin-up. Keep it under ~8 s (the IntelliPark park "
+                              "timer) or it adds head-parking instead of preventing it. When idle the "
+                              "drive sleeps normally — its lowest-wear state.",
                       text_color=MUTED, justify="left", wraplength=440).pack(anchor="w", padx=14, pady=(0, 10))
 
         # ABOUT
@@ -3581,6 +3621,7 @@ class App:
         self._build()
         self._restore_queue()   # rebuild the saved queue now that the listbox exists
         self._poll()
+        self._start_keep_awake()   # keep external HDDs from sleeping (if enabled)
 
         if self._is_first_run:
             self.root.after(200, self._show_first_run_wizard)
@@ -3698,6 +3739,12 @@ class App:
             pass
 
     def _on_close(self):
+        # Stop the keep-awake pinger so it can't touch a drive mid-teardown.
+        try:
+            if getattr(self, "_keepawake_stop", None):
+                self._keepawake_stop.set()
+        except Exception:
+            pass
         # If a job is running, confirm and stop it (kill the whole backend tree)
         # before quitting — otherwise the backend + mkpfs Pool keep running headless.
         try:
@@ -3864,6 +3911,7 @@ class App:
         # diskutil/PowerShell. Re-probes when the folders change; cached per device.
         self.temp_var.trace_add("write", lambda *_: self._warm_drive_types())
         self.output_var.trace_add("write", lambda *_: self._warm_drive_types())
+        self.source_var.trace_add("write", lambda *_: self._warm_drive_types())
         self._warm_drive_types()
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
@@ -3894,6 +3942,14 @@ class App:
         # Opt-in: build an exFAT intermediate and compress that (PSBrew's most-stable
         # exfat->ffpfsc path) instead of the folder PFS builder. macOS only. Default off.
         self.build_via_exfat_var = self._persisted_bool(settings, "build_via_exfat", False)
+        # Keep external drives awake DURING A RUN only: a fast tiny flushed write so
+        # bus-powered 2.5" USB HDDs (WD Elements) stay spun-up with heads LOADED across the
+        # short gaps between games in a batch — so each game doesn't pay a fresh spinup. The
+        # interval ('keep_awake_interval', default 8 s) is deliberately under WD IntelliPark's
+        # 8 s park timer: a SLOWER ping would just unpark→re-park every cycle and ADD load
+        # cycles. When no job runs we ping nothing and let the drive fully sleep (its lowest-
+        # wear state). Default off; toggle + interval live in Settings → Drive & Space.
+        self.keep_drives_awake_var = self._persisted_bool(settings, "keep_drives_awake", False)
         # MkPFS 0.0.8 tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
@@ -5085,14 +5141,99 @@ class App:
                 pass
 
     def _warm_drive_types(self) -> None:
-        """Kick off background SSD/HDD probes for the temp + output drives so
+        """Kick off background SSD/HDD probes for the source + temp + output drives so
         temp_drive_label()/drive_type_cached() have honest data at pack time without ever
         blocking the UI thread on diskutil/PowerShell. Cached per device, so this is a
-        no-op after the first probe of a given drive."""
-        for p in (self.temp_var.get().strip(), self.output_var.get().strip()):
+        no-op after the first probe of a given drive. (Source is included so the keep-awake
+        pinger correctly SKIPS a confirmed-SSD source instead of treating it as Unknown.)"""
+        for p in (self.temp_var.get().strip(), self.output_var.get().strip(),
+                  self.source_var.get().strip()):
             if not p:
                 continue
             threading.Thread(target=lambda pp=Path(p): get_drive_type(pp), daemon=True).start()
+
+    # ── Keep-awake pinger ──────────────────────────────────────────────────────
+    def _start_keep_awake(self) -> None:
+        """One long-lived daemon that pings the configured drives so bus-powered
+        external HDDs don't sleep. It checks the toggle each cycle (so flipping the
+        Settings checkbox takes effect without restarting the thread)."""
+        self._keepawake_stop = threading.Event()
+        self._keepawake_announced = False
+        self._keepawake_thread = threading.Thread(target=self._keep_awake_loop, daemon=True)
+        self._keepawake_thread.start()
+
+    def _keepalive_dirs(self):
+        """Distinct, writable directories — one per physical drive — that the pinger
+        should touch. Skips drives we have CONFIRMED to be SSDs (no point), and pings
+        HDD plus still-unknown drives (the WD Elements externals report 'Unknown')."""
+        seen, out = set(), []
+        for v in (self.source_var, self.output_var, self.temp_var):
+            try:
+                raw = (v.get() or "").strip()
+            except Exception:
+                raw = ""
+            if not raw:
+                continue
+            p = Path(raw)
+            d = p if p.is_dir() else p.parent
+            try:
+                if not d.is_dir():
+                    continue
+                if drive_type_cached(d) == "SSD":
+                    continue  # never bother a confirmed SSD
+                dev = os.stat(str(d)).st_dev
+            except OSError:
+                continue
+            if dev in seen:
+                continue
+            seen.add(dev)
+            out.append(d)
+        return out
+
+    def _job_active(self) -> bool:
+        """True while the app is actively working the drives (a batch, a live pack worker,
+        a running backend process, or a pending extraction). Used to scope the keep-awake
+        pinger to runs only — outside a run we let external HDDs fully sleep."""
+        try:
+            if getattr(self, "_batch_running", False):
+                return True
+            w = getattr(self, "worker", None)
+            if w is not None and w.is_alive():
+                return True
+            p = getattr(self, "current_process", None)
+            if p is not None and p.poll() is None:
+                return True
+            if getattr(self, "pending_start", False):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _keep_awake_loop(self) -> None:
+        while not self._keepawake_stop.is_set():
+            active = False
+            try:
+                active = bool(self.keep_drives_awake_var.get()) and self._job_active()
+            except Exception:
+                pass
+            if active:
+                # Fast ping (default 8 s, under WD IntelliPark's 8 s park timer) keeps heads
+                # LOADED across inter-game gaps instead of unpark→re-park churn.
+                try:
+                    interval = max(3, min(15, int(load_settings().get("keep_awake_interval", 8))))
+                except Exception:
+                    interval = 8
+                dirs = self._keepalive_dirs()
+                for d in dirs:
+                    poke_drive_keepalive(d)
+                if dirs and not self._keepawake_announced:
+                    self.log("INFO", f"Keep-awake: holding {len(dirs)} drive(s) spun-up every "
+                                     f"{interval}s for this run.")
+                    self._keepawake_announced = True
+            else:
+                self._keepawake_announced = False
+            # Ping on the fast interval during a run; otherwise just poll the gate every 5 s.
+            self._keepawake_stop.wait(interval if active else 5)
 
     def _resolve_extract_root(self, item) -> Path:
         """Place this run's artifacts across drives to maximise fast (SSD) temp use, and

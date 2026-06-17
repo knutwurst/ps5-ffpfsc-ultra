@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.34"
+APP_VERSION = "1.0.35"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -422,6 +422,18 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     size = _build_size_of(item)
     if size <= 0:
         return True   # unknown size — placement used the larger drive; the backend asserts
+    if getattr(item, "_extract_on_pool", False):
+        # Two-fast-drive split: inner image on _build_temp (one SSD), extracted source on
+        # _build_root (another SSD), final on the output drive. Check each independently.
+        # No pass-2 spool term: our config (--inode-bits 32, --block-size 65536, unsigned)
+        # streams pass 2 directly to the image with NO spool, so the image drive needs only
+        # the image (~1.2x) and the extract drive only the source (~1x) — matching the
+        # router's stage-2 placement test. (The backend's pre-pass-2 assert is the backstop.)
+        image_dir   = Path(getattr(item, "_build_temp", temp_dir))
+        extract_dir = Path(getattr(item, "_build_root", image_dir))
+        return (get_free_space(image_dir)   >= estimate_image_space_needed(size)
+                and get_free_space(extract_dir) >= int(size)
+                and get_free_space(out_dir)  >= estimate_output_space_needed(size))
     if getattr(item, "_image_only_on_temp", False):
         temp_free = get_free_space(temp_dir)
         image_need = estimate_image_space_needed(size)
@@ -1740,6 +1752,50 @@ class SettingsWindow(ctk.CTkToplevel):
             _cur_ka = 8
         ka_menu.set(ka_labels.get(_cur_ka, "every 8 s (recommended)"))
         ka_menu.pack(side="left")
+
+        # ── Extra temp drives (pool) ─────────────────────────────────────────
+        ctk.CTkLabel(ds, text="Extra temp drives (pool, one path per line):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Add more fast scratch drives here (e.g. external SSDs). For a big archive "
+                              "game that won't fit one drive, the source is extracted to one and the inner "
+                              "image built on another — so pass 1 stays SSD↔SSD instead of reading off the "
+                              "HDD. The main Temp folder is the first pool drive; these are added to it.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14)
+        self._pool_box = ctk.CTkTextbox(ds, height=70, fg_color=CARD, border_width=1,
+                                         border_color=BORDER2, text_color=WHITE,
+                                         font=ctk.CTkFont(size=12))
+        self._pool_box.pack(fill="x", padx=14, pady=(4, 4))
+        self._pool_box.insert("1.0", "\n".join(self.app.temp_pool))
+
+        def _save_pool(*_):
+            raw = self._pool_box.get("1.0", "end")
+            seen, dirs = set(), []
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if ln and ln not in seen:
+                    seen.add(ln)
+                    dirs.append(ln)
+            self.app.temp_pool = dirs
+            save_settings({"temp_pool": dirs})
+            self.app._warm_drive_types()   # probe SSD/HDD for the new drives
+
+        self._pool_box.bind("<FocusOut>", _save_pool, add="+")
+        _pool_btns = ctk.CTkFrame(ds, fg_color=PANEL)
+        _pool_btns.pack(anchor="w", fill="x", padx=14, pady=(0, 6))
+        def _add_pool_dir():
+            p = filedialog.askdirectory(title="Select an extra temp/scratch drive")
+            if p:
+                cur = self._pool_box.get("1.0", "end").rstrip("\n")
+                self._pool_box.delete("1.0", "end")
+                self._pool_box.insert("1.0", (cur + "\n" + p).strip("\n"))
+                _save_pool()
+        ctk.CTkButton(_pool_btns, text="Add Drive…", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), width=120,
+                       command=_add_pool_dir).pack(side="left")
+        ctk.CTkButton(_pool_btns, text="Save Pool", fg_color=GREEN, text_color="#061006",
+                       hover_color=GREEN2, width=120, command=_save_pool).pack(side="left", padx=(8, 0))
+
         ctk.CTkLabel(ds, text="Safety factor scales only the temp headroom; the output drive must always "
                               "fit the finished .ffpfsc. 'Skip' applies per game during batch runs. "
                               "exFAT mode wraps a real exFAT volume instead of the folder PFS builder "
@@ -3917,6 +3973,10 @@ class App:
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
         self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["DLPSGAME.COM"]))
+        # Extra temp/scratch drives (a "pool" added to the primary temp field). When more
+        # than one fast drive is available the router can keep pass 1 SSD↔SSD for big
+        # archive games by extracting the source to one and building the image on another.
+        self.temp_pool: list[str] = [str(p) for p in (load_settings().get("temp_pool", []) or []) if str(p).strip()]
         self.copy_siblings_var = tk.BooleanVar(value=getattr(self, "_saved_copy_siblings", True))
         settings = load_settings()   # _build() is a separate method from _setup()
         self.keep_pfs_var        = self._persisted_bool(settings, "keep_pfs", False)
@@ -5147,8 +5207,9 @@ class App:
         blocking the UI thread on diskutil/PowerShell. Cached per device, so this is a
         no-op after the first probe of a given drive. (Source is included so the keep-awake
         pinger correctly SKIPS a confirmed-SSD source instead of treating it as Unknown.)"""
-        for p in (self.temp_var.get().strip(), self.output_var.get().strip(),
-                  self.source_var.get().strip()):
+        probes = [self.output_var.get().strip(), self.source_var.get().strip()]
+        probes += [str(d) for d in self._temp_pool_dirs()]   # primary temp + extra pool drives
+        for p in probes:
             if not p:
                 continue
             threading.Thread(target=lambda pp=Path(p): get_drive_type(pp), daemon=True).start()
@@ -5175,16 +5236,44 @@ class App:
         except OSError:
             return None
 
-    def _keepalive_dirs(self):
-        """(dir, st_dev) per physical drive the pinger may touch. Skips drives we have
-        CONFIRMED to be SSDs (no point), and keeps HDD plus still-unknown drives (the WD
-        Elements externals report 'Unknown')."""
-        seen, out = set(), []
-        for v in (self.source_var, self.output_var, self.temp_var):
+    def _temp_pool_dirs(self):
+        """Ordered, device-deduped list of fast-temp candidate directories: the primary
+        temp field first, then the extra pool dirs from Settings. The router spreads the
+        inner image / extracted source across these (and the keep-awake pinger covers
+        them). The primary is always included even if it doesn't exist yet (it's created on
+        demand); extra pool entries must exist."""
+        out, seen = [], set()
+        primary = self.temp_var.get().strip()
+        cands = ([primary] if primary else []) + [str(p).strip() for p in getattr(self, "temp_pool", [])]
+        for i, raw in enumerate(cands):
+            if not raw:
+                continue
+            d = Path(raw)
             try:
-                raw = (v.get() or "").strip()
+                if i > 0 and not d.is_dir():
+                    continue   # skip a missing EXTRA pool dir (unplugged drive, typo)
+                dev = _drive_cache_key(d)
             except Exception:
-                raw = ""
+                continue
+            if dev in seen:
+                continue
+            seen.add(dev)
+            out.append(d)
+        return out
+
+    def _keepalive_dirs(self):
+        """(dir, st_dev) per physical drive the pinger may touch — source, output, and
+        every temp-pool drive. Skips drives we have CONFIRMED to be SSDs (no point), and
+        keeps HDD plus still-unknown drives (the WD Elements externals report 'Unknown')."""
+        seen, out = set(), []
+        raws = []
+        for v in (self.source_var, self.output_var):
+            try:
+                raws.append((v.get() or "").strip())
+            except Exception:
+                pass
+        raws += [str(d) for d in self._temp_pool_dirs()]
+        for raw in raws:
             if not raw:
                 continue
             p = Path(raw)
@@ -5320,6 +5409,7 @@ class App:
             item._build_root = temp_root
             item._build_temp = temp_base_p
             item._image_only_on_temp = False
+            item._extract_on_pool = False
         set_temp()   # default: whole scratch on the temp drive
 
         # Placement is resolved several times per item (the space gate, the extraction
@@ -5346,6 +5436,7 @@ class App:
             item._build_root = spread_root
             item._build_temp = spread_temp
             item._image_only_on_temp = False
+            item._extract_on_pool = False
         try:
             probe_out = out_dir if out_dir.exists() else out_dir.parent
             out_is_source = bool(archive) and same_drive(probe_out, archive.parent)
@@ -5375,32 +5466,66 @@ class App:
             _plog("INFO", f"Drive 'spread': building on the output drive {out_dir}{contention}.")
             return spread_root
         # AUTO ---------------------------------------------------------------------
-        # 1) Everything on the SSD/temp (source + image + spool). Fastest; final on output.
-        if size > 0 and temp_free >= full_need:
-            return temp_root
-        # 2) SPLIT — inner image on the SSD, source extracted to the output drive; the
+        # Fast-temp candidates (primary temp + any extra pool drives), each with free space.
+        pool = []
+        for d in self._temp_pool_dirs():
+            try:
+                pool.append((d, get_free_space(d)))
+            except Exception:
+                pass
+        if not pool:
+            pool = [(temp_base_p, temp_free)]
+        is_archive_pre = getattr(item, "source_kind", "") == "archive"
+
+        def _set(image_dir, extract_dir, image_only, on_pool):
+            item._build_temp = Path(image_dir)
+            item._build_root = Path(extract_dir)
+            item._image_only_on_temp = image_only
+            item._extract_on_pool = on_pool
+
+        # 1) Everything on ONE fast drive (source + image + spool). Best-fit = most free.
+        fit_full = [(d, f) for d, f in pool if f >= full_need]
+        if size > 0 and fit_full:
+            best = max(fit_full, key=lambda t: t[1])[0]
+            _set(best, Path(best) / "_extracted", False, False)
+            if _drive_cache_key(best) != _drive_cache_key(temp_base_p):
+                _plog("INFO", f"Auto: {item.name} (~{szs}): whole scratch on pool drive {best}.")
+            return item._build_root
+        # 2) TWO fast drives (archives only): inner image on one, extracted source on
+        #    ANOTHER — keeps pass 1 SSD↔SSD when no single fast drive holds image+source.
+        if size > 0 and is_archive_pre:
+            img_fit = [(d, f) for d, f in pool if f >= image_need]
+            if img_fit:
+                img_dir = min(img_fit, key=lambda t: t[1])[0]    # smallest fast drive that fits the image
+                img_dev = _drive_cache_key(img_dir)
+                ext_fit = [(d, f) for d, f in pool
+                           if _drive_cache_key(d) != img_dev and f >= int(size)]
+                if ext_fit:
+                    ext_dir = max(ext_fit, key=lambda t: t[1])[0]  # most-free OTHER fast drive
+                    _set(img_dir, Path(ext_dir) / "_extracted", True, True)
+                    _plog("INFO", f"Auto: {item.name} (~{szs}): extract source → {ext_dir}; "
+                                     f"inner image → {img_dir}; final → {out_dir}. Pass 1 stays SSD↔SSD.")
+                    return item._build_root
+        # 3) SPLIT — inner image on a fast drive, source extracted to the OUTPUT drive; the
         #    backend routes the spool adaptively. Reads source off one drive while writing
         #    the image to the other, so neither HDD does a same-drive read+write.
-        if size > 0 and temp_free >= image_need and out_free >= out_split_need:
-            item._build_root = spread_root          # source extracts to the big output drive
-            item._build_temp = temp_base_p          # inner image (and spool, if it fits) on the SSD
-            item._image_only_on_temp = True
-            # Spell out the ORDER + both drives: the big HDD write you see first is the
-            # SOURCE extraction; the inner image builds on the SSD afterwards. (The old
-            # wording led with "image on the SSD" and looked wrong next to the HDD write.)
+        img_fit = [(d, f) for d, f in pool if f >= image_need]
+        if size > 0 and img_fit and out_free >= out_split_need:
+            img_dir = max(img_fit, key=lambda t: t[1])[0]
+            _set(img_dir, spread_root, True, False)          # source extracts to the big output drive
             _plog("INFO", f"Auto: {item.name} (~{szs}): 1) extract source → output drive "
-                             f"({out_dir}); 2) build inner image → {temp_drive_label(temp_base_p)} "
-                             f"({temp_base_p}); spool auto-routed. No same-drive read+write.")
+                             f"({out_dir}); 2) build inner image → {temp_drive_label(img_dir)} "
+                             f"({img_dir}); spool auto-routed. No same-drive read+write.")
             return spread_root
-        # 3) Everything on the output drive (mechanical, slower, but it completes).
+        # 4) Everything on the output drive (mechanical, slower, but it completes).
         if out_free >= out_full:
             set_spread()
-            why = "too big for the temp drive" if size > 0 else "unknown size — using the larger drive for safety"
+            why = "too big for the temp drive(s)" if size > 0 else "unknown size — using the larger drive for safety"
             _plog("INFO", f"Auto: {item.name} (~{szs}) {why} → building on {out_dir}"
                              f"{contention or ' (mechanical drive, slower, but it completes)'}.")
             return spread_root
-        # 4) Nothing fits — leave temp; the space gate aborts/skips with real numbers.
-        _plog("WARN", f"Auto: {item.name} (~{szs}) fits neither the temp drive (~{format_size(image_need)}) "
+        # 5) Nothing fits — leave temp; the space gate aborts/skips with real numbers.
+        _plog("WARN", f"Auto: {item.name} (~{szs}) fits neither the temp drive(s) (~{format_size(image_need)}) "
                           f"nor the output drive (~{format_size(out_full)}) — the space gate will skip/abort it.")
         return temp_root
 

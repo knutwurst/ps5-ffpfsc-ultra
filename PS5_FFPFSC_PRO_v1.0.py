@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.35"
+APP_VERSION = "1.0.36"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -2485,12 +2485,20 @@ SCENE_JUNK_EXTS = {".nfo", ".sfv", ".txt", ".diz", ".url", ".md5", ".sha1",
 # destination. The mkpfs backend filters the same set inside the image
 # (pfs.is_fs_junk); this GUI copy path is a separate process, so it carries its own.
 FS_JUNK_NAMES = {".DS_Store", ".localized", ".VolumeIcon.icns", ".apdisk",
-                 "Thumbs.db", "ehthumbs.db", "desktop.ini"}
+                 "Thumbs.db", "ehthumbs.db", "desktop.ini",
+                 # junk DIRECTORIES (so they're never carried as a DLC/extra sibling)
+                 "__MACOSX", ".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems"}
 
 
 def is_fs_junk_name(name: str) -> bool:
     """True for macOS/Windows filesystem junk (by basename). '._*' = AppleDouble."""
     return name in FS_JUNK_NAMES or name.startswith("._")
+
+
+# Glob patterns for the dir-copy path (shutil.ignore_patterns) so a copied DLC/extra
+# folder never carries OS/archiver metadata to the destination.
+_COPYTREE_JUNK_GLOBS = ("__MACOSX", ".DS_Store", "._*", ".localized",
+                        ".Spotlight-V100", ".fseventsd", ".Trashes", "Thumbs.db", "desktop.ini")
 
 
 def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None, detect_patch=False):
@@ -2580,10 +2588,32 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None, dete
         exclude: set = set()
         for c in cands:
             exclude |= _vol_set(c)
-        return [f for f in files
-                if f.resolve() not in exclude
-                and f.suffix.lower() not in SCENE_JUNK_EXTS
-                and not is_fs_junk_name(f.name)]
+        files_out = [f for f in files
+                     if f.resolve() not in exclude
+                     and f.suffix.lower() not in SCENE_JUNK_EXTS
+                     and not is_fs_junk_name(f.name)]
+        # Also carry whole EXTRA subfolders (e.g. an '[ ALL DLC ]' wrapper) — anything
+        # that isn't the chosen game/patch, doesn't CONTAIN it, and isn't OS junk.
+        game_paths = set()
+        for g in cands:
+            try:
+                game_paths.add(g.resolve())
+            except Exception:
+                pass
+        dirs_out = []
+        for d in subdirs:
+            try:
+                rp = d.resolve()
+            except Exception:
+                continue
+            if rp in game_paths:
+                continue                                   # the game/patch folder itself
+            if any(str(g) == str(rp) or str(g).startswith(str(rp) + os.sep) for g in game_paths):
+                continue                                   # a wrapper that holds the game
+            if is_fs_junk_name(d.name):
+                continue
+            dirs_out.append(d)
+        return files_out + dirs_out
 
     # Normal case: exactly one game in the folder.
     if len(games) == 1:
@@ -3404,9 +3434,10 @@ class CLIWorker(threading.Thread):
         return False
 
     def _copy_bundle_siblings(self) -> None:
-        """For a folder bundle, copy the extra files (DLCs etc.) next to the
-        packed .ffpfsc. No-op unless the item carries siblings and the user has
-        'copy extras' enabled."""
+        """Copy the extra files AND folders (DLCs etc.) next to the packed .ffpfsc.
+        Handles both loose files and whole subfolders (e.g. an '[ ALL DLC ]' wrapper),
+        copied 1:1 into the output directory. No-op unless the item carries siblings and
+        the user has 'copy extras' enabled. The source is never modified (copy, not move)."""
         siblings = getattr(self.item, "bundle_siblings", None)
         if not siblings:
             return
@@ -3418,19 +3449,33 @@ class CLIWorker(threading.Thread):
         for src in siblings:
             try:
                 src = Path(src)
-                if not src.exists() or not src.is_file():
+                if not src.exists():
                     continue
                 target = dest_dir / src.name
-                if target.exists() and target.stat().st_size == src.stat().st_size:
+                if src.is_dir():
+                    # DLC / extra subfolder → copy the whole tree (merge). Skip when an
+                    # identical-size copy is already there so a re-run doesn't re-copy GBs.
+                    if target.resolve() == src.resolve():
+                        continue   # source already sits in the destination — nothing to do
+                    if target.exists() and get_folder_size(target) == get_folder_size(src):
+                        copied += 1
+                        continue
+                    self.app.log("INFO", f"Copying extra folder next to output: {src.name} "
+                                         f"({format_size(get_folder_size(src))})")
+                    shutil.copytree(src, target, dirs_exist_ok=True,
+                                    ignore=shutil.ignore_patterns(*_COPYTREE_JUNK_GLOBS))
                     copied += 1
-                    continue
-                self.app.log("INFO", f"Copying extra next to output: {src.name} ({format_size(src.stat().st_size)})")
-                shutil.copy2(src, target)
-                copied += 1
+                elif src.is_file():
+                    if target.exists() and target.stat().st_size == src.stat().st_size:
+                        copied += 1
+                        continue
+                    self.app.log("INFO", f"Copying extra next to output: {src.name} ({format_size(src.stat().st_size)})")
+                    shutil.copy2(src, target)
+                    copied += 1
             except Exception as e:
                 self.app.log("WARN", f"Could not copy extra '{Path(src).name}': {e}")
         if copied:
-            self.app.log("OK", f"Copied {copied} extra file(s) next to the .ffpfsc.")
+            self.app.log("OK", f"Copied {copied} extra item(s) next to the .ffpfsc.")
 
     def _validate_shadowmount(self) -> list:
         """Post-compression ShadowMount compatibility checks.
@@ -4927,6 +4972,37 @@ class App:
             return GameItem.from_exfat(path)
         return GameItem(path)
 
+    def _sibling_extras(self, parent: Path, game_paths) -> list:
+        """Extra items (DLC subfolders, loose non-junk files) sitting BESIDE the game in an
+        extracted archive tree, to copy next to the .ffpfsc. Excludes the detected game
+        folder(s) and any wrapper that contains one, OS/Finder junk, and scene-note files
+        (.txt/.nfo/images …). The source is never modified — these are copied, not moved."""
+        ex = set()
+        for g in game_paths:
+            try:
+                ex.add(str(Path(g).resolve()))
+            except Exception:
+                pass
+        out = []
+        try:
+            for child in sorted(Path(parent).iterdir()):
+                try:
+                    rp = str(child.resolve())
+                except Exception:
+                    continue
+                if rp in ex:
+                    continue                                       # the game folder itself
+                if any(g == rp or g.startswith(rp + os.sep) for g in ex):
+                    continue                                       # a wrapper that holds the game
+                if is_fs_junk_name(child.name):
+                    continue
+                if child.is_file() and child.suffix.lower() in SCENE_JUNK_EXTS:
+                    continue                                       # scene notes / nfo / cover images
+                out.append(child)
+        except Exception:
+            pass
+        return out
+
     def _copy_item_payload(self, target: GameItem, source: GameItem) -> None:
         target.path         = source.path
         target.archive_path = source.archive_path
@@ -5720,6 +5796,15 @@ class App:
                 payload_items = [self._item_from_payload_path(kind, path) for path in paths]
                 primary = payload_items[0]
                 self._copy_item_payload(item, primary)
+                # Carry extra subfolders/files that sit BESIDE the game in the archive
+                # (e.g. an '[ ALL DLC ]' wrapper) so they're copied next to the .ffpfsc.
+                # Skipped when the archive root IS the game (no wrapper → no siblings).
+                if kind == "game" and not (len(paths) == 1
+                        and Path(paths[0]).resolve() == Path(extracted_root).resolve()):
+                    try:
+                        item.bundle_siblings = self._sibling_extras(Path(primary.path).parent, paths)
+                    except Exception:
+                        item.bundle_siblings = []
                 self._extract_q.put(("ok", (item, payload_items[1:])))
             except ArchiveExtractionCancelled as exc:
                 self.log("WARN", str(exc))

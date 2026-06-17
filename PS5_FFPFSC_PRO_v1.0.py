@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.33"
+APP_VERSION = "1.0.34"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -1746,9 +1746,10 @@ class SettingsWindow(ctk.CTkToplevel):
                               "(slower to build; try it if folder-built .ffpfsc crash the console). "
                               "Keep-awake only runs WHILE a job is packing: a fast tiny write keeps "
                               "bus-powered HDDs (WD Elements) spun-up across the gaps between games, so "
-                              "each game skips a fresh spin-up. Keep it under ~8 s (the IntelliPark park "
-                              "timer) or it adds head-parking instead of preventing it. When idle the "
-                              "drive sleeps normally — its lowest-wear state.",
+                              "each game skips a fresh spin-up. It pings only the drive the job ISN'T "
+                              "currently using (the busy one can't sleep and a write there just costs a "
+                              "seek). Keep it under ~8 s (the IntelliPark park timer) or it adds head-"
+                              "parking instead of preventing it. When idle the drive sleeps normally.",
                       text_color=MUTED, justify="left", wraplength=440).pack(anchor="w", padx=14, pady=(0, 10))
 
         # ABOUT
@@ -5162,10 +5163,22 @@ class App:
         self._keepawake_thread = threading.Thread(target=self._keep_awake_loop, daemon=True)
         self._keepawake_thread.start()
 
+    @staticmethod
+    def _dev_of(path):
+        """st_dev for the volume holding *path* (its parent if it's a file), or None."""
+        if not path:
+            return None
+        try:
+            p = Path(path)
+            d = p if p.is_dir() else p.parent
+            return os.stat(str(d)).st_dev
+        except OSError:
+            return None
+
     def _keepalive_dirs(self):
-        """Distinct, writable directories — one per physical drive — that the pinger
-        should touch. Skips drives we have CONFIRMED to be SSDs (no point), and pings
-        HDD plus still-unknown drives (the WD Elements externals report 'Unknown')."""
+        """(dir, st_dev) per physical drive the pinger may touch. Skips drives we have
+        CONFIRMED to be SSDs (no point), and keeps HDD plus still-unknown drives (the WD
+        Elements externals report 'Unknown')."""
         seen, out = set(), []
         for v in (self.source_var, self.output_var, self.temp_var):
             try:
@@ -5187,8 +5200,42 @@ class App:
             if dev in seen:
                 continue
             seen.add(dev)
-            out.append(d)
+            out.append((d, dev))
         return out
+
+    def _busy_devices(self):
+        """Best-effort set of device IDs the current job is actively reading/writing, by
+        worker phase, so the pinger can SKIP them — a flushed write there forces a pointless
+        seek away from the streaming I/O. Empty set ⇒ ping every configured drive (the safe
+        default when we can't tell, e.g. during pre-worker archive extraction or 'Starting')."""
+        w = getattr(self, "worker", None)
+        if w is None or not getattr(w, "is_alive", lambda: False)():
+            return set()
+        phase = getattr(w, "phase", "") or ""
+        item = getattr(self, "_active_item", None)
+        out = self.output_var.get().strip()
+        src = getattr(item, "path", None) if item else None
+        arch = getattr(item, "archive_path", None) if item else None
+        br = getattr(item, "_build_root", None) if item else None   # extracted-source dir
+        bt = getattr(item, "_build_temp", None) if item else None   # inner-image dir
+        busy = set()
+        def add(*paths):
+            for p in paths:
+                dev = self._dev_of(p)
+                if dev is not None:
+                    busy.add(dev)
+        if phase in ("Scanning Files", "Reading Game", "Creating Temp PFS"):
+            # pass 1: read source, write inner image. An archive reads from its extracted
+            # dir (_build_root); a plain folder reads from its original path (_build_root is
+            # an unused extract dir for folders, so don't treat it as busy).
+            add((br or src) if arch else src, bt)
+        elif phase in ("Compressing", "Writing Final Image"):
+            add(bt, out)                 # pass 2: read inner image, write .ffpfsc
+        elif phase == "Extracting":
+            add(arch or src, br)         # archive extraction: read archive, write extract dir
+        elif phase == "Verifying Output":
+            add(out)                     # verify: read .ffpfsc
+        return busy
 
     def _job_active(self) -> bool:
         """True while the app is actively working the drives (a batch, a live pack worker,
@@ -5223,12 +5270,19 @@ class App:
                     interval = max(3, min(15, int(load_settings().get("keep_awake_interval", 8))))
                 except Exception:
                     interval = 8
-                dirs = self._keepalive_dirs()
-                for d in dirs:
+                # Ping only the drives the job ISN'T currently hammering: a flushed write on
+                # an actively-streaming drive just forces a wasteful seek, and a busy drive
+                # can't sleep anyway. The idle-but-needed-soon drive is the one worth holding.
+                busy = self._busy_devices()
+                pinged = 0
+                for d, dev in self._keepalive_dirs():
+                    if dev in busy:
+                        continue
                     poke_drive_keepalive(d)
-                if dirs and not self._keepawake_announced:
-                    self.log("INFO", f"Keep-awake: holding {len(dirs)} drive(s) spun-up every "
-                                     f"{interval}s for this run.")
+                    pinged += 1
+                if pinged and not self._keepawake_announced:
+                    self.log("INFO", f"Keep-awake: holding idle drive(s) spun-up every "
+                                     f"{interval}s for this run (skipping the busy one).")
                     self._keepawake_announced = True
             else:
                 self._keepawake_announced = False

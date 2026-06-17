@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.36"
+APP_VERSION = "1.0.37"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -461,12 +461,14 @@ def find_newest_ffpfsc_after(folder: Path, started_at: float):
         if not folder.exists():
             return None
         candidates = []
-        for p in folder.glob("*.ffpfsc"):
-            try:
-                if p.is_file() and p.stat().st_size > 0 and p.stat().st_mtime >= started_at - 2:
-                    candidates.append(p)
-            except OSError:
-                pass
+        # Both the compressed (.ffpfsc) and uncompressed (.ffpfs) deliverables.
+        for pat in ("*.ffpfsc", "*.ffpfs"):
+            for p in folder.glob(pat):
+                try:
+                    if p.is_file() and p.stat().st_size > 0 and p.stat().st_mtime >= started_at - 2:
+                        candidates.append(p)
+                except OSError:
+                    pass
         if not candidates:
             return None
         return max(candidates, key=lambda x: x.stat().st_mtime)
@@ -880,10 +882,13 @@ def sanitize_filename(s: str) -> str:
     return s[:180].strip()   # leave headroom under the 255-char filename limit
 
 
-def descriptive_ffpfsc_name(item) -> str:
+def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     """Build a findable output filename for *item*:
-    '<Game Name> [<TITLEID>] [v<version>].ffpfsc'  (version omitted if unknown).
-    Falls back to the title id alone if the name is missing."""
+    '<Game Name> [<TITLEID>] [v<version>]<ext>'  (version omitted if unknown).
+    Falls back to the title id alone if the name is missing. *ext* is '.ffpfsc'
+    (compressed) or '.ffpfs' (uncompressed)."""
+    if not ext.startswith("."):
+        ext = "." + ext
     PLACEHOLDERS = {"Unknown", "📦", "💾", "📤", ""}
     tid = (getattr(item, "title_id", "") or "").strip()
     if tid in PLACEHOLDERS:
@@ -901,9 +906,9 @@ def descriptive_ffpfsc_name(item) -> str:
     suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
     # Reserve room for the [v..][TITLEID] suffix + extension so those collision-resistant
     # tags survive the filename-length cap instead of being truncated away.
-    name_budget = max(20, 180 - len(suffix) - len(".ffpfsc"))
+    name_budget = max(20, 180 - len(suffix) - len(ext))
     name = sanitize_filename(name)[:name_budget].strip() or "output"
-    return sanitize_filename(name + suffix) + ".ffpfsc"
+    return sanitize_filename(name + suffix) + ext
 
 
 def find_artwork(path: Path):
@@ -3410,11 +3415,12 @@ class CLIWorker(threading.Thread):
             tid = (getattr(self.item, "title_id", "") or "").strip()
             if tid and tid not in ("📦", "Unknown"):
                 try:
-                    # Match both "<tid>.ffpfsc" and the descriptive
+                    # Match both "<tid>.ffpfsc"/".ffpfs" and the descriptive
                     # "<name> [<tid>].ffpfsc"; pick the newest one this run created.
-                    cands = [p for p in self.output_dir.glob(f"*{tid}*.ffpfsc")
+                    cands = [p for p in self.output_dir.glob(f"*{tid}*.ffpfs*")
                              if p.is_file() and p.stat().st_size > 0
-                             and p.stat().st_mtime >= self.start_time - 2]
+                             and p.stat().st_mtime >= self.start_time - 2
+                             and p.suffix.lower() in (".ffpfsc", ".ffpfs")]
                     if cands:
                         best = max(cands, key=lambda p: p.stat().st_mtime)
                         self.output_path = str(best)
@@ -3674,6 +3680,102 @@ class PatchDialog(ctk.CTkToplevel):
         overwrite = self.mode_var.get() == "overwrite"
         self.destroy()
         self.app._start_patch(g, p, overwrite)
+
+
+class ConverterDialog(ctk.CTkToplevel):
+    """Stepwise image converter: take a packed image apart one step at a time —
+    .ffpfsc → .ffpfs (decompress, fast) → folder. The chosen conversion is added to the
+    queue; the user then presses START (it reuses the normal unpack pipeline). Compressing
+    a folder or a .ffpfs INTO a .ffpfsc is the normal queue + the top format switch."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Image Converter")
+        self.geometry("660x430")
+        self.configure(fg_color=BLACK)
+        self.resizable(False, False)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+        self.src_var = tk.StringVar()
+
+        ctk.CTkLabel(self, text="🔄  Image Converter",
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text="Take a packed image apart, one step at a time:  .ffpfsc → .ffpfs "
+                                "(decompress) → folder.  The conversion is added to the queue — then "
+                                "press START.  (To COMPRESS a folder or a .ffpfs into a .ffpfsc, add it "
+                                "as a source and use the format switch at the top.)",
+                      text_color=MUTED, wraplength=620, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(self, text="Image (.ffpfsc / .ffpfs) — or a folder of images:",
+                      text_color=WHITE).pack(anchor="w", padx=20)
+        row = ctk.CTkFrame(self, fg_color=BLACK); row.pack(fill="x", padx=20, pady=(2, 8))
+        ctk.CTkEntry(row, textvariable=self.src_var, fg_color=CARD, border_color=BORDER2,
+                      text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="File…", width=70, fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_file).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(row, text="Folder…", width=80, fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_folder).pack(side="left", padx=(6, 0))
+
+        self.type_var = tk.StringVar(value="Pick a .ffpfsc / .ffpfs file or a folder of images.")
+        ctk.CTkLabel(self, textvariable=self.type_var, text_color=MUTED, wraplength=620,
+                      justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+
+        self.actions = ctk.CTkFrame(self, fg_color=BLACK)
+        self.actions.pack(fill="x", padx=20, pady=(4, 8))
+        mk = lambda txt, act: ctk.CTkButton(self.actions, text=txt, fg_color=GREEN, hover_color=GREEN2,
+                                            text_color="#061006", font=ctk.CTkFont(size=13, weight="bold"),
+                                            command=lambda a=act: self._go(a))
+        self.btn_decompress = mk("→ .ffpfs  (decompress, fast)", "decompress")
+        self.btn_tofolder   = mk("→ Folder  (full unpack)", "folder")
+        self.btn_batch      = mk("Unpack all images → folders", "batch")
+        self.src_var.trace_add("write", lambda *_: self._refresh())
+        self._refresh()
+
+        ctk.CTkButton(self, text="Close", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy
+                       ).pack(side="right", padx=20, pady=14)
+
+    def _pick_file(self):
+        p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
+                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_folder(self):
+        p = filedialog.askdirectory(title="Select a folder of .ffpfsc / .ffpfs images")
+        if p:
+            self.src_var.set(p)
+
+    def _refresh(self):
+        for b in (self.btn_decompress, self.btn_tofolder, self.btn_batch):
+            b.pack_forget()
+        raw = (self.src_var.get() or "").strip()
+        p = Path(raw) if raw else None
+        if not p or not p.exists():
+            self.type_var.set("Pick a .ffpfsc / .ffpfs file or a folder of images.")
+            return
+        if p.is_dir():
+            self.type_var.set(f"📁 Folder “{p.name}” — batch-unpack every .ffpfs/.ffpfsc inside to folders.")
+            self.btn_batch.pack(side="left", padx=(0, 8))
+        elif p.suffix.lower() == ".ffpfsc":
+            self.type_var.set(".ffpfsc (compressed) — decompress to the inner .ffpfs (fast), or unpack fully to a folder.")
+            self.btn_decompress.pack(side="left", padx=(0, 8))
+            self.btn_tofolder.pack(side="left", padx=(0, 8))
+        elif p.suffix.lower() == ".ffpfs":
+            self.type_var.set(".ffpfs (uncompressed) — unpack to a folder.  (To compress it, add it as a source + use the format switch.)")
+            self.btn_tofolder.pack(side="left", padx=(0, 8))
+        else:
+            self.type_var.set("⚠ Not a .ffpfsc / .ffpfs image.")
+
+    def _go(self, action):
+        raw = (self.src_var.get() or "").strip()
+        if not raw or not Path(raw).exists():
+            messagebox.showerror("Nothing selected", "Pick a .ffpfsc / .ffpfs file or a folder of images.")
+            return
+        self.app._queue_conversion(Path(raw), action)
+        self.destroy()
 
 
 # ─── Main Application ──────────────────────────────────────────────────────────
@@ -4032,6 +4134,21 @@ class App:
         self.sound_error_var     = self._persisted_bool(settings, "sound_error", True)
         self.batch_var = tk.BooleanVar(value=False)        # session state — not persisted
         self.unpack_mode_var = tk.BooleanVar(value=False)  # session state — not persisted
+        # Output format for the whole queue: compressed .ffpfsc (smaller) vs uncompressed
+        # .ffpfs (faster to build AND to mount — ShadowMountPlus decompresses .ffpfsc at only
+        # ~150-250 MB/s and streaming-heavy games can stutter). True = compressed (default).
+        self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
+        # A slide switch top-centre in the header toggles the format for the WHOLE queue.
+        fmt = ctk.CTkFrame(header, fg_color=BLACK)
+        fmt.grid(row=0, column=1, padx=10)
+        self.format_label_var = tk.StringVar()
+        ctk.CTkSwitch(fmt, text="", width=44, variable=self.output_compressed_var,
+                       onvalue=True, offvalue=False, progress_color=GREEN,
+                       command=self._on_format_toggle).pack(side="left")
+        ctk.CTkLabel(fmt, textvariable=self.format_label_var, text_color=WHITE,
+                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
+        self._button(fmt, "🔄 Konverter", self.open_converter, width=120).pack(side="left", padx=(16, 0))
+        self._update_format_label()
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
         # Auto-patch: when a release folder holds a base game plus a clearly-smaller
@@ -4212,15 +4329,14 @@ class App:
         # ── Mode ──────────────────────────────────────────────────────────────
         # The persistent options (sounds, summary, verify, keep-PFS, auto-clear,
         # auto-patch, drive usage, verbose, output/temp/compression…) ALL live in the
-        # ⚙ Settings window now — no point duplicating them here and forcing a scroll.
-        # Only the per-job Unpack mode stays in the main flow: it isn't a persistent
-        # setting and it auto-enables when a .ffpfs/.ffpfsc is added to the queue.
-        ctk.CTkCheckBox(body, text="Unpack PFS images (.ffpfs / .ffpfsc) to a folder",
-                         variable=self.unpack_mode_var, fg_color=GREEN, hover_color=GREEN2,
-                         text_color=WHITE).grid(row=7, column=0, sticky="w", padx=18, pady=(14, 4))
-        ctk.CTkLabel(body, text="All other options live in  ⚙ Settings (top-right).",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).grid(
-                          row=8, column=0, sticky="w", padx=18, pady=(0, 12))
+        # ⚙ Settings window now. Unpacking/decompressing images is done via the 🔄 Konverter
+        # (top) — the old "Unpack PFS images" checkbox is gone (unpack_mode_var stays as
+        # internal state that the converter's batch action drives). A dropped .ffpfsc still
+        # queues as an unpack; a .ffpfs queues as a (re)pack source.
+        ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Konverter (top).\n"
+                                "All other options live in  ⚙ Settings (top-right).",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
+                          row=7, column=0, sticky="w", padx=18, pady=(12, 12))
 
         # ── Center: Progress + Stages ────────────────────────────────────────
         center = ctk.CTkFrame(content, fg_color=BLACK)
@@ -4796,6 +4912,30 @@ class App:
             return
         self._settings_win = SettingsWindow(self.root, self)
 
+    def open_converter(self):
+        ConverterDialog(self)
+
+    def _queue_conversion(self, path: Path, action: str):
+        """Add a converter job to the queue (the user then presses START — it reuses the
+        normal unpack pipeline). action: 'decompress' (.ffpfsc → inner .ffpfs, one level),
+        'folder' (full unpack to a folder), 'batch' (a folder of images → unpack each)."""
+        if not (self.output_var.get() or "").strip():
+            base = path.parent if path.is_file() else path
+            self.output_var.set(str(base))
+        if action == "batch":
+            self.source_var.set(str(path))
+            self.unpack_mode_var.set(True)        # the folder-scan unpack path reads this
+            self.add_source_to_queue()
+            return
+        item = GameItem.from_pfs_image(path)
+        item.unwrap = (action != "decompress")    # decompress = stop at the inner .ffpfs
+        self.queue.append(item)
+        self.update_queue_box(select_item=item)
+        what = "decompress → .ffpfs" if action == "decompress" else "unpack → folder"
+        self.log("OK", f"Conversion queued ({what}): {path.name}.  Press ▶ START to run.")
+        self.status_update("Ready", f"Conversion queued: {path.name} — press START.",
+                            "Ready", 0, 0, "00:00", "—", "—")
+
     # ── Drag & drop ───────────────────────────────────────────────────────────
     def _on_drop(self, event):
         try:
@@ -4844,7 +4984,7 @@ class App:
             return
         p = Path(path)
         self.source_var.set(str(p))
-        if p.suffix.lower() in PFS_IMAGE_SUFFIXES:
+        if p.suffix.lower() == ".ffpfsc":   # .ffpfs is a PACK source now (re-pack), not unpack
             self.unpack_mode_var.set(True)
         if not self.output_var.get():
             self.output_var.set(str(p.parent))
@@ -5033,15 +5173,27 @@ class App:
                                   f"This path does not exist:\n{src}")
             return
 
-        # ── Existing .ffpfs / .ffpfsc image — unpack via MkPFS ────────────────
-        if src.is_file() and src.suffix.lower() in PFS_IMAGE_SUFFIXES:
+        # ── Existing uncompressed .ffpfs — a PACK source (re-pack to .ffpfsc, or copy
+        #    when the format toggle is set to uncompressed). Read in place, no extraction. ─
+        if src.is_file() and src.suffix.lower() == ".ffpfs":
+            item = GameItem.from_exfat(src)   # single-file image item, operation = "pack"
+            self.queue.append(item)
+            self.update_queue_box(select_item=item)
+            self.log("OK", f".ffpfs image queued for (re)packing: {src.name}  [{format_size(item.size)}]")
+            self.status_update("Ready",
+                                f".ffpfs image queued for packing: {src.name}",
+                                "Ready", 0, 0, "00:00", "—", "—")
+            return
+
+        # ── Existing .ffpfsc image — unpack/convert via MkPFS ─────────────────
+        if src.is_file() and src.suffix.lower() == ".ffpfsc":
             item = GameItem.from_pfs_image(src)
             self.queue.append(item)
             self.update_queue_box(select_item=item)
             self.unpack_mode_var.set(True)
-            self.log("OK", f"PFS image queued for extraction: {src.name}  [{format_size(item.size)}]")
+            self.log("OK", f".ffpfsc image queued for extraction: {src.name}  [{format_size(item.size)}]")
             self.status_update("Ready",
-                                f"PFS image queued for extraction: {src.name}",
+                                f".ffpfsc image queued for extraction: {src.name}",
                                 "Ready", 0, 0, "00:00", "—", "—")
             return
 
@@ -6083,6 +6235,24 @@ class App:
         except Exception:
             self.temp_space_var.set(f"Peak Needed: ~{format_size(item.size * 2.2)}")
 
+    def _update_format_label(self):
+        comp = self.output_compressed_var.get()
+        self.format_label_var.set("📦 Compressed (.ffpfsc, smaller)" if comp
+                                  else "⚡ Uncompressed (.ffpfs, faster)")
+
+    def _on_format_toggle(self):
+        """Top format switch changed — applies to the WHOLE queue. Refresh the labels and
+        the command preview so output names/extensions reflect the chosen format."""
+        self._update_format_label()
+        for fn in ("update_queue_box", "update_command_preview"):
+            try:
+                getattr(self, fn)()
+            except Exception:
+                pass
+        self.log("INFO", "Output format set to "
+                 + ("compressed .ffpfsc (smaller)" if self.output_compressed_var.get()
+                    else "uncompressed .ffpfs (faster to build and mount; full size)."))
+
     def update_command_preview(self):
         item = self.queue[0] if self.queue else None
         # Archive placeholders have no path yet — show a friendly message instead
@@ -6094,7 +6264,7 @@ class App:
         if not item and src and Path(src).exists():
             p = Path(src)
             pycmd = get_backend_python_command() or ["python"]
-            is_unpack = p.suffix.lower() in PFS_IMAGE_SUFFIXES or self.unpack_mode_var.get()
+            is_unpack = p.suffix.lower() == ".ffpfsc" or self.unpack_mode_var.get()
             if getattr(sys, "frozen", False):
                 cmd = pycmd + [str(p), self.output_var.get().strip() or str(p.parent), "--overwrite"]
             else:
@@ -6121,16 +6291,28 @@ class App:
         # when handed a directory) — so naming by title id alone would let two queued
         # games with the same title id overwrite each other in a batch. An explicit
         # .ffpfsc the user typed is respected as-is.
+        op = getattr(item, "operation", "pack")
+        # Output format (whole-queue toggle): uncompressed .ffpfs ONLY for the PFS family —
+        # a game folder or a .ffpfs source. .exfat/.ffpkg disk images are always compressed
+        # to .ffpfsc (the backend ignores --no-compress for them). .ffpfs is faster to build
+        # (no pass 2) and to mount (no decompression), at full size.
+        try:
+            _ip = Path(getattr(item, "path", "") or "")
+            src_pfs_family = _ip.is_dir() or _ip.suffix.lower() == ".ffpfs"
+        except Exception:
+            src_pfs_family = False
+        self._cmd_uncompressed = (op == "pack") and src_pfs_family and not self.output_compressed_var.get()
+        out_ext = ".ffpfs" if self._cmd_uncompressed else ".ffpfsc"
+        explicit_file = out.suffix.lower() in (".ffpfsc", ".ffpfs")
         sub = getattr(item, "bundle_subfolder", None)
-        if (getattr(item, "operation", "pack") == "pack"
-                and out.suffix.lower() != ".ffpfsc"):
+        if op == "pack" and not explicit_file:
             # Bundle: recreate the source folder under the output dir. Bundle
             # naming applies even in batch (each item has its own subfolder).
             base = (out / sanitize_filename(sub)) if sub else out
             try:
-                out = base / descriptive_ffpfsc_name(item)
+                out = base / descriptive_ffpfsc_name(item, ext=out_ext)
             except Exception:
-                out = base   # keep the subfolder; backend names <title_id>.ffpfsc inside
+                out = base   # keep the subfolder; backend names <title_id><ext> inside
         temp = Path(self.temp_var.get().strip())
         backend = backend_base_dir()
         cli_py = Path("backend") / "cli.py"  # macOS-ready pathlib form
@@ -6150,7 +6332,13 @@ class App:
                 else:
                     cmd = pycmd + ["-u", str(cli_py), str(item.path), str(out)]
             cmd += ["--unpack", "--overwrite"]
+            # Converter "decompress one level" (.ffpfsc → inner .ffpfs): stop unwrapping at
+            # the first nested image instead of recursing all the way to a folder.
+            if getattr(item, "unwrap", True) is False:
+                cmd.append("--no-unwrap")
             return cmd, backend, out, temp
+        if getattr(self, "_cmd_uncompressed", False):
+            cmd.append("--no-compress")   # emit uncompressed .ffpfs (skip pass-2)
         if self.batch_var.get():
             cmd.append("--batch")
         if self.keep_pfs_var.get():
@@ -6207,7 +6395,7 @@ class App:
                 and getattr(item, "path", None) and Path(item.path).is_dir()):
             cmd.append("--via-exfat")
         cmd.append("--overwrite")
-        return cmd, backend, out if out.suffix.lower() != ".ffpfsc" else out.parent, temp
+        return cmd, backend, out if out.suffix.lower() not in (".ffpfsc", ".ffpfs") else out.parent, temp
 
     def _run_cleanup(self, work) -> None:
         """Run a cleanup function in a daemon thread, counted so the batch can wait for

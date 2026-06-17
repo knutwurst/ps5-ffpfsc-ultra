@@ -66,9 +66,13 @@ _PFS_IMAGE_SUFFIXES = {'.ffpfs', '.ffpfsc'}
 
 def find_game_items(path: Path, batch: bool = False) -> list[Path]:
     if path.is_file():
-        if path.suffix.lower() in _DISK_IMAGE_SUFFIXES:
+        # Disk images (.exfat/.ffpkg) AND a bare uncompressed PFS image (.ffpfs) are valid
+        # pack sources: a .ffpfs is just re-wrapped into a compressed .ffpfsc (its native
+        # nested layout), so an already-built image can be (re)packed without a folder
+        # round-trip. .ffpfsc is NOT packable here (it's already the compressed deliverable).
+        if path.suffix.lower() in _DISK_IMAGE_SUFFIXES or path.suffix.lower() == ".ffpfs":
             return [path]
-        print(f"[ERROR] Unsupported file type: {path.name}. Supported: .exfat, .ffpkg, or a game folder.")
+        print(f"[ERROR] Unsupported file type: {path.name}. Supported: .exfat, .ffpkg, .ffpfs, or a game folder.")
         sys.exit(1)
 
     print(f"[INFO] Scanning for game folder(s) and disk image(s) (.exfat / .ffpkg) in {path}...")
@@ -712,6 +716,11 @@ def main() -> None:
     parser.add_argument("--pack", dest="operation", action="store_const", const="pack", help="Force pack/compress mode")
     parser.add_argument("--unpack", dest="operation", action="store_const", const="unpack", help="Extract .ffpfs/.ffpfsc image(s)")
     parser.add_argument("--keep-pfs",     action="store_true", help="Keep intermediate pfs_image.dat")
+    parser.add_argument("--no-compress",  dest="no_compress", action="store_true",
+                        help="Emit the UNCOMPRESSED inner PFS image (.ffpfs) instead of wrapping "
+                             "it in a compressed .ffpfsc. Faster to build (no pass 2) and to mount "
+                             "(no decompression), at full size. Applies to game folders and .ffpfs "
+                             "sources; .exfat/.ffpkg inputs are still compressed.")
     parser.add_argument("--via-exfat",    action="store_true",
                         help="Build an exFAT image of the game folder and compress THAT into "
                              ".ffpfsc (PSBrew's most-stable exfat->ffpfsc path; macOS only, "
@@ -1016,24 +1025,28 @@ def main() -> None:
         # An explicit .ffpfsc output is a single-FILE target — never mkdir it into a
         # directory, even under --batch. (--batch is a backend folder-scan mode that
         # expects a directory output; the GUI hands a descriptive .ffpfsc file path.)
-        explicit_ffpfsc = ffpfs_path.suffix.lower() == ".ffpfsc"
-        # Guard: --batch writes one file per game; a single explicit .ffpfsc path would
+        explicit_file = ffpfs_path.suffix.lower() in (".ffpfsc", ".ffpfs")
+        # Guard: --batch writes one file per game; a single explicit output FILE path would
         # make every game overwrite the SAME file (only the last survives). Refuse it.
-        if args.batch and explicit_ffpfsc and len(game_items) > 1:
-            print(f"[ERROR] --batch with a single .ffpfsc output would overwrite all "
+        if args.batch and explicit_file and len(game_items) > 1:
+            print(f"[ERROR] --batch with a single output file would overwrite all "
                   f"{len(game_items)} games into one file. Point the output at a DIRECTORY "
                   f"for batch mode.")
             sys.exit(1)
-        if args.batch and not explicit_ffpfsc:
+        if args.batch and not explicit_file:
             ffpfs_path.mkdir(parents=True, exist_ok=True)
         elif not ffpfs_path.is_dir() and not ffpfs_path.suffix:
             ffpfs_path.mkdir(parents=True, exist_ok=True)
 
         for item in game_items:
             title_id = get_title_id(item)
-            ext = ".ffpfsc"
+            # Uncompressed output (.ffpfs) applies to the PFS family — a game folder or a
+            # .ffpfs source; .exfat/.ffpkg are always compressed to .ffpfsc.
+            src_pfs_family = item.is_dir() or item.suffix.lower() == ".ffpfs"
+            uncompressed = getattr(args, "no_compress", False) and src_pfs_family
+            ext = ".ffpfs" if uncompressed else ".ffpfsc"
 
-            if (args.batch and not explicit_ffpfsc) or ffpfs_path.is_dir():
+            if (args.batch and not explicit_file) or ffpfs_path.is_dir():
                 current_ffpfs_path = ffpfs_path / f"{title_id}{ext}"
             else:
                 current_ffpfs_path = ffpfs_path.with_suffix(ext)
@@ -1091,10 +1104,19 @@ def main() -> None:
                         continue   # done with this item; skip the two-pass folder build
                 print("[WARN] Falling back to the two-pass folder image (exFAT path unavailable).", flush=True)
 
-            if item.is_file() and item.suffix.lower() in ('.exfat', '.ffpkg'):
-                # Direct disk image (.exfat / .ffpkg) → .ffpfsc (single-file streaming path).
-                # The source is read in place; route the spool to the SSD temp if it fits,
-                # else spill onto the output drive (same adaptive rule as the folder path).
+            if uncompressed and item.is_file() and item.suffix.lower() == '.ffpfs':
+                # Uncompressed output + already a PFS image → emit the .ffpfs directly (copy;
+                # no compression, no temp). Re-pack of a .ffpfs to a faster uncompressed copy.
+                if item.resolve() != current_ffpfs_path.resolve():
+                    print(f"[INFO] Uncompressed output — copying {item.name} -> {current_ffpfs_path.name}", flush=True)
+                    shutil.copy2(item, current_ffpfs_path)
+                else:
+                    print("[INFO] Source already IS the requested .ffpfs output — nothing to do.", flush=True)
+            elif item.is_file() and item.suffix.lower() in ('.exfat', '.ffpkg', '.ffpfs'):
+                # Direct image (.exfat / .ffpkg / .ffpfs) → .ffpfsc (single-file streaming
+                # path). A .ffpfs is re-wrapped into its native compressed container. The
+                # source is read in place; route the spool to the SSD temp if it fits, else
+                # spill onto the output drive (same adaptive rule as the folder path).
                 spool_dir, spool_ctx = _open_pass2_spool_dir(item, user_temp, current_ffpfs_path, spill_base=user_spill)
                 try:
                     compress_file_to_ffpfsc(
@@ -1114,6 +1136,20 @@ def main() -> None:
                 # (upstream MkPFS issue #49 — see the warning in backend/mkpfs/cli.py). A
                 # green local build/verify is NOT proof of console correctness, so never
                 # "optimize" this into single-pass to save the temp intermediate.
+                if uncompressed:
+                    # Uncompressed deliverable: build the inner PFS image STRAIGHT to the
+                    # output (.ffpfs) and stop — no pass 2, no compressed spool. Faster to
+                    # build and (per ShadowMountPlus) far faster to mount; full size on disk.
+                    print("[INFO] Uncompressed output — building the PFS image directly to "
+                          f"{current_ffpfs_path.name} (skipping pass-2 compression).", flush=True)
+                    current_ffpfs_path.parent.mkdir(parents=True, exist_ok=True)
+                    pack_folder_uncompressed(
+                        item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                        verify_enabled=args.verify,
+                        temp_folder=Path(user_temp) if user_temp else None,
+                        **pack_kwargs,
+                    )
+                    continue   # done with this item — no pass 2
                 with tempfile.TemporaryDirectory(dir=user_temp) as temp_dir:
                     temp_pfs = Path(temp_dir) / f"{title_id}.ffpfs"
 

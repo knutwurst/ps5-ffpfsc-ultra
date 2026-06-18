@@ -93,7 +93,12 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.39"
+APP_VERSION = "1.0.40"
+# For archive sources, the GUI extraction occupies the first slice of a game's overall
+# progress; the worker's pack progress is compressed into the remaining tail so the
+# whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
+# and the extraction status_update calls).
+ARCHIVE_EXTRACT_OVERALL_PCT = 25
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3143,6 +3148,13 @@ class CLIWorker(threading.Thread):
 
         elapsed = format_duration(time.time() - self.start_time)
         overall = self._overall_for_stage(stage, self.stage_progress[stage])
+        # For an item that was unpacked from an archive, the GUI already showed the
+        # extraction as the first ARCHIVE_EXTRACT_OVERALL_PCT% of this game's overall
+        # progress. Compress the worker's own 0-100 pack progress into the remaining
+        # tail so the whole-game `overall` stays MONOTONIC across extraction → pack
+        # (no overshoot, no backward jump) and the QUEUE bar isn't a mirror of the step.
+        if getattr(self.item, "_from_archive", False):
+            overall = ARCHIVE_EXTRACT_OVERALL_PCT + overall * (100 - ARCHIVE_EXTRACT_OVERALL_PCT) / 100.0
 
         detail = label or f"{stage} is active."
         if stage == "Creating Temp PFS":
@@ -5876,7 +5888,7 @@ class App:
                 self.status_update(
                     "Extracting",
                     f"Unpacking {archive.name}…  {pct}%\n{short}",
-                    "Extracting", pct, pct, "—", "—", "—"
+                    "Extracting", pct, pct * ARCHIVE_EXTRACT_OVERALL_PCT / 100.0, "—", "—", "—"
                 )
 
         candidate_passwords = self._candidate_passwords()  # built on the Tk thread
@@ -5978,9 +5990,13 @@ class App:
         def _progress(pct, filename):
             if pct - _last_pct[0] >= 2 or pct >= 100:
                 _last_pct[0] = pct
+                # Step bar shows the FULL extraction %; the queue bar (overall) only counts
+                # extraction as the first ARCHIVE_EXTRACT_OVERALL_PCT% of this game — so the
+                # two bars don't move in lockstep and the queue bar doesn't overshoot.
                 self.status_update("Extracting",
                                     f"Unpacking {archive.name}…  {pct}%",
-                                    "Extracting", pct, pct, "—", "—", "—")
+                                    "Extracting", pct, pct * ARCHIVE_EXTRACT_OVERALL_PCT / 100.0,
+                                    "—", "—", "—")
 
         candidate_passwords = self._candidate_passwords(item)  # includes per-archive override
 
@@ -6002,6 +6018,10 @@ class App:
                 payload_items = [self._item_from_payload_path(kind, path) for path in paths]
                 primary = payload_items[0]
                 self._copy_item_payload(item, primary)
+                # Mark this as an extracted-archive item so the pack worker compresses its
+                # overall progress into the tail after the extraction slice (monotonic
+                # whole-game %). Underscore attr → not persisted in the saved queue.
+                item._from_archive = True
                 # Carry extra subfolders/files that sit BESIDE the game in the archive
                 # (e.g. an '[ ALL DLC ]' wrapper) so they're copied next to the .ffpfsc.
                 # Skipped when the archive root IS the game (no wrapper → no siblings).

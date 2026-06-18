@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.41"
+APP_VERSION = "1.0.42"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4377,31 +4377,17 @@ class App:
             ctk.CTkLabel(body, text="↓ Drag & drop supported", text_color=MUTED,
                           font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="w", padx=14, pady=(0, 4))
 
-        # ── Archive password ──────────────────────────────────────────────────
-        ctk.CTkLabel(body, text="ARCHIVE PASSWORD (OPTIONAL)",
-                      font=ctk.CTkFont(size=13, weight="bold"),
-                      text_color=WHITE).grid(row=4, column=0, sticky="w", padx=14, pady=(10, 2))
-        ctk.CTkLabel(body,
-                      text="Only needed if your ZIP / RAR / 7z is password-protected.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11),
-                      justify="left"
-                     ).grid(row=5, column=0, sticky="w", padx=14, pady=(0, 2))
-        ctk.CTkEntry(body, textvariable=self.password_var,
-                      placeholder_text="Archive password (if required)",
-                      show="*", fg_color=CARD, border_color=BORDER2,
-                      text_color=WHITE).grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 4))
-
         # ── Mode ──────────────────────────────────────────────────────────────
-        # The persistent options (sounds, summary, verify, keep-PFS, auto-clear,
-        # auto-patch, drive usage, verbose, output/temp/compression…) ALL live in the
-        # ⚙ Settings window now. Unpacking/decompressing images is done via the 🔄 Konverter
-        # (top) — the old "Unpack PFS images" checkbox is gone (unpack_mode_var stays as
-        # internal state that the converter's batch action drives). A dropped .ffpfsc still
-        # queues as an unpack; a .ffpfs queues as a (re)pack source.
+        # Everything persistent (passwords, sounds, verify, keep-PFS, auto-clear,
+        # auto-patch, drive usage, verbose, output/temp/compression…) lives in the
+        # ⚙ Settings window — including the auto-tried archive password list, so the old
+        # per-job password field here was redundant and just took up space (password_var
+        # stays as a fallback override, still editable in Settings). Unpacking/decompressing
+        # is via the 🔄 Converter (top); the old "Unpack PFS images" checkbox is gone.
         ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Converter (top).\n"
-                                "All other options live in  ⚙ Settings (top-right).",
+                                "Archive passwords & all other options live in  ⚙ Settings (top-right).",
                       text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
-                          row=7, column=0, sticky="w", padx=18, pady=(12, 12))
+                          row=4, column=0, sticky="w", padx=18, pady=(12, 12))
 
         # ── Center: Progress + Stages ────────────────────────────────────────
         center = ctk.CTkFrame(content, fg_color=BLACK)

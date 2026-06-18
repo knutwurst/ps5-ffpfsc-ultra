@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.37"
+APP_VERSION = "1.0.38"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -3566,10 +3566,10 @@ class CLIWorker(threading.Thread):
 # Stage definitions: (full backend name, short display label)
 _STAGE_DEFS = [
     ("Scanning Files",      "Scan"),
+    ("Extracting",          "Extract"),    # archives extract first; folders skip this station
     ("Reading Game",        "Read"),
     ("Creating Temp PFS",   "Temp PFS"),
     ("Compressing",         "Compress"),
-    ("Extracting",          "Extract"),
     ("Writing Final Image", "Write"),
     ("Verifying Output",    "Verify"),
     ("Cleaning Up",         "Cleanup"),
@@ -3617,7 +3617,7 @@ class PatchDialog(ctk.CTkToplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("Patch in Spiel integrieren")
+        self.title("Integrate Patch into Game")
         self.geometry("640x360")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
@@ -3627,29 +3627,29 @@ class PatchDialog(ctk.CTkToplevel):
         self.patch_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="new")
 
-        ctk.CTkLabel(self, text="🩹  Patch in Spiel integrieren",
+        ctk.CTkLabel(self, text="🩹  Integrate Patch into Game",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Entpackt das Spiel, legt die Patch-Dateien drüber (überschreiben + neue) und packt neu.",
+        ctk.CTkLabel(self, text="Unpacks the game, overlays the patch files (overwrite + new), and repacks.",
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
-        self._file_row("Spiel  (.ffpfsc, Ordner oder Archiv):", self.game_var,
-                       [("Spiel / Archiv", "*.ffpfsc *.zip *.rar *.7z")])
-        self._file_row("Patch  (Archiv oder Ordner mit losen Dateien):", self.patch_var,
-                       [("Archiv", "*.zip *.rar *.7z")])
+        self._file_row("Game  (.ffpfsc, folder, or archive):", self.game_var,
+                       [("Game / Archive", "*.ffpfsc *.zip *.rar *.7z")])
+        self._file_row("Patch  (archive or folder of loose files):", self.patch_var,
+                       [("Archive", "*.zip *.rar *.7z")])
 
         mode_row = ctk.CTkFrame(self, fg_color=BLACK); mode_row.pack(fill="x", padx=20, pady=(10, 4))
-        ctk.CTkLabel(mode_row, text="Ausgabe:", text_color=WHITE).pack(side="left", padx=(0, 10))
-        ctk.CTkRadioButton(mode_row, text="Neue Datei ( … [patched].ffpfsc )", variable=self.mode_var,
+        ctk.CTkLabel(mode_row, text="Output:", text_color=WHITE).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(mode_row, text="New file ( … [patched].ffpfsc )", variable=self.mode_var,
                             value="new", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
-        ctk.CTkRadioButton(mode_row, text="Original überschreiben", variable=self.mode_var,
+        ctk.CTkRadioButton(mode_row, text="Overwrite original", variable=self.mode_var,
                             value="overwrite", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="▶  Patch starten", fg_color=GREEN, hover_color=GREEN2,
+        ctk.CTkButton(btns, text="▶  Start patch", fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
                        command=self._go).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Abbrechen", fg_color=CARD2, text_color=WHITE,
+        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
 
     def _file_row(self, label, var, filetypes):
@@ -3657,13 +3657,13 @@ class PatchDialog(ctk.CTkToplevel):
         ctk.CTkLabel(row, text=label, text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         inner = ctk.CTkFrame(row, fg_color=PANEL); inner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(inner, textvariable=var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(inner, text="Datei", width=58, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+        ctk.CTkButton(inner, text="File", width=58, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=lambda: self._pick_file(var, filetypes)).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(inner, text="Ordner", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+        ctk.CTkButton(inner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=lambda: self._pick_dir(var)).pack(side="left", padx=(6, 0))
 
     def _pick_file(self, var, filetypes):
-        p = filedialog.askopenfilename(filetypes=filetypes + [("Alle Dateien", "*.*")])
+        p = filedialog.askopenfilename(filetypes=filetypes + [("All files", "*.*")])
         if p:
             var.set(p)
 
@@ -3675,7 +3675,7 @@ class PatchDialog(ctk.CTkToplevel):
     def _go(self):
         g = self.game_var.get().strip(); p = self.patch_var.get().strip()
         if not g or not p:
-            messagebox.showerror("Fehlt", "Bitte Spiel UND Patch auswählen.", parent=self)
+            messagebox.showerror("Missing", "Please select BOTH a game and a patch.", parent=self)
             return
         overwrite = self.mode_var.get() == "overwrite"
         self.destroy()
@@ -3692,7 +3692,7 @@ class ConverterDialog(ctk.CTkToplevel):
         super().__init__(app.root)
         self.app = app
         self.title("Image Converter")
-        self.geometry("660x430")
+        self.geometry("680x440")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
@@ -3701,41 +3701,44 @@ class ConverterDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(self, text="🔄  Image Converter",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
-                      ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Take a packed image apart, one step at a time:  .ffpfsc → .ffpfs "
-                                "(decompress) → folder.  The conversion is added to the queue — then "
-                                "press START.  (To COMPRESS a folder or a .ffpfs into a .ffpfsc, add it "
-                                "as a source and use the format switch at the top.)",
-                      text_color=MUTED, wraplength=620, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
+                      ).pack(anchor="w", padx=24, pady=(18, 2))
+        ctk.CTkLabel(self, text="Pick an image, then choose a step along the chain. The conversion is "
+                                "added to the queue — press ▶ START to run it.",
+                      text_color=MUTED, wraplength=632, justify="left").pack(anchor="w", padx=24, pady=(0, 14))
 
-        ctk.CTkLabel(self, text="Image (.ffpfsc / .ffpfs) — or a folder of images:",
-                      text_color=WHITE).pack(anchor="w", padx=20)
-        row = ctk.CTkFrame(self, fg_color=BLACK); row.pack(fill="x", padx=20, pady=(2, 8))
+        # Source row + a detected-type badge.
+        row = ctk.CTkFrame(self, fg_color=BLACK); row.pack(fill="x", padx=24, pady=(0, 6))
         ctk.CTkEntry(row, textvariable=self.src_var, fg_color=CARD, border_color=BORDER2,
-                      text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(row, text="File…", width=70, fg_color=CARD2, text_color=WHITE,
+                      text_color=WHITE, placeholder_text="Select a .ffpfsc / .ffpfs file or a folder…"
+                      ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="File…", width=66, fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_file).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(row, text="Folder…", width=80, fg_color=CARD2, text_color=WHITE,
+        ctk.CTkButton(row, text="Folder…", width=78, fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_folder).pack(side="left", padx=(6, 0))
 
-        self.type_var = tk.StringVar(value="Pick a .ffpfsc / .ffpfs file or a folder of images.")
-        ctk.CTkLabel(self, textvariable=self.type_var, text_color=MUTED, wraplength=620,
-                      justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+        badge_row = ctk.CTkFrame(self, fg_color=BLACK); badge_row.pack(fill="x", padx=24, pady=(2, 2))
+        self.badge = ctk.CTkLabel(badge_row, text="—", fg_color=CARD2, corner_radius=6,
+                                   text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold"),
+                                   width=72, height=24)
+        self.badge.pack(side="left")
+        self.type_var = tk.StringVar(value="No file selected.")
+        ctk.CTkLabel(badge_row, textvariable=self.type_var, text_color=MUTED,
+                      wraplength=540, justify="left").pack(side="left", padx=(10, 0))
 
-        self.actions = ctk.CTkFrame(self, fg_color=BLACK)
-        self.actions.pack(fill="x", padx=20, pady=(4, 8))
-        mk = lambda txt, act: ctk.CTkButton(self.actions, text=txt, fg_color=GREEN, hover_color=GREEN2,
-                                            text_color="#061006", font=ctk.CTkFont(size=13, weight="bold"),
-                                            command=lambda a=act: self._go(a))
-        self.btn_decompress = mk("→ .ffpfs  (decompress, fast)", "decompress")
-        self.btn_tofolder   = mk("→ Folder  (full unpack)", "folder")
-        self.btn_batch      = mk("Unpack all images → folders", "batch")
-        self.src_var.trace_add("write", lambda *_: self._refresh())
-        self._refresh()
+        # The conversion chain — nodes with transition buttons between them.
+        self.pipe = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+        self.pipe.pack(fill="x", padx=24, pady=(14, 6))
+
+        self.note_var = tk.StringVar(value="")
+        ctk.CTkLabel(self, textvariable=self.note_var, text_color=MUTED,
+                      font=ctk.CTkFont(size=11), wraplength=632, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
 
         ctk.CTkButton(self, text="Close", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy
-                       ).pack(side="right", padx=20, pady=14)
+                       ).pack(side="right", padx=24, pady=16)
+
+        self.src_var.trace_add("write", lambda *_: self._refresh())
+        self._refresh()
 
     def _pick_file(self):
         p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
@@ -3748,26 +3751,68 @@ class ConverterDialog(ctk.CTkToplevel):
         if p:
             self.src_var.set(p)
 
+    def _node(self, text, current=False):
+        box = ctk.CTkFrame(self.pipe, fg_color=CARD, corner_radius=8,
+                            border_width=2 if current else 1,
+                            border_color=GREEN if current else BORDER2)
+        box.pack(side="left", padx=4, pady=14)
+        ctk.CTkLabel(box, text=text, text_color=(WHITE if current else MUTED),
+                      font=ctk.CTkFont(size=14, weight="bold")).pack(padx=14, pady=(8, 0))
+        ctk.CTkLabel(box, text=("you have this" if current else "result"),
+                      text_color=(GREEN if current else MUTED),
+                      font=ctk.CTkFont(size=10)).pack(padx=14, pady=(0, 8))
+
+    def _transition(self, label, action, desc):
+        cell = ctk.CTkFrame(self.pipe, fg_color=PANEL)
+        cell.pack(side="left", padx=2, pady=8)
+        ctk.CTkLabel(cell, text="→", text_color=MUTED, font=ctk.CTkFont(size=20)).pack()
+        ctk.CTkButton(cell, text=label, fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
+                       width=118, height=30, font=ctk.CTkFont(size=12, weight="bold"),
+                       command=lambda a=action: self._go(a)).pack(pady=(2, 2))
+        ctk.CTkLabel(cell, text=desc, text_color=MUTED, font=ctk.CTkFont(size=10),
+                      wraplength=128, justify="center").pack()
+
     def _refresh(self):
-        for b in (self.btn_decompress, self.btn_tofolder, self.btn_batch):
-            b.pack_forget()
+        for w in self.pipe.winfo_children():
+            w.destroy()
+        self.note_var.set("")
         raw = (self.src_var.get() or "").strip()
         p = Path(raw) if raw else None
         if not p or not p.exists():
-            self.type_var.set("Pick a .ffpfsc / .ffpfs file or a folder of images.")
+            self.badge.configure(text="—", fg_color=CARD2)
+            self.type_var.set("No file selected.")
+            ctk.CTkLabel(self.pipe, text="Pick a .ffpfsc / .ffpfs file or a folder above to see the steps.",
+                          text_color=MUTED).pack(padx=16, pady=24)
             return
         if p.is_dir():
-            self.type_var.set(f"📁 Folder “{p.name}” — batch-unpack every .ffpfs/.ffpfsc inside to folders.")
-            self.btn_batch.pack(side="left", padx=(0, 8))
+            self.badge.configure(text="FOLDER", fg_color=CARD2)
+            self.type_var.set(f"“{p.name}” — a folder; batch-unpack every image inside.")
+            self._node("📁 Images", current=True)
+            self._transition("Unpack all", "batch", "each image → its own folder")
+            self._node("Folders")
+            self.note_var.set("Every .ffpfs / .ffpfsc found in the folder is unpacked to its own folder.")
         elif p.suffix.lower() == ".ffpfsc":
-            self.type_var.set(".ffpfsc (compressed) — decompress to the inner .ffpfs (fast), or unpack fully to a folder.")
-            self.btn_decompress.pack(side="left", padx=(0, 8))
-            self.btn_tofolder.pack(side="left", padx=(0, 8))
+            self.badge.configure(text=".ffpfsc", fg_color=GREEN)
+            self.type_var.set(f"“{p.name}” — compressed image.")
+            self._node(".ffpfsc", current=True)
+            self._transition("Decompress", "decompress", "→ inner .ffpfs (fast, one level)")
+            self._node(".ffpfs")
+            self._transition("Unpack", "folder", "→ game files")
+            self._node("Folder")
+            self.note_var.set("Decompress gives the uncompressed .ffpfs (faster to mount, full size). "
+                              "Unpack extracts the game files into a folder.")
         elif p.suffix.lower() == ".ffpfs":
-            self.type_var.set(".ffpfs (uncompressed) — unpack to a folder.  (To compress it, add it as a source + use the format switch.)")
-            self.btn_tofolder.pack(side="left", padx=(0, 8))
+            self.badge.configure(text=".ffpfs", fg_color=CARD2)
+            self.type_var.set(f"“{p.name}” — uncompressed image.")
+            self._node(".ffpfs", current=True)
+            self._transition("Unpack", "folder", "→ game files")
+            self._node("Folder")
+            self.note_var.set("To COMPRESS this .ffpfs into a .ffpfsc instead, add it as a source in the "
+                              "main window and use the Output control (Compressed).")
         else:
-            self.type_var.set("⚠ Not a .ffpfsc / .ffpfs image.")
+            self.badge.configure(text="?", fg_color=CARD2)
+            self.type_var.set("Not a .ffpfsc / .ffpfs image.")
+            ctk.CTkLabel(self.pipe, text="Unsupported file type.", text_color=MUTED).pack(padx=16, pady=24)
 
     def _go(self, action):
         raw = (self.src_var.get() or "").strip()
@@ -4077,25 +4122,28 @@ class App:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
         header.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(header, text="PS5 FFPFSC PRO",
-                      font=ctk.CTkFont(size=30, weight="bold"), text_color=WHITE).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(header, text=f"v{APP_VERSION}  •  Bizkut Backend  •  {MKPFS_NAME} v{MKPFS_VERSION}  •  by Knutwurst",
-                      text_color=MUTED).grid(row=1, column=0, sticky="w", padx=2)
+        title_box = ctk.CTkFrame(header, fg_color=BLACK)
+        title_box.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(title_box, text="PS5 FFPFSC PRO",
+                      font=ctk.CTkFont(size=26, weight="bold"), text_color=WHITE).pack(anchor="w")
+        ctk.CTkLabel(title_box, text=f"v{APP_VERSION}  ·  Bizkut backend  ·  {MKPFS_NAME} v{MKPFS_VERSION}  ·  by Knutwurst",
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=2)
 
+        # Kept for live stage writes (the stage itself is shown in the progress panel and
+        # the bottom status bar, so it is no longer crammed into the header).
         self.header_status_var = tk.StringVar(value=f"v{APP_VERSION}  |  Backend: Ready")
-        ctk.CTkLabel(header, textvariable=self.header_status_var,
-                      text_color=MUTED, font=ctk.CTkFont(size=14)).grid(row=0, column=2, padx=12)
 
-        # START / CANCEL always visible in header
-        self.start_btn = self._button(header, "▶  START QUEUE", self.start, green=True, width=150, height=36)
-        self.start_btn.grid(row=0, column=3, rowspan=1, padx=(0, 6), pady=2, sticky="e")
-        self.cancel_btn = self._button(header, "✕  CANCEL", self.cancel, red=True, width=120, height=36)
-        self.cancel_btn.grid(row=0, column=4, padx=(0, 6), pady=2, sticky="e")
+        # START / CANCEL — primary actions, top-right.
+        self.start_btn = self._button(header, "▶  START QUEUE", self.start, green=True, width=160, height=38)
+        self.start_btn.grid(row=0, column=2, padx=(8, 6), sticky="e")
+        self.cancel_btn = self._button(header, "✕  CANCEL", self.cancel, red=True, width=110, height=38)
+        self.cancel_btn.grid(row=0, column=3, padx=(0, 2), sticky="e")
         self.cancel_btn.configure(state="disabled")
 
-        self._button(header, "🩹  Patch integrieren", self._open_patch_dialog, width=170).grid(row=1, column=1, padx=(0, 8), pady=2, sticky="e")
-        self._button(header, "☀ Light / 🌙 Dark", self._toggle_theme, width=150).grid(row=1, column=2, padx=12, sticky="e")
-        self._button(header, "⚙  Settings", self.open_settings, width=120).grid(row=1, column=3, columnspan=2, padx=(0, 4), sticky="e")
+        # One calm toolbar row holds the format control + tools (populated once the
+        # output_compressed_var exists — see the Variables section below).
+        self._toolbar = ctk.CTkFrame(header, fg_color=BLACK)
+        self._toolbar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
         # ── Variables ────────────────────────────────────────────────────────
         # Remember the last input path across restarts (a browsed folder stays in the
@@ -4138,16 +4186,24 @@ class App:
         # .ffpfs (faster to build AND to mount — ShadowMountPlus decompresses .ffpfsc at only
         # ~150-250 MB/s and streaming-heavy games can stutter). True = compressed (default).
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
-        # A slide switch top-centre in the header toggles the format for the WHOLE queue.
-        fmt = ctk.CTkFrame(header, fg_color=BLACK)
-        fmt.grid(row=0, column=1, padx=10)
-        self.format_label_var = tk.StringVar()
-        ctk.CTkSwitch(fmt, text="", width=44, variable=self.output_compressed_var,
-                       onvalue=True, offvalue=False, progress_color=GREEN,
-                       command=self._on_format_toggle).pack(side="left")
-        ctk.CTkLabel(fmt, textvariable=self.format_label_var, text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
-        self._button(fmt, "🔄 Konverter", self.open_converter, width=120).pack(side="left", padx=(16, 0))
+        # Toolbar (header row 2): a segmented Output control for the WHOLE queue + the tools.
+        ctk.CTkLabel(self._toolbar, text="Output", text_color=MUTED,
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 8))
+        self._format_seg = ctk.CTkSegmentedButton(
+            self._toolbar, values=["Compressed", "Uncompressed"],
+            command=self._on_format_segment, fg_color=CARD2,
+            selected_color=GREEN, selected_hover_color=GREEN2,
+            unselected_color=CARD2, text_color=WHITE)
+        self._format_seg.set("Compressed" if self.output_compressed_var.get() else "Uncompressed")
+        self._format_seg.pack(side="left")
+        self.format_hint_var = tk.StringVar()
+        ctk.CTkLabel(self._toolbar, textvariable=self.format_hint_var, text_color=MUTED,
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(10, 0))
+        # Tools, grouped on the right.
+        self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
+        self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
+        self._button(self._toolbar, "🩹  Integrate Patch", self._open_patch_dialog, width=160).pack(side="right", padx=(0, 8))
+        self._button(self._toolbar, "🔄  Converter", self.open_converter, green=True, width=130).pack(side="right", padx=(0, 8))
         self._update_format_label()
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
@@ -4333,7 +4389,7 @@ class App:
         # (top) — the old "Unpack PFS images" checkbox is gone (unpack_mode_var stays as
         # internal state that the converter's batch action drives). A dropped .ffpfsc still
         # queues as an unpack; a .ffpfs queues as a (re)pack source.
-        ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Konverter (top).\n"
+        ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Converter (top).\n"
                                 "All other options live in  ⚙ Settings (top-right).",
                       text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
                           row=7, column=0, sticky="w", padx=18, pady=(12, 12))
@@ -4357,8 +4413,9 @@ class App:
         self.overall_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
         self.overall_bar.set(0)
 
-        ctk.CTkLabel(progress, text="CURRENT GAME", text_color=WHITE,
-                      font=ctk.CTkFont(size=12, weight="bold")).grid(row=2, column=0, sticky="w", padx=14)
+        self.cur_game_var = tk.StringVar(value="CURRENT STEP")
+        ctk.CTkLabel(progress, textvariable=self.cur_game_var, text_color=MUTED,
+                      font=ctk.CTkFont(size=12, weight="bold")).grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
         self.stage_title_var = tk.StringVar(value="Ready")
         self.stage_detail_var = tk.StringVar(value="Add a game and start queue.")
         self.stage_pct_var = tk.StringVar(value="0%")
@@ -4782,7 +4839,7 @@ class App:
 
     def _open_patch_dialog(self):
         if getattr(self, "_batch_running", False) or (getattr(self, "worker", None) and self.worker and self.worker.is_alive()):
-            messagebox.showinfo("Bitte warten", "Es läuft gerade ein Vorgang. Erst abwarten oder abbrechen.")
+            messagebox.showinfo("Please wait", "A job is already running. Wait for it to finish or cancel it first.")
             return
         PatchDialog(self)
 
@@ -4813,15 +4870,15 @@ class App:
         game = Path(self._clean_path_str(game_str))
         patch = Path(self._clean_path_str(patch_str))
         if not game.exists():
-            messagebox.showerror("Nicht gefunden", f"Spiel nicht gefunden:\n{game}"); return
+            messagebox.showerror("Not found", f"Game not found:\n{game}"); return
         if not patch.exists():
-            messagebox.showerror("Nicht gefunden", f"Patch nicht gefunden:\n{patch}"); return
+            messagebox.showerror("Not found", f"Patch not found:\n{patch}"); return
         temp_base = self.temp_var.get().strip() or str(game.parent / "_ffpfsc_temp")
         self.temp_var.set(temp_base)
         out_base = self.output_var.get().strip()
         self.start_btn.configure(state="disabled"); self.cancel_btn.configure(state="normal")
         self.cancel_requested = False; self.extract_cancel_event.clear()
-        self.status_update("Patching", f"Patch wird vorbereitet: {game.name}…", "Scanning Files", 0, 0, "00:00", "—", "—")
+        self.status_update("Patching", f"Preparing patch: {game.name}…", "Scanning Files", 0, 0, "00:00", "—", "—")
         try:
             self.bottom_tabs.set("Logs")
         except Exception:
@@ -4847,24 +4904,24 @@ class App:
                     game_arg = game
                 elif gsfx in ARCH:
                     self.log("INFO", f"Extracting game archive: {game.name}")
-                    self.status_update("Extracting", f"Spiel entpacken: {game.name}…", "Scanning Files", 0, 0, "—", "—", "—")
+                    self.status_update("Extracting", f"Unpacking game: {game.name}…", "Extracting", 0, 0, "—", "—", "—")
                     game_arg = ArchiveExtractor.extract_with_passwords(
                         game, Path(temp_base) / "_patch_game", pw,
                         log_fn=self.log, cancel_event=self.extract_cancel_event)
                     patch_inplace = True   # extracted to a throwaway temp dir → overlay in place
                 else:
-                    raise RuntimeError(f"Nicht unterstützter Spiel-Typ: {game.name}")
+                    raise RuntimeError(f"Unsupported game type: {game.name}")
                 # resolve the PATCH to a folder of loose files
                 if patch.is_dir():
                     patch_dir = patch
                 elif patch.suffix.lower() in ARCH:
                     self.log("INFO", f"Extracting patch archive: {patch.name}")
-                    self.status_update("Extracting", f"Patch entpacken: {patch.name}…", "Scanning Files", 0, 0, "—", "—", "—")
+                    self.status_update("Extracting", f"Unpacking patch: {patch.name}…", "Extracting", 0, 0, "—", "—", "—")
                     patch_dir = ArchiveExtractor.extract_with_passwords(
                         patch, Path(temp_base) / "_patch_files", pw,
                         log_fn=self.log, cancel_event=self.extract_cancel_event)
                 else:
-                    raise RuntimeError(f"Patch muss ein Ordner oder Archiv sein: {patch.name}")
+                    raise RuntimeError(f"Patch must be a folder or archive: {patch.name}")
                 if self.cancel_requested:
                     raise ArchiveExtractionCancelled("Cancelled by user.")
                 # output path (ask-per-run choice from the dialog)
@@ -5806,7 +5863,7 @@ class App:
         self.extract_cancel_event.clear()
         self.cancel_btn.configure(state="normal")
         self.status_update("Extracting", f"Unpacking {archive.name}…  0%",
-                            "Scanning Files", 0, 0, "00:00", "—", "—")
+                            "Extracting", 0, 0, "00:00", "—", "—")
         # Show Logs tab so the user can watch per-file lines
         try:
             self.bottom_tabs.set("Logs")
@@ -5822,7 +5879,7 @@ class App:
                 self.status_update(
                     "Extracting",
                     f"Unpacking {archive.name}…  {pct}%\n{short}",
-                    "Scanning Files", pct, pct, "—", "—", "—"
+                    "Extracting", pct, pct, "—", "—", "—"
                 )
 
         candidate_passwords = self._candidate_passwords()  # built on the Tk thread
@@ -5914,7 +5971,7 @@ class App:
 
         self.log("INFO", f"Extracting archive: {archive.name}")
         self.status_update("Extracting", f"Unpacking {archive.name}…  0%",
-                            "Scanning Files", 0, 0, "00:00", "—", "—")
+                            "Extracting", 0, 0, "00:00", "—", "—")
         try:
             self.bottom_tabs.set("Logs")
         except Exception:
@@ -5926,7 +5983,7 @@ class App:
                 _last_pct[0] = pct
                 self.status_update("Extracting",
                                     f"Unpacking {archive.name}…  {pct}%",
-                                    "Scanning Files", pct, pct, "—", "—", "—")
+                                    "Extracting", pct, pct, "—", "—", "—")
 
         candidate_passwords = self._candidate_passwords(item)  # includes per-archive override
 
@@ -6237,12 +6294,23 @@ class App:
 
     def _update_format_label(self):
         comp = self.output_compressed_var.get()
-        self.format_label_var.set("📦 Compressed (.ffpfsc, smaller)" if comp
-                                  else "⚡ Uncompressed (.ffpfs, faster)")
+        try:
+            self.format_hint_var.set(".ffpfsc — smaller" if comp else ".ffpfs — faster, full size")
+        except Exception:
+            pass
+        try:
+            self._format_seg.set("Compressed" if comp else "Uncompressed")
+        except Exception:
+            pass
+
+    def _on_format_segment(self, value):
+        """The header Output segmented control changed."""
+        self.output_compressed_var.set(value == "Compressed")
+        self._on_format_toggle()
 
     def _on_format_toggle(self):
-        """Top format switch changed — applies to the WHOLE queue. Refresh the labels and
-        the command preview so output names/extensions reflect the chosen format."""
+        """Output format changed — applies to the WHOLE queue. Refresh the hint and the
+        command/queue preview so output names/extensions reflect the chosen format."""
         self._update_format_label()
         for fn in ("update_queue_box", "update_command_preview"):
             try:
@@ -7798,13 +7866,15 @@ class App:
                 title, detail, stage, stage_pct, overall_pct, elapsed, speed, eta = self.status_q.get_nowait()
                 self.big_status_var.set(title)
                 self.big_detail_var.set(detail)
-                # Lower bar = CURRENT GAME: this game's progress across ALL its stages
-                # (= overall_pct). The live stage and its % live in the stage chain
-                # (▶ Compress 86%) and the detail line below — not a separate bar.
-                self.stage_title_var.set((self.queue[0].name if self.queue else "") or title)
+                # Lower bar = CURRENT STEP: the progress of the operation running right now
+                # (extract / read / temp-PFS / compress / write …) = stage_pct. The game name
+                # sits above as context; whole-game progress feeds the QUEUE bar below.
+                _gname = (self.queue[0].name if self.queue else "") or ""
+                self.cur_game_var.set(f"CURRENT STEP  ·  {_gname}" if _gname else "CURRENT STEP")
+                self.stage_title_var.set(stage or title)
                 self.stage_detail_var.set(detail)
-                self.stage_pct_var.set(f"{int(overall_pct)}%")
-                self.stage_bar.set(max(0, min(1, overall_pct / 100)))
+                self.stage_pct_var.set(f"{int(stage_pct)}%")
+                self.stage_bar.set(max(0, min(1, stage_pct / 100)))
                 # Upper bar = QUEUE: finished games + the current game's fraction over the
                 # whole batch — reflects TOTAL progress, not just the one running element.
                 _total = max(1, getattr(self, "_batch_total", 1))

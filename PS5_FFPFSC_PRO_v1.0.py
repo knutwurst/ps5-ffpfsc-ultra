@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.38"
+APP_VERSION = "1.0.39"
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
@@ -4186,19 +4186,16 @@ class App:
         # .ffpfs (faster to build AND to mount — ShadowMountPlus decompresses .ffpfsc at only
         # ~150-250 MB/s and streaming-heavy games can stutter). True = compressed (default).
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
-        # Toolbar (header row 2): a segmented Output control for the WHOLE queue + the tools.
+        # Toolbar (header row 2): a slide switch sets the Output format for the WHOLE queue
+        # (ON = compressed .ffpfsc, OFF = uncompressed .ffpfs); the label states which.
         ctk.CTkLabel(self._toolbar, text="Output", text_color=MUTED,
                       font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 8))
-        self._format_seg = ctk.CTkSegmentedButton(
-            self._toolbar, values=["Compressed", "Uncompressed"],
-            command=self._on_format_segment, fg_color=CARD2,
-            selected_color=GREEN, selected_hover_color=GREEN2,
-            unselected_color=CARD2, text_color=WHITE)
-        self._format_seg.set("Compressed" if self.output_compressed_var.get() else "Uncompressed")
-        self._format_seg.pack(side="left")
+        ctk.CTkSwitch(self._toolbar, text="", width=46, variable=self.output_compressed_var,
+                       onvalue=True, offvalue=False, progress_color=GREEN,
+                       command=self._on_format_toggle).pack(side="left")
         self.format_hint_var = tk.StringVar()
-        ctk.CTkLabel(self._toolbar, textvariable=self.format_hint_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(self._toolbar, textvariable=self.format_hint_var, text_color=WHITE,
+                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
         # Tools, grouped on the right.
         self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
         self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
@@ -6295,18 +6292,10 @@ class App:
     def _update_format_label(self):
         comp = self.output_compressed_var.get()
         try:
-            self.format_hint_var.set(".ffpfsc — smaller" if comp else ".ffpfs — faster, full size")
+            self.format_hint_var.set("📦 Compressed (.ffpfsc, smaller)" if comp
+                                     else "⚡ Uncompressed (.ffpfs, faster)")
         except Exception:
             pass
-        try:
-            self._format_seg.set("Compressed" if comp else "Uncompressed")
-        except Exception:
-            pass
-
-    def _on_format_segment(self, value):
-        """The header Output segmented control changed."""
-        self.output_compressed_var.set(value == "Compressed")
-        self._on_format_toggle()
 
     def _on_format_toggle(self):
         """Output format changed — applies to the WHOLE queue. Refresh the hint and the
@@ -6917,6 +6906,14 @@ class App:
             self._batch_done    = 0
             self._batch_failed  = 0
             self._batch_running = self._batch_total > 0
+            # Snapshot each queued game's size (in queue order) so the QUEUE bar can show
+            # SIZE-weighted total progress — a 187 GB game advances it far more than a 35 GB
+            # one, instead of every game counting an equal 1/N. Games finish in queue order,
+            # so done-bytes = sum of the first _done sizes (see the status drain).
+            try:
+                self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in self.queue]
+            except Exception:
+                self._batch_sizes = []
         self._update_batch_counter()
 
         self._last_cmd_str = " ".join(cmd)
@@ -7875,11 +7872,20 @@ class App:
                 self.stage_detail_var.set(detail)
                 self.stage_pct_var.set(f"{int(stage_pct)}%")
                 self.stage_bar.set(max(0, min(1, stage_pct / 100)))
-                # Upper bar = QUEUE: finished games + the current game's fraction over the
-                # whole batch — reflects TOTAL progress, not just the one running element.
+                # Upper bar = QUEUE: TOTAL progress over the whole batch — finished games plus
+                # the current game's fraction. SIZE-weighted when we have the size snapshot
+                # (so a 187 GB game moves the bar far more than a 35 GB one and it does NOT
+                # just mirror the current game); falls back to equal-weight game count.
                 _total = max(1, getattr(self, "_batch_total", 1))
                 _done  = getattr(self, "_batch_done", 0) + getattr(self, "_batch_failed", 0)
-                _qfrac = max(0.0, min(1.0, (_done + overall_pct / 100.0) / _total))
+                _sizes = getattr(self, "_batch_sizes", []) or []
+                _tot_bytes = sum(_sizes)
+                if _tot_bytes > 0 and _done <= len(_sizes):
+                    _done_bytes = sum(_sizes[:_done])
+                    _cur_bytes  = _sizes[_done] if _done < len(_sizes) else 0
+                    _qfrac = max(0.0, min(1.0, (_done_bytes + _cur_bytes * overall_pct / 100.0) / _tot_bytes))
+                else:
+                    _qfrac = max(0.0, min(1.0, (_done + overall_pct / 100.0) / _total))
                 self.overall_pct_var.set(f"{int(_qfrac * 100)}%")
                 self.overall_bar.set(_qfrac)
                 self.overall_title_var.set(

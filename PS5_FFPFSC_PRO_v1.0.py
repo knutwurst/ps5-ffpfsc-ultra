@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.40"
+APP_VERSION = "1.0.41"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4518,7 +4518,9 @@ class App:
                        fg_color=BORDER2, progress_color=GREEN,
                        button_color=GREEN, button_hover_color=GREEN2,
                        height=16).grid(row=1, column=4, sticky="ew", padx=(0, 4), pady=(0, 8))
-        self._cpu_count_lbl = ctk.CTkLabel(tune_bar, text="auto",
+        self._cpu_count_lbl = ctk.CTkLabel(tune_bar,
+                                            text=("auto" if self.cpu_count_var.get() == 0
+                                                  else str(self.cpu_count_var.get())),
                                             text_color=GREEN, font=ctk.CTkFont(size=12, weight="bold"),
                                             width=34, anchor="w")
         self._cpu_count_lbl.grid(row=1, column=5, padx=(0, 10), pady=(0, 8))

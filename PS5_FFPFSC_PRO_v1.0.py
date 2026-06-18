@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.42"
+APP_VERSION = "1.0.43"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4335,12 +4335,10 @@ class App:
         # grabs the mouse-wheel inside its OWN canvas subtree, so a listbox that is not a
         # descendant keeps its own wheel/scrollbar and the outer scroll can't fight it.
         left.grid_rowconfigure(2, weight=1)
-        # Subtle scrollbar: with the duplicate options gone the body fits without
-        # scrolling in normal use, so the bar should recede (dark, matches the border)
-        # and only matter if the content area is dragged very short. ctk 5.2.2 has no
-        # auto-hide, so a muted colour is how we keep it unobtrusive.
-        body = ctk.CTkScrollableFrame(left, fg_color=PANEL, corner_radius=0,
-                                      scrollbar_button_color=BORDER2, scrollbar_button_hover_color=GREEN)
+        # Plain frame (no scrollbar): the left pane below the queue list now holds only the
+        # queue buttons + a couple of hint lines, so it always fits — the old scrollable
+        # body + its scrollbar just added visual noise.
+        body = ctk.CTkFrame(left, fg_color=PANEL, corner_radius=0)
         body.grid(row=2, column=0, sticky="nsew", padx=0, pady=(2, 0))
         body.grid_columnconfigure(0, weight=1)
 
@@ -4375,7 +4373,7 @@ class App:
 
         if _HAS_DND:
             ctk.CTkLabel(body, text="↓ Drag & drop supported", text_color=MUTED,
-                          font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="w", padx=14, pady=(0, 4))
+                          font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="w", padx=14, pady=(2, 0))
 
         # ── Mode ──────────────────────────────────────────────────────────────
         # Everything persistent (passwords, sounds, verify, keep-PFS, auto-clear,
@@ -4387,7 +4385,7 @@ class App:
         ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Converter (top).\n"
                                 "Archive passwords & all other options live in  ⚙ Settings (top-right).",
                       text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
-                          row=4, column=0, sticky="w", padx=18, pady=(12, 12))
+                          row=4, column=0, sticky="w", padx=14, pady=(4, 2))
 
         # ── Center: Progress + Stages ────────────────────────────────────────
         center = ctk.CTkFrame(content, fg_color=BLACK)
@@ -4440,36 +4438,12 @@ class App:
             lbl.pack(side="left", padx=2, pady=6)
             self._stage_labels.append(lbl)
 
-        # ShadowMount guide — sits directly below the stages strip
-        sm_bar = ctk.CTkFrame(progress, fg_color=CARD, corner_radius=6, border_width=1, border_color=BORDER2)
-        sm_bar.grid(row=8, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 12))
-        sm_bar.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(sm_bar,
-                      text="ShadowMount — How to use your .ffpfsc file",
-                      text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold"),
-                      anchor="w"
-                     ).grid(row=0, column=0, sticky="w", padx=10, pady=(7, 2))
-        self.shadowmount_guide_label = ctk.CTkLabel(
-            sm_bar,
-            text=(
-                "1.   Copy the .ffpfsc file to your PS5 internal storage or an external USB drive.\n"
-                "1a.  If you already have a shortcut for this game on the XMB, delete it first — "
-                "the old entry causes a param error and the game won't appear.\n"
-                "2.   Open ShadowMount on your PS5 and let it scan. "
-                "If the game is not detected or the shortcut is not made, re-run ShadowMount.\n"
-                "3.   Select the game from the XMB and launch it — it will appear and run like a standard title."
-            ),
-            text_color=MUTED, font=ctk.CTkFont(size=11),
-            justify="left", anchor="w", wraplength=420
-        )
-        self.shadowmount_guide_label.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
         self._bind_dynamic_wrap(progress, [self.stage_detail_label], padding=36, min_width=260)
-        self._bind_dynamic_wrap(sm_bar, [self.shadowmount_guide_label], padding=24, min_width=260)
 
-        # ── Compression tuning bar — horizontal, uses the empty center space ──
+        # ── Compression tuning bar — sits directly under the stages strip ──
         tune_bar = ctk.CTkFrame(progress, fg_color=CARD, corner_radius=6,
                                  border_width=1, border_color=BORDER2)
-        tune_bar.grid(row=9, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 12))
+        tune_bar.grid(row=7, column=0, columnspan=2, sticky="ew", padx=14, pady=(2, 12))
         tune_bar.grid_columnconfigure(1, weight=1)
         tune_bar.grid_columnconfigure(4, weight=1)
 

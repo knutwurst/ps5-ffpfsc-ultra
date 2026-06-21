@@ -33,6 +33,7 @@ a = Analysis(
         "unrar.rarfile",
         "unrar._unrar",
         "tkinterdnd2",
+        "psutil",
         "PIL._tkinter_finder",
         "cryptography",
         "cryptography.hazmat.primitives.ciphers",

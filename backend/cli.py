@@ -704,6 +704,40 @@ def resolve_unpack_output_dir(image_file: Path, requested_output: Path, *, batch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CPU auto-cap (OOM safety)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _auto_cap_cpu(requested: int, source: Path) -> int:
+    """Effective mkpfs worker count. When the user left CPU cores on AUTO (0), cap the
+    worker count for large sources: mkpfs spawns one worker per core and each buffers
+    compressed blocks in RAM, so a big game can backlog memory and get OOM-killed
+    (the TLOU2 SIGKILL). >30 GB -> 2 workers, >10 GB -> 4; smaller -> mkpfs default.
+    An explicit non-zero count is always honoured untouched."""
+    requested = max(0, int(requested or 0))
+    if requested:
+        return requested
+    try:
+        src = Path(source)
+        if src.is_file():
+            size = src.stat().st_size
+        else:
+            size = sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
+        GB = 1024 ** 3
+        if size > 30 * GB:
+            cap = 2
+        elif size > 10 * GB:
+            cap = 4
+        else:
+            return 0   # small source — let mkpfs use its default (all cores)
+        cap = min(cap, max(1, os.cpu_count() or 4))
+        print(f"[INFO] Source is {size / GB:.1f} GB — auto-capping mkpfs workers to {cap} "
+              f"to prevent out-of-memory (override with the CPU cores setting).", flush=True)
+        return cap
+    except Exception:
+        return 0   # stat failed — leave at mkpfs default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -871,7 +905,7 @@ def main() -> None:
             sys.exit(1)
         patch_pack_kwargs = dict(
             compression_level=max(0, min(9, args.compression_level)),
-            cpu_count=max(0, args.cpu_count),
+            cpu_count=_auto_cap_cpu(args.cpu_count, game_folder),
             threshold_gain=max(0, args.threshold_gain),
             block_size=args.block_size,
             verbose=args.verbose,
@@ -1040,6 +1074,8 @@ def main() -> None:
 
         for item in game_items:
             title_id = get_title_id(item)
+            # Per-item worker cap (auto only): size each game independently in a batch.
+            pack_kwargs["cpu_count"] = _auto_cap_cpu(args.cpu_count, item)
             # Uncompressed output (.ffpfs) applies to the PFS family — a game folder or a
             # .ffpfs source; .exfat/.ffpkg are always compressed to .ffpfsc.
             src_pfs_family = item.is_dir() or item.suffix.lower() == ".ffpfs"

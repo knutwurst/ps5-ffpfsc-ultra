@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.45"
+APP_VERSION = "1.0.46"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -903,6 +903,23 @@ def guess_game_version(path: Path) -> str:
     # Fall back to a version pattern in the source folder name (e.g. "…01.004…")
     m = re.search(rf"\bv?({_VER})\b", path.name)
     return m.group(1) if m else ""
+
+
+# ── AMPR / APR (PlayGo) support ───────────────────────────────────────────────
+# APR = a PlayGo game (streamed/chunked delivery, marked by sce_sys/playgo-chunk.dat).
+# AMPR = the emu shim it needs to boot from a compressed container: two user-supplied
+# .sprx files injected into a fakelib/ folder, plus an ampr_emu.index. No file format —
+# a game category + injected runtime files. See _build_ampr_index for the index layout.
+AMPR_SPRX_FILES = ["libSceAmpr.sprx", "libScePlayGo.sprx"]
+
+
+def is_apr_game(path) -> bool:
+    """True if *path* is a game folder using PlayGo (an APR title)."""
+    try:
+        sce = Path(path) / "sce_sys"
+        return (sce / "playgo-chunk.dat").exists() or (sce / "playgo_chunk.dat").exists()
+    except Exception:
+        return False
 
 
 # Two filename-length ceilings, BOTH in UTF-8 BYTES (the filesystem and ShadowMountPlus
@@ -1872,6 +1889,32 @@ class SettingsWindow(ctk.CTkToplevel):
         ka_menu.set(ka_labels.get(_cur_ka, "every 8 s (recommended)"))
         ka_menu.pack(side="left")
 
+        # ── AMPR / APR emu folder (PlayGo titles) ────────────────────────────
+        ctk.CTkLabel(ds, text="AMPR / APR (PlayGo) — emu files folder:",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Folder holding libSceAmpr.sprx + libScePlayGo.sprx (you supply these). "
+                              "PlayGo/APR games are auto-detected (sce_sys/playgo-chunk.dat); the two "
+                              "files are injected into a fakelib/ folder and an ampr_emu.index is built "
+                              "before packing, so the game boots from the compressed container.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14)
+        _ampr_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _ampr_row.pack(fill="x", padx=14, pady=(4, 4))
+        _ampr_entry = ctk.CTkEntry(_ampr_row, textvariable=self.app.ampr_var,
+                                   placeholder_text="Folder with the two .sprx files…")
+        _ampr_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_ampr(*_):
+            save_settings({"ampr_folder": self.app.ampr_var.get().strip()})
+        def _browse_ampr():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select AMPR Emu Folder")
+            if c:
+                self.app.ampr_var.set(c)
+                _save_ampr()
+        _ampr_entry.bind("<FocusOut>", lambda e: _save_ampr())
+        ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
+                      command=_browse_ampr).pack(side="left")
+
         # ── Extra temp drives (pool) ─────────────────────────────────────────
         ctk.CTkLabel(ds, text="Extra temp drives (pool, one path per line):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
@@ -2796,6 +2839,7 @@ def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None,
 
 
 class GameItem:
+    ampr_emu = False   # class-level default — guards history/from_* items built via __new__
     def __init__(self, path: Path):
         self.path       = path
         self.archive_path: Path | None = None   # set for archive placeholders
@@ -2808,6 +2852,7 @@ class GameItem:
         self.status     = "Queued"
         self.source_kind    = "inplace"   # a folder is packed in place — no second copy
         self.extracted_size = self.size   # already extracted; honest size for space math
+        self.ampr_emu       = is_apr_game(path)   # PlayGo/APR title? (auto-detected)
 
     @classmethod
     def from_archive(cls, archive: Path) -> "GameItem":
@@ -3101,6 +3146,12 @@ class CLIWorker(threading.Thread):
             if code != 0:
                 smart = smart_error_from_log()
                 msg = smart if smart else f"Backend exited with code {code}."
+                # Flag an out-of-memory kill so the main thread can auto-retry with fewer
+                # cores: either a printed MemoryError, or a SIGKILL (-9 / 137) during a
+                # pack — the OS memory-pressure kill leaves mkpfs no chance to print one.
+                if self.operation != "unpack" and (getattr(self, "_mem_error_shown", False)
+                                                    or code in (-9, 137)):
+                    self.oom_killed = True
                 self.app.finish(False, msg, self.last_cmd_str)
                 return
 
@@ -4307,6 +4358,8 @@ class App:
         # .ffpfs (faster to build AND to mount — ShadowMountPlus decompresses .ffpfsc at only
         # ~150-250 MB/s and streaming-heavy games can stutter). True = compressed (default).
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
+        # AMPR/APR emu folder (PlayGo titles): holds libSceAmpr.sprx + libScePlayGo.sprx.
+        self.ampr_var = tk.StringVar(value=settings.get("ampr_folder", ""))
         # Toolbar (header row 2): a slide switch sets the Output format for the WHOLE queue
         # (ON = compressed .ffpfsc, OFF = uncompressed .ffpfs); the label states which.
         ctk.CTkLabel(self._toolbar, text="Output", text_color=MUTED,
@@ -4740,7 +4793,12 @@ class App:
         log_head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(log_head, text="LOGS", text_color=WHITE,
                       font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
-        self._button(log_head, "CLEAR LOGS", self.clear_logs, width=110).grid(row=0, column=1, padx=4)
+        # Live RAM meter — green/amber/red; refreshed ~every 2 s from the poll loop.
+        self.ram_var = tk.StringVar(value="")
+        self._ram_label = ctk.CTkLabel(log_head, textvariable=self.ram_var, text_color=MUTED,
+                                        font=ctk.CTkFont(size=12))
+        self._ram_label.grid(row=0, column=1, padx=(0, 10), sticky="e")
+        self._button(log_head, "CLEAR LOGS", self.clear_logs, width=110).grid(row=0, column=2, padx=4)
         self.log_box = ctk.CTkTextbox(log_tab, fg_color=BLACK, border_width=1, border_color=BORDER,
                                        text_color="#94a3b8", font=ctk.CTkFont(family="Consolas", size=12), wrap="none")
         self.log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -5295,6 +5353,11 @@ class App:
         # remaining image+spool (~2.3x) rather than re-counting the already-written tree.
         target.source_kind    = getattr(source, "source_kind", "inplace")
         target.extracted_size = getattr(source, "extracted_size", source.size)
+        # Now that the archive is a real folder, detect whether it's a PlayGo/APR title.
+        try:
+            target.ampr_emu = is_apr_game(target.path)
+        except Exception:
+            target.ampr_emu = False
 
     def add_source_to_queue(self):
         src_str = self._clean_path_str(self.source_var.get())
@@ -6511,8 +6574,12 @@ class App:
         comp_level = self.compression_level_var.get()
         if comp_level != 7:  # only pass if non-default
             cmd += ["--compression-level", str(comp_level)]
-        cpu = self.cpu_count_var.get()
-        if cpu != 0:
+        # An OOM auto-retry pins an explicit (lower) core count on the item — honour it
+        # over the global setting so the retry actually uses fewer mkpfs workers.
+        cpu = getattr(item, "_cpu_retry_override", None)
+        if cpu is None:
+            cpu = self.cpu_count_var.get()
+        if cpu:
             cmd += ["--cpu-count", str(cpu)]
         block_size = self.block_size_var.get()
         if block_size and block_size != "auto":
@@ -6573,6 +6640,252 @@ class App:
                     self._cleanup_inflight = max(0, self._cleanup_inflight - 1)
         threading.Thread(target=_wrapped, daemon=True).start()
 
+    # ── AMPR / APR (PlayGo) support ───────────────────────────────────────────
+    def _ampr_folder(self):
+        """The configured folder holding the two emu .sprx files, or None."""
+        try:
+            p = self.ampr_var.get().strip()
+        except Exception:
+            p = ""
+        return Path(p) if p and Path(p).is_dir() else None
+
+    def _ensure_ampr_folder(self) -> bool:
+        """Ensure the AMPR emu folder is set; prompt once if not. True when ready."""
+        if self._ampr_folder():
+            return True
+        result = [False]
+        win = ctk.CTkToplevel(self.root)
+        win.title("AMPR Emu Files Needed")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.lift()
+        win.after(200, lambda: win.attributes("-topmost", False))
+        ctk.CTkLabel(win, text="AMPR emu folder not set",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=WHITE).pack(padx=28, pady=(22, 4))
+        ctk.CTkLabel(win,
+                     text="This APR (PlayGo) game needs two emu files to boot after compression:\n"
+                          "  • libSceAmpr.sprx\n"
+                          "  • libScePlayGo.sprx\n\n"
+                          "Point to the folder that contains both. They are copied into a\n"
+                          "fakelib/ folder inside the game before packing, and an\n"
+                          "ampr_emu.index is built. (Stored in Settings — asked only once.)",
+                     font=ctk.CTkFont(size=12), text_color=MUTED, justify="left").pack(padx=28, pady=(0, 14))
+        path_var = tk.StringVar(value="")
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkEntry(row, textvariable=path_var, width=300,
+                     placeholder_text="Folder containing libSceAmpr.sprx…").pack(side="left", padx=(0, 8))
+        def _browse():
+            from tkinter import filedialog
+            chosen = filedialog.askdirectory(title="Select AMPR Emu Folder")
+            if chosen:
+                path_var.set(chosen)
+        self._button(row, "Browse", _browse, width=80, height=32).pack(side="left")
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(pady=(0, 22))
+        def _confirm():
+            p = path_var.get().strip()
+            if p:
+                self.ampr_var.set(p)
+                save_settings({"ampr_folder": p})
+                result[0] = True
+            win.destroy()
+        self._button(btns, "Confirm & Continue", _confirm, green=True, width=190, height=36).pack(side="left", padx=(0, 10))
+        self._button(btns, "Skip (no AMPR)", win.destroy, width=140, height=36).pack(side="left")
+        win.grab_set()
+        self.root.wait_window(win)
+        return result[0]
+
+    def _inject_ampr_files(self, item) -> None:
+        """Copy the two emu .sprx into <game>/fakelib/. Tracks injected paths on the item
+        so a DIRECT (non-archive) source folder can be cleaned up after packing."""
+        ampr_dir = self._ampr_folder()
+        if not ampr_dir or not item.path or not getattr(item, "ampr_emu", False):
+            return
+        target_dir = Path(item.path) / "fakelib"
+        target_dir.mkdir(exist_ok=True)
+        item._ampr_injected = []
+        for fname in AMPR_SPRX_FILES:
+            src, dst = ampr_dir / fname, target_dir / fname
+            if not src.exists():
+                self.log("WARN", f"AMPR: {fname} not found in {ampr_dir}")
+                continue
+            if dst.exists():
+                self.log("INFO", f"AMPR: {fname} already present — skipping injection")
+                continue
+            try:
+                shutil.copy2(src, dst)
+                item._ampr_injected.append(dst)
+                self.log("INFO", f"AMPR: injected {fname}")
+            except Exception as exc:
+                self.log("WARN", f"AMPR: failed to inject {fname}: {exc}")
+
+    def _build_ampr_index(self, item) -> None:
+        """Build ampr_emu.index (AMPRIDX3) in the game folder. Ported byte-exact from the
+        reference tool: header <8sIIQQQII>, records <IIQq>, FNV-1a-64 open-addressed slots
+        <QII>, /app0/-prefixed lowercased POSIX paths, atomic temp-rename write."""
+        if not getattr(item, "ampr_emu", False) or not item.path or not Path(item.path).is_dir():
+            return
+        import struct as _struct
+        root       = Path(item.path).resolve()
+        output     = root / "ampr_emu.index"
+        output_tmp = output.with_suffix(output.suffix + ".tmp")
+
+        def _key(p):
+            return p.replace("\\", "/").lower()
+
+        def _fnv(p):
+            h = 1469598103934665603
+            for ch in _key(p):
+                h ^= ord(ch)
+                h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+            return h or 1
+
+        def _make_slots(rows):
+            n = 2
+            while n < len(rows) * 2:
+                n <<= 1
+            table = [(0, 0, 0)] * n
+            mask = n - 1
+            for i, (_, _, path) in enumerate(rows):
+                h = _fnv(path)
+                pos = h & mask
+                while table[pos][1] != 0:
+                    if table[pos][0] == h:
+                        oh, oi, of_ = table[pos]
+                        table[pos] = (oh, oi, of_ | 1)
+                    pos = (pos + 1) & mask
+                table[pos] = (h, i + 1, 0)
+            return table
+
+        def _write(rows):
+            rec_s = _struct.Struct("<IIQq")
+            slt_s = _struct.Struct("<QII")
+            hdr_s = _struct.Struct("<8sIIQQQII")
+            rows = sorted(rows, key=lambda r: _key(r[2]))
+            blob = bytearray()
+            recs = bytearray()
+            for sz, mt, path in rows:
+                enc = path.encode("utf-8") + b"\0"
+                recs += rec_s.pack(len(blob), len(enc) - 1, sz, mt)
+                blob += enc
+            table = _make_slots(rows)
+            p_end = hdr_s.size + len(recs) + len(blob)
+            h_off = (p_end + (slt_s.size - 1)) & ~(slt_s.size - 1)
+            with output_tmp.open("wb") as f:
+                f.write(hdr_s.pack(b"AMPRIDX3", 3, rec_s.size, len(rows),
+                                   len(blob), h_off, slt_s.size, len(table)))
+                f.write(recs)
+                f.write(blob)
+                f.write(b"\0" * (h_off - p_end))
+                for h, ip1, fl in table:
+                    f.write(slt_s.pack(h, ip1, fl))
+            output_tmp.replace(output)
+
+        out_r, tmp_r = output.resolve(), output_tmp.resolve()
+        _SKIP = {_key("/app0/ampr_emu.index"), _key("/app0/ampr_emu.index.tmp")}
+        seen, rows = {}, []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort(key=str.lower)
+            filenames.sort(key=str.lower)
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                try:
+                    if not fpath.is_file() or fpath.resolve() in (out_r, tmp_r):
+                        continue
+                    ipath = "/app0/" + fpath.relative_to(root).as_posix()
+                    ikey = _key(ipath)
+                    if ikey in _SKIP or ikey in seen:
+                        continue
+                    seen[ikey] = ipath
+                    st = fpath.stat()
+                    rows.append((st.st_size, int(st.st_mtime), ipath))
+                except Exception as exc:
+                    self.log("WARN", f"AMPR index: skipping {fpath.name}: {exc}")
+        try:
+            _write(rows)
+            item._ampr_index_path = output
+            self.log("INFO", f"AMPR: built index → ampr_emu.index  ({len(rows):,} files)")
+        except Exception as exc:
+            self.log("WARN", f"AMPR: index build failed: {exc}")
+
+    def _prepare_ampr(self, item) -> None:
+        """Right before packing an APR/PlayGo folder: ensure the emu folder, inject the
+        .sprx into fakelib/, and build the index. No-op for non-APR games / disk images."""
+        if not getattr(item, "ampr_emu", False) or not getattr(item, "path", None):
+            return
+        self.log("INFO", f"AMPR: {item.name} is a PlayGo/APR title — preparing emu files.")
+        if not self._ensure_ampr_folder():
+            self.log("WARN", "AMPR: no emu folder set — packing WITHOUT AMPR support; this "
+                             "APR title may not boot until you set the folder in Settings.")
+            return
+        self._inject_ampr_files(item)
+        self._build_ampr_index(item)
+
+    def _ampr_cleanup(self, item) -> None:
+        """Remove emu files we injected into a DIRECT (non-archive) source folder — that's
+        the user's own library, so restore it after packing. Archive-extracted sources sit
+        in temp and are removed wholesale by the normal teardown, so they're left alone."""
+        if item is None or getattr(item, "_from_archive", False):
+            return
+        injected = getattr(item, "_ampr_injected", None)
+        idx = getattr(item, "_ampr_index_path", None)
+        if not injected and not idx:
+            return
+        for p in (injected or []):
+            try:
+                Path(p).unlink()
+            except Exception:
+                pass
+        try:
+            fl = Path(item.path) / "fakelib"
+            if fl.is_dir() and not any(fl.iterdir()):
+                fl.rmdir()
+        except Exception:
+            pass
+        if idx:
+            try:
+                Path(idx).unlink()
+            except Exception:
+                pass
+        item._ampr_injected = []
+        item._ampr_index_path = None
+        self.log("INFO", f"AMPR: cleaned injected emu files from {Path(item.path).name}.")
+
+    def _oom_retry(self, item) -> bool:
+        """Requeue *item* with one fewer mkpfs worker after an out-of-memory kill.
+        Returns True if a retry was scheduled (caller should NOT count this as a failure).
+        Step-down: an explicit N → N-1 → … → 1; AUTO (0) drops straight to 1 worker (the
+        backend already auto-capped it, so 1 is the only guaranteed reduction). Capped at
+        two retries; gives up at one worker."""
+        MAX_RETRIES = 2
+        tries = getattr(item, "_oom_retries", 0)
+        prev = getattr(item, "_cpu_retry_override", None)
+        if prev is not None:
+            new_cpu = prev - 1
+        else:
+            base = self.cpu_count_var.get()
+            new_cpu = (base - 1) if (base and base > 0) else 1
+        new_cpu = max(1, new_cpu)
+        if tries >= MAX_RETRIES or (prev is not None and new_cpu >= prev):
+            self.log("ERROR", f"Still out of memory at {new_cpu} core(s) — giving up on "
+                              f"{item.name}. Try a lower compression level or smaller block size.")
+            return False
+        item._cpu_retry_override = new_cpu
+        item._oom_retries = tries + 1
+        item.status = "Pending"
+        self._cleanup_after_failure(item)   # reclaim the failed run's partial scratch first
+        self.queue.insert(0, item)
+        self.update_queue_box()
+        self.log("WARN", f"Out of memory — retrying {item.name} with {new_cpu} CPU core(s) "
+                         f"(attempt {tries + 1}/{MAX_RETRIES}).")
+        self.status_update("Retrying", f"Out of memory — retrying with {new_cpu} core(s)…",
+                           "Retrying", 0, 0, "—", "—", "—")
+        self._batch_running = True   # keep the loop alive even for a single-game run
+        self.root.after(800, self._batch_auto_start)
+        return True
+
     def _cleanup_after_failure(self, item) -> None:
         """Reclaim a failed/skipped/cancelled run's scratch: the mkpfs tmp* working dirs
         (orphaned inner image + pass-2 spool) AND this item's own extracted-source subdir
@@ -6580,6 +6893,7 @@ class App:
         folder, AND the output drive's _ffpfsc_temp (where a SPLIT run may have spilled its
         pass-2 spool, ffpfsc_spool_*). Counted so the next batch gate waits for the reclaim.
         Threaded (rmtree of a ~150 GB tree must not freeze the UI)."""
+        self._ampr_cleanup(item)   # restore a direct source folder we injected emu files into
         roots, seen = [], set()
         out_str = self.output_var.get().strip()
         out_spool = (str(Path(out_str) / "_ffpfsc_temp") if out_str else None)
@@ -6849,6 +7163,10 @@ class App:
         # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
         # user's own — left indexable). Archives were marked in _extract_queued_item.
         self._mark_no_spotlight(getattr(item, "_build_temp", None))
+        # AMPR/APR: inject the emu .sprx + build ampr_emu.index on the resolved game folder
+        # (post-extraction for archives) before packing, so they ride into the .ffpfsc.
+        if getattr(item, "ampr_emu", False):
+            self._prepare_ampr(item)
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
         except Exception as e:
@@ -6961,6 +7279,10 @@ class App:
         # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
         # user's own — left indexable). Archives were marked in _extract_queued_item.
         self._mark_no_spotlight(getattr(item, "_build_temp", None))
+        # AMPR/APR: inject the emu .sprx + build ampr_emu.index on the resolved game folder
+        # (post-extraction for archives) before packing, so they ride into the .ffpfsc.
+        if getattr(item, "ampr_emu", False):
+            self._prepare_ampr(item)
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
         except Exception as e:
@@ -7736,6 +8058,29 @@ class App:
         if w and w.is_alive() and w.start_time:
             self.elapsed_var.set(f"Elapsed: {format_duration(time.time() - w.start_time)}")
 
+    def _update_ram_meter(self):
+        """Refresh the RAM readout in the log header (green <70%, amber <85%, red above)."""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            avail_gb = mem.available / 1024**3
+            total_gb = mem.total / 1024**3
+            pct = mem.percent
+            color = (("#1a7a40", "#4ade80") if pct < 70
+                     else ("#b45309", "#facc15") if pct < 85
+                     else ("#b91c1c", "#f87171"))
+            self.ram_var.set(f"RAM: {avail_gb:.1f} / {total_gb:.0f} GB free  ({pct:.0f}% used)")
+            try:
+                self._ram_label.configure(text_color=color)
+            except Exception:
+                pass
+        except Exception:
+            # psutil missing or unavailable — hide the meter rather than error.
+            try:
+                self.ram_var.set("")
+            except Exception:
+                pass
+
     def _poll(self):
         try:
             self._poll_inner()
@@ -7749,6 +8094,11 @@ class App:
 
     def _poll_inner(self):
         self._tick_elapsed()
+        # Refresh the RAM meter ~every 2 s (poll runs every 200 ms → every 10th tick).
+        self._ram_tick = getattr(self, "_ram_tick", 0) + 1
+        if self._ram_tick >= 10:
+            self._ram_tick = 0
+            self._update_ram_meter()
         try:
             while True:
                 status, payload = self.scan_q.get_nowait()
@@ -8112,6 +8462,7 @@ class App:
                 # extract on the OUTPUT drive, which _auto_clear_temp (temp only) misses.
                 if completed_item is not None:
                     self._cleanup_item_extract(completed_item)
+                    self._ampr_cleanup(completed_item)   # restore a direct source folder
 
                 # Feature 4: batch auto-advance
                 if self._batch_running and self.queue:
@@ -8161,6 +8512,11 @@ class App:
                 if completed_item is not None:
                     self._cleanup_after_failure(completed_item)
             else:
+                # OOM auto-retry: if the backend was out-of-memory-killed and we can still
+                # drop a core, requeue the SAME game with fewer workers instead of failing.
+                if (self.worker is not None and getattr(self.worker, "oom_killed", False)
+                        and completed_item is not None and self._oom_retry(completed_item)):
+                    return
                 self._batch_failed += 1
                 self.update_queue_box()
                 self.status_update("Failed", msg, "Failed", 0, 0, "—", "—", "—")

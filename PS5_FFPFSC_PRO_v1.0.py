@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.43"
+APP_VERSION = "1.0.45"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -404,12 +404,35 @@ def estimate_image_space_needed(extracted_size: int) -> int:
     return int(extracted_size * IMAGE_PEAK_FACTOR * space_safety_factor())
 
 
-def estimate_output_space_needed(game_size: int) -> int:
-    """Worst-case free space the OUTPUT drive must have for the final .ffpfsc.
-    A non-compressing title (PFSC gain ~0%, e.g. already-compressed game assets)
-    produces a container roughly the size of the source; +5% covers block
-    alignment and container headers."""
-    return int(game_size * 1.05)
+# Realistic final-.ffpfsc size as a fraction of the UNPACKED game. Measured over 70+
+# runs: mean ~0.59, worst ~0.87. 0.75 leaves headroom above the mean without reserving
+# the full incompressible worst case (which needlessly skipped easily-fitting games like
+# Astro Bot: 148 GB unpacked → 37 GB .rar, but the old 1.05x reserved ~156 GB on the
+# output drive and skipped it on a 131 GB-free disk).
+COMPRESSED_OUTPUT_RATIO = 0.75
+
+
+def estimate_output_space_needed(game_size: int, compressed: bool = True,
+                                 known_packed: int = 0) -> int:
+    """Free space the OUTPUT drive must have for the final container.
+
+    UNCOMPRESSED (.ffpfs): the container IS the full inner image → 1.05x (block
+    alignment + headers).
+
+    COMPRESSED (.ffpfsc): reserving 1.05x the UNPACKED size ignores the whole point of
+    compression and skips titles that comfortably fit. Reserve a realistic fraction of
+    the unpacked size (COMPRESSED_OUTPUT_RATIO), floored by the known compressed source
+    set (*known_packed*, the .rar volume total) × 1.25 so a barely-compressible game
+    (large .rar) is still reserved near full size, and capped at the incompressible 1.05x
+    worst case so it never over-reserves. The backend's pre-pass-2 assert is the hard
+    backstop if a title compresses worse than estimated (a clean late skip, no corruption)."""
+    worst = int(game_size * 1.05)
+    if not compressed:
+        return worst
+    est = int(game_size * COMPRESSED_OUTPUT_RATIO)
+    if known_packed:
+        est = max(est, int(known_packed * 1.25))
+    return min(est, worst)
 
 
 def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
@@ -427,6 +450,10 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     size = _build_size_of(item)
     if size <= 0:
         return True   # unknown size — placement used the larger drive; the backend asserts
+    # Output-drive reservation reflects the chosen output format (compressed → realistic,
+    # uncompressed → full size) and, for archives, the known compressed source-set size.
+    comp  = bool(getattr(item, "_output_compressed", True))
+    known = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
     if getattr(item, "_extract_on_pool", False):
         # Two-fast-drive split: inner image on _build_temp (one SSD), extracted source on
         # _build_root (another SSD), final on the output drive. Check each independently.
@@ -438,7 +465,7 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
         extract_dir = Path(getattr(item, "_build_root", image_dir))
         return (get_free_space(image_dir)   >= estimate_image_space_needed(size)
                 and get_free_space(extract_dir) >= int(size)
-                and get_free_space(out_dir)  >= estimate_output_space_needed(size))
+                and get_free_space(out_dir)  >= estimate_output_space_needed(size, comp, known))
     if getattr(item, "_image_only_on_temp", False):
         temp_free = get_free_space(temp_dir)
         image_need = estimate_image_space_needed(size)
@@ -448,12 +475,12 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
         # The source copy is reserved only before extraction (archive); afterwards it is
         # already on the output drive and counted in its free space.
         src_on_out = size if getattr(item, "source_kind", "") == "archive" else 0
-        out_need = src_on_out + estimate_output_space_needed(size) + (0 if spool_fits_temp else spool_need)
+        out_need = src_on_out + estimate_output_space_needed(size, comp, known) + (0 if spool_fits_temp else spool_need)
         return image_ok and get_free_space(out_dir) >= out_need
     same = same_drive(temp_dir, out_dir)
     factor = _peak_factor_for(item)
     temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same)
-    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size)
+    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
     return temp_ok and out_ok
 
 
@@ -878,13 +905,69 @@ def guess_game_version(path: Path) -> str:
     return m.group(1) if m else ""
 
 
+# Two filename-length ceilings, BOTH in UTF-8 BYTES (the filesystem and ShadowMountPlus
+# checks count bytes, not characters — a "™" is 3 bytes, not 1):
+#  • MAX_FILENAME_BYTES — the filesystem hard cap (exFAT 255 UTF-16 units / APFS 255 bytes).
+#    Used by the general sanitiser so no path component is ever filesystem-illegal.
+#  • SHADOWMOUNT_NAME_LIMIT — the stricter limit ShadowMountPlus enforces on the .ffpfsc
+#    FILENAME: it rejects longer names with ENAMETOOLONG ("Dateiname zu lang"). EMPIRICAL
+#    (2026-06-21): a 59-byte name mounts, a 69-byte name fails → the real cap is ~64. Set
+#    conservatively to 63 (one under the likely char[64] buffer) so generated names always
+#    fit. The output namer budgets against THIS value — change it in one place if the exact
+#    constant turns out different.
+MAX_FILENAME_BYTES = 255
+SHADOWMOUNT_NAME_LIMIT = 63
+
+
+def _truncate_to_bytes(s: str, max_bytes: int) -> str:
+    """Trim *s* so its UTF-8 encoding is <= *max_bytes*, never splitting a character."""
+    b = s.encode("utf-8")
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", "ignore")
+
+
+def short_version(ver: str) -> str:
+    """Collapse a PS5 version to two groups and drop any leading 'v' for filenames:
+    'v01.007.000' -> '01.007', '02.001.010' -> '02.001', '01.030' -> '01.030'."""
+    if not ver:
+        return ver
+    m = re.match(r"v*(\d{1,2}\.\d{2,3})", ver)
+    return m.group(1) if m else ver.lstrip("v")
+
+
 def sanitize_filename(s: str) -> str:
     """Make *s* safe as a cross-platform filename component (keeps spaces,
-    brackets, &, etc.; strips path separators and reserved characters)."""
+    brackets, &, etc.; strips path separators and reserved characters), and cap it
+    to the filesystem's per-name limit."""
     s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
+    s = re.sub(r"[™®©℠℗]", "", s)   # ™ ® © ℠ ℗ — waste bytes, no value on a console drive
     s = re.sub(r'[*?"<>|\x00-\x1f]', "", s)
     s = re.sub(r"\s+", " ", s).strip().strip(".")
-    return s[:180].strip()   # leave headroom under the 255-char filename limit
+    return _truncate_to_bytes(s, MAX_FILENAME_BYTES).strip()
+
+
+# Redundant "edition" qualifiers dropped from an output filename ONLY when the full name
+# would otherwise exceed SHADOWMOUNT_NAME_LIMIT (so games that fit keep their full title).
+# Longest/most-specific phrases first; an optional leading separator (- – — :) is eaten too.
+_EDITION_FLUFF_RE = re.compile(
+    r"\s*[-–—:]?\s*\b("
+    r"\d{1,3}(?:st|nd|rd|th)\s+anniversary\s+edition"
+    r"|game\s+of\s+the\s+year\s+edition|goty\s+edition"
+    r"|complete\s+edition|definitive\s+edition|enhanced\s+edition"
+    r"|deluxe\s+edition|ultimate\s+edition|standard\s+edition"
+    r"|special\s+edition|gold\s+edition|premium\s+edition"
+    r"|anniversary\s+edition|remastered|remaster"
+    r")\b",
+    re.IGNORECASE)
+
+
+def _strip_edition_fluff(name: str) -> str:
+    """Remove redundant 'edition'/'remastered' qualifiers and tidy leftover separators.
+    Used only as a fallback when a name is over the ShadowMount length budget."""
+    out = _EDITION_FLUFF_RE.sub("", name)
+    out = re.sub(r"\s{2,}", " ", out).strip(" -–—:")
+    return out
 
 
 def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
@@ -907,12 +990,36 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     src = getattr(item, "path", None)
     ver = guess_game_version(src) if isinstance(src, Path) else ""
     if ver:
-        suffix_parts.append(f"[v{ver}]")
+        # Shortened, 'v'-less version tag (e.g. [01.007]) — matches shorten_ffpfsc_versions.sh.
+        suffix_parts.append(f"[{short_version(ver)}]")
     suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
-    # Reserve room for the [v..][TITLEID] suffix + extension so those collision-resistant
-    # tags survive the filename-length cap instead of being truncated away.
-    name_budget = max(20, 180 - len(suffix) - len(ext))
-    name = sanitize_filename(name)[:name_budget].strip() or "output"
+    # Reserve room (by UTF-8 bytes) for the [version][TITLEID] suffix + extension so those
+    # collision-resistant tags survive the filename-length cap instead of being truncated.
+    if item is not None:
+        try:
+            item._name_was_truncated = False
+            item._name_fluff_stripped = False
+        except Exception:
+            pass
+    name_budget = max(20, SHADOWMOUNT_NAME_LIMIT - len(suffix.encode("utf-8")) - len(ext.encode("utf-8")))
+    clean = sanitize_filename(name)
+    fluff_stripped = False
+    if len(clean.encode("utf-8")) > name_budget:
+        # Over budget — first drop redundant edition qualifiers (much nicer than a blunt
+        # cut). Only adopt the result if it actually shortened to something non-empty.
+        reduced = sanitize_filename(_strip_edition_fluff(clean))
+        if reduced and len(reduced.encode("utf-8")) < len(clean.encode("utf-8")):
+            clean = reduced
+            fluff_stripped = True
+    trunc = _truncate_to_bytes(clean, name_budget)
+    truncated = len(trunc.encode("utf-8")) < len(clean.encode("utf-8"))
+    if item is not None:
+        try:
+            item._name_was_truncated = truncated
+            item._name_fluff_stripped = fluff_stripped and not truncated
+        except Exception:
+            pass
+    name = trunc.strip() or "output"
     return sanitize_filename(name + suffix) + ext
 
 
@@ -1305,7 +1412,9 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         same        = same_drive(temp_dir, out_dir)
         bsize       = _build_size_of(item)
         peak_needed = estimate_peak_space_needed(bsize, _peak_factor_for(item), same)
-        out_needed  = estimate_output_space_needed(bsize)
+        out_needed  = estimate_output_space_needed(
+            bsize, bool(getattr(item, "_output_compressed", True)),
+            int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0)
         final_est   = int(bsize * 0.55)
         temp_fs     = get_filesystem_type(temp_dir)   # fast ctypes call
         out_fs      = get_filesystem_type(out_dir)
@@ -5653,6 +5762,12 @@ class App:
         Modes 'temp'/'spread' force the SSD / the output drive respectively; the backend's
         adaptive spool still saves a too-tight 'temp' run from failing mid-pass-2."""
         archive = getattr(item, "archive_path", None)
+        # Record the output format so the space gate sizes the OUTPUT-drive reservation
+        # correctly (compressed .ffpfsc → realistic; uncompressed .ffpfs → full size).
+        try:
+            item._output_compressed = bool(self.output_compressed_var.get())
+        except Exception:
+            item._output_compressed = True
         temp_base = self.temp_var.get().strip()
         if not temp_base:
             anchor = archive.parent if archive else Path.home()
@@ -5705,8 +5820,10 @@ class App:
         out_full   = estimate_peak_space_needed(size, factor, True)      # everything on the output drive
         # Output drive must hold, in the split: the source copy extracted there (archives
         # only) + the final container (the spool only spills here if the SSD can't hold it).
+        comp_out = bool(getattr(item, "_output_compressed", True))
+        known_out = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
         src_on_out = size if archive else 0
-        out_split_need = int(src_on_out) + estimate_output_space_needed(size)
+        out_split_need = int(src_on_out) + estimate_output_space_needed(size, comp_out, known_out)
         temp_free = get_free_space(temp_base_p)
         out_free  = get_free_space(probe_out)
         szs = format_size(size) if size else "?"
@@ -6350,6 +6467,12 @@ class App:
             base = (out / sanitize_filename(sub)) if sub else out
             try:
                 out = base / descriptive_ffpfsc_name(item, ext=out_ext)
+                if getattr(item, "_name_was_truncated", False):
+                    self.log("WARN", f"Output filename shortened to fit the {SHADOWMOUNT_NAME_LIMIT}-"
+                                     f"byte ShadowMount limit: {out.name}")
+                elif getattr(item, "_name_fluff_stripped", False):
+                    self.log("INFO", f"Dropped edition suffix to fit the {SHADOWMOUNT_NAME_LIMIT}-"
+                                     f"byte ShadowMount limit: {out.name}")
             except Exception:
                 out = base   # keep the subfolder; backend names <title_id><ext> inside
         temp = Path(self.temp_var.get().strip())

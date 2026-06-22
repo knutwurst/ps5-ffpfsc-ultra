@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.46"
+APP_VERSION = "1.0.47"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -454,6 +454,10 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     # uncompressed → full size) and, for archives, the known compressed source-set size.
     comp  = bool(getattr(item, "_output_compressed", True))
     known = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
+    if getattr(item, "_is_disk_image", False):
+        # Single-pass: mkpfs compresses the disk image directly — no inner image on temp,
+        # no spool. Only the output drive needs space for the final .ffpfsc.
+        return get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
     if getattr(item, "_extract_on_pool", False):
         # Two-fast-drive split: inner image on _build_temp (one SSD), extracted source on
         # _build_root (another SSD), final on the output drive. Check each independently.
@@ -2919,6 +2923,7 @@ class GameItem:
         obj.artwork      = None
         obj.status       = "Queued"
         obj.source_kind    = "inplace"   # disk image is read in place — no second copy
+        obj._is_disk_image = True        # single-pass: mkpfs compresses directly, no temp inner image
         obj.extracted_size = obj.size
         return obj
 
@@ -5891,6 +5896,23 @@ class App:
         out_free  = get_free_space(probe_out)
         szs = format_size(size) if size else "?"
         contention = " (output is the source drive: read+write contention, slower)" if out_is_source else ""
+
+        # ── Disk images (.exfat, .ffpkg): single-pass — mkpfs compresses the file
+        # directly to .ffpfsc without building a temp inner image.  Temp = irrelevant;
+        # only the output drive needs space for the final container. ──────────────────
+        if getattr(item, "_is_disk_image", False):
+            output_need = estimate_output_space_needed(size, comp_out, 0)
+            set_spread()   # _build_temp on the output drive (backend still needs a temp dir)
+            if size == 0 or out_free >= output_need:
+                if size > 0:
+                    _plog("INFO", f"Auto: {item.name} (~{szs}): disk image → single-pass "
+                                  f"to {out_dir} (~{format_size(output_need)} needed, "
+                                  f"{format_size(out_free)} free){contention}.")
+            else:
+                _plog("WARN", f"Auto: {item.name} (~{szs}): disk image needs "
+                              f"~{format_size(output_need)} on output drive, only "
+                              f"{format_size(out_free)} free — the space gate will skip/abort it.")
+            return spread_root
 
         if mode == "temp":
             if size and temp_free < image_need:

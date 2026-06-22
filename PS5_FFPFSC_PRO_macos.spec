@@ -43,6 +43,8 @@ a = Analysis(
         "mkpfs.utils",
         "mkpfs.logging",
         "mkpfs.pbar",
+        "make_fself",
+        "fake_sign",
         "argparse",
         "contextlib",
         "dataclasses",

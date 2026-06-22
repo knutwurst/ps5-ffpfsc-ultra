@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.48"
+APP_VERSION = "1.0.49"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1890,6 +1890,22 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkCheckBox(ds, text="Build via exFAT intermediate (macOS) — PSBrew's most-stable path",
                          variable=self.app.build_via_exfat_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
+        def _confirm_fake_sign():
+            # Warn once when ENABLING: every pack will then mutate the source folder
+            # in place (the toolbar button asks per-run; the setting is persistent).
+            if not self.app.fake_sign_before_pack_var.get():
+                return
+            if not messagebox.askyesno(
+                    "Fake-sign before packing?",
+                    "With this on, every pack of a game FOLDER will fake-sign its "
+                    "executables IN PLACE before packing — modifying your source files "
+                    "(already-signed files are skipped). Disk-image sources are unaffected.\n\n"
+                    "Enable this?"):
+                self.app.fake_sign_before_pack_var.set(False)
+        ctk.CTkCheckBox(ds, text="Fake-sign executables before packing (folder sources; in place)",
+                         variable=self.app.fake_sign_before_pack_var, fg_color=GREEN,
+                         hover_color=GREEN2, text_color=WHITE,
+                         command=_confirm_fake_sign).pack(anchor="w", padx=14, pady=(0, 4))
         ctk.CTkCheckBox(ds, text="Keep external drives spun-up during a run (bridges gaps between games)",
                          variable=self.app.keep_drives_awake_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
@@ -2955,6 +2971,102 @@ class GameItem:
         obj.source_kind    = "inplace"   # unpack op — no second copy on the build drive
         obj.extracted_size = obj.size
         return obj
+
+
+# ─── Fake-Sign Worker ───────────────────────────────────────────────────────────
+
+class FakeSignWorker(threading.Thread):
+    """One-off worker that runs ``cli.py --fake-sign <folder>`` and streams its
+    stdout into the Logs tab.
+
+    Deliberately NOT a CLIWorker: fake-signing is not a pack/unpack, so it must
+    not drive the pack progress stages or trigger pack-completion side effects
+    (output detection, history, AMPR cleanup, space gate, batch advance). It
+    only: spawns the backend, forwards each line via ``app.log()``, exposes its
+    process as ``app.current_process`` so the Cancel button can kill it, and
+    restores the buttons on the Tk thread when done."""
+
+    def __init__(self, app, folder, cmd, cwd):
+        super().__init__(daemon=True)
+        self.app = app
+        self.folder = folder
+        self.cmd = cmd
+        self.cwd = cwd
+        self.proc = None
+        # The main-thread poll loop (_tick_elapsed) reads worker.start_time every
+        # tick; without it the loop would raise and stall the Logs/status drains
+        # for the whole run. Mirror CLIWorker: 0 here, real clock in run().
+        self.start_time = 0
+
+    def run(self):
+        app = self.app
+        self.start_time = time.time()
+        app.log("INFO", f"{APP_NAME} {APP_VERSION} — Fake Sign")
+        app.log("INFO", f"Folder: {self.folder}")
+        app.log("CMD", " ".join(str(c) for c in self.cmd))
+        rc = 1
+        try:
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            self.proc = subprocess.Popen(
+                self.cmd,
+                cwd=str(self.cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                start_new_session=(os.name != "nt"),
+            )
+            app.current_process = self.proc
+            for line in self.proc.stdout:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                up = line.upper()
+                if "[ERROR]" in up or "[FAIL]" in up:
+                    tag = "ERROR"
+                elif "[WARN]" in up:
+                    tag = "WARN"
+                elif "[OK]" in up or "[DONE]" in up or "[SUCCESS]" in up:
+                    tag = "OK"
+                else:
+                    tag = "INFO"
+                app.log(tag, line)
+            rc = self.proc.wait()
+        except Exception as e:
+            app.log("ERROR", f"Fake-sign worker failed: {e}")
+            rc = 1
+        finally:
+            app.current_process = None
+
+        cancelled = bool(getattr(app, "cancel_requested", False))
+
+        def _finish():
+            try:
+                app.start_btn.configure(state="normal")
+                app.cancel_btn.configure(state="disabled")
+            except Exception:
+                pass
+            app.cancel_requested = False
+            if cancelled:
+                app.status_update("Cancelled", "Fake-sign cancelled.", "Complete", 0, 0, "00:00", "—", "—")
+                app.log("WARN", "Fake-sign cancelled by user.")
+            elif rc == 0:
+                app.status_update("Done", f"Fake-sign complete: {self.folder.name}",
+                                  "Complete", 100, 100, "00:00", "—", "—")
+            else:
+                app.status_update("Failed", "Fake-sign failed — see the Logs tab.",
+                                  "Complete", 0, 0, "00:00", "—", "—")
+                app.log("ERROR", f"Fake-sign exited with code {rc}.")
+
+        try:
+            app.root.after(0, _finish)
+        except Exception:
+            pass
 
 
 # ─── CLI Worker ────────────────────────────────────────────────────────────────
@@ -4391,6 +4503,7 @@ class App:
         self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
         self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
         self._button(self._toolbar, "🩹  Integrate Patch", self._open_patch_dialog, width=160).pack(side="right", padx=(0, 8))
+        self._button(self._toolbar, "🖊  Fake Sign (Folder)", self.fake_sign_folder, width=170).pack(side="right", padx=(0, 8))
         self._button(self._toolbar, "🔄  Converter", self.open_converter, green=True, width=130).pack(side="right", padx=(0, 8))
         self._update_format_label()
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
@@ -4409,6 +4522,8 @@ class App:
         # Opt-in: build an exFAT intermediate and compress that (PSBrew's most-stable
         # exfat->ffpfsc path) instead of the folder PFS builder. macOS only. Default off.
         self.build_via_exfat_var = self._persisted_bool(settings, "build_via_exfat", False)
+        # Opt-in: fake-sign a game folder's executables in place before packing it.
+        self.fake_sign_before_pack_var = self._persisted_bool(settings, "fake_sign_before_pack", False)
         # Keep external drives awake DURING A RUN only: a fast tiny flushed write so
         # bus-powered 2.5" USB HDDs (WD Elements) stay spun-up with heads LOADED across the
         # short gaps between games in a batch — so each game doesn't pay a fresh spinup. The
@@ -5126,6 +5241,53 @@ class App:
 
     def open_converter(self):
         ConverterDialog(self)
+
+    def fake_sign_folder(self):
+        """Pick a decrypted PS5 dump folder and fake-sign its executables in place
+        (eboot.bin / .elf / .prx / .sprx) by running `cli.py --fake-sign <folder>`
+        through a lightweight off-thread worker that streams to the Logs tab."""
+        if getattr(self, "_batch_running", False) or (getattr(self, "worker", None)
+                                                      and self.worker and self.worker.is_alive()):
+            messagebox.showinfo("Please wait",
+                                "A job is already running. Wait for it to finish or cancel it first.")
+            return
+        path = filedialog.askdirectory(
+            title="Select a PS5 game folder (or a parent folder of dumps) to fake-sign")
+        if not path:
+            return
+        folder = Path(path)
+        if not messagebox.askyesno(
+                "Fake Sign — in place",
+                f"Fake-sign every executable (eboot.bin, .elf, .prx, .sprx) under:\n\n{folder}\n\n"
+                "Files are modified IN PLACE. Already-signed files are skipped, so this is "
+                "safe to repeat. Continue?"):
+            return
+        try:
+            self.bottom_tabs.set("Logs")
+        except Exception:
+            pass
+        pycmd = get_backend_python_command()
+        if not pycmd:
+            messagebox.showerror("Python not found",
+                                 "No backend Python available to run the fake-signer.")
+            return
+        backend = backend_base_dir()
+        cli_py = backend / "cli.py"
+        # --fake-sign needs no positional source (the standalone mode returns before the
+        # game_folder guard), so the command is just the head + the flag + the folder.
+        head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
+        cmd = head + ["--fake-sign", str(folder)]
+        self._batch_total = 1; self._batch_done = 0; self._batch_failed = 0
+        self._batch_running = False
+        self._update_batch_counter()
+        self._last_cmd_str = " ".join(str(c) for c in cmd)
+        self.cancel_requested = False
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.status_update("Fake-signing", f"Fake-signing {folder.name}…",
+                           "Reading Game", 0, 0, "00:00", "—", "—")
+        self.worker = FakeSignWorker(self, folder, cmd, backend)
+        self.worker.start()
 
     def _queue_conversion(self, path: Path, action: str):
         """Add a converter job to the queue (the user then presses START — it reuses the
@@ -6657,6 +6819,17 @@ class App:
                 and getattr(item, "operation", "pack") == "pack"
                 and getattr(item, "path", None) and Path(item.path).is_dir()):
             cmd.append("--via-exfat")
+        # Opt-in: fake-sign the source folder's executables in place before packing.
+        # The backend applies this per folder-item (and warns-and-skips non-folder
+        # sources), so it is safe to pass for any pack job that isn't a patch job.
+        # AMPR items are EXCLUDED here: their fake-signing is done GUI-side inside
+        # _prepare_ampr BEFORE the ampr_emu.index is built, so the index records the
+        # final (signed) file sizes/mtimes. Letting the backend re-sign afterwards
+        # would invalidate that index.
+        if (self.fake_sign_before_pack_var.get() and not is_patch_job
+                and getattr(item, "operation", "pack") == "pack"
+                and not getattr(item, "ampr_emu", False)):
+            cmd.append("--fake-sign-first")
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() not in (".ffpfsc", ".ffpfs") else out.parent, temp
 
@@ -6844,6 +7017,22 @@ class App:
         except Exception as exc:
             self.log("WARN", f"AMPR: index build failed: {exc}")
 
+    def _fake_sign_folder_inproc(self, folder: Path) -> None:
+        """Run the recursive fake-signer over *folder* in this (main) thread, used
+        by the AMPR path so signing completes BEFORE the ampr_emu.index is built.
+        The backend's fake_sign module is pure-Python; import it directly rather
+        than spawning a subprocess so the index build can follow synchronously."""
+        backend = backend_base_dir()
+        if str(backend) not in sys.path:
+            sys.path.insert(0, str(backend))
+        try:
+            import fake_sign as _fs
+        except Exception as e:
+            self.log("ERROR", f"Fake-sign before AMPR failed to load: {e}")
+            return
+        self.log("INFO", f"Fake-signing {folder.name} before building the AMPR index…")
+        _fs.fake_sign_tree(str(folder), log=lambda m: self.log("INFO", m))
+
     def _prepare_ampr(self, item) -> None:
         """Right before packing an APR/PlayGo folder: ensure the emu folder, inject the
         .sprx into fakelib/, and build the index. No-op for non-APR games / disk images."""
@@ -6854,6 +7043,11 @@ class App:
             self.log("WARN", "AMPR: no emu folder set — packing WITHOUT AMPR support; this "
                              "APR title may not boot until you set the folder in Settings.")
             return
+        # If fake-signing is enabled, sign the game's executables FIRST so the index
+        # below records their final (signed) sizes/mtimes. The injected .sprx shims
+        # are added after this and are themselves already signed, so they're skipped.
+        if self.fake_sign_before_pack_var.get() and Path(item.path).is_dir():
+            self._fake_sign_folder_inproc(Path(item.path))
         self._inject_ampr_files(item)
         self._build_ampr_index(item)
 

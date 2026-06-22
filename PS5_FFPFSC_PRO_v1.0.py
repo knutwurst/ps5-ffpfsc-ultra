@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.47"
+APP_VERSION = "1.0.48"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -338,6 +338,18 @@ def archive_set_ondisk_size(archive: Path) -> int:
             return 0
 
 
+def _item_is_single_pass(item) -> bool:
+    """True for directly-supplied disk images (.exfat, .ffpkg, .ffpfs etc.) that are
+    compressed in a SINGLE pass by the backend — no inner image on the temp drive.
+    Derived purely from persistent attributes so it works after queue save/restore."""
+    try:
+        return (getattr(item, "source_kind", "") == "inplace"
+                and not getattr(item, "archive_path", None)
+                and Path(getattr(item, "path", "") or "").is_file())
+    except Exception:
+        return False
+
+
 def _build_size_of(item) -> int:
     """The honest EXTRACTED size to base space decisions on: the header-read extracted
     size when known, else item.size (already extracted for folders/disk images). For an
@@ -454,7 +466,7 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     # uncompressed → full size) and, for archives, the known compressed source-set size.
     comp  = bool(getattr(item, "_output_compressed", True))
     known = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
-    if getattr(item, "_is_disk_image", False):
+    if _item_is_single_pass(item):
         # Single-pass: mkpfs compresses the disk image directly — no inner image on temp,
         # no spool. Only the output drive needs space for the final .ffpfsc.
         return get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
@@ -5900,7 +5912,7 @@ class App:
         # ── Disk images (.exfat, .ffpkg): single-pass — mkpfs compresses the file
         # directly to .ffpfsc without building a temp inner image.  Temp = irrelevant;
         # only the output drive needs space for the final container. ──────────────────
-        if getattr(item, "_is_disk_image", False):
+        if _item_is_single_pass(item):
             output_need = estimate_output_space_needed(size, comp_out, 0)
             set_spread()   # _build_temp on the output drive (backend still needs a temp dir)
             if size == 0 or out_free >= output_need:

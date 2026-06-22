@@ -737,6 +737,18 @@ def _auto_cap_cpu(requested: int, source: Path) -> int:
         return 0   # stat failed — leave at mkpfs default
 
 
+def _fake_sign_tree(folder) -> dict:
+    """Recursively fake-sign every executable under *folder*, in place.
+
+    Thin wrapper around backend/fake_sign.py (which imports the vendored
+    make_fself). Routes the signer's per-file lines through print(..., flush=True)
+    so the GUI's stdout scraper shows them live. Returns the counts dict."""
+    if _CLI_DIR not in sys.path:
+        sys.path.insert(0, _CLI_DIR)
+    from fake_sign import fake_sign_tree
+    return fake_sign_tree(str(folder), log=lambda m: print(m, flush=True))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -789,8 +801,37 @@ def main() -> None:
     parser.add_argument("--patch-inplace", action="store_true",
                         help="The game folder is a throwaway temp extract — overlay in "
                              "place instead of copying it first.")
+    parser.add_argument("--fake-sign", type=str, default=None, metavar="DIR",
+                        help="FAKE-SIGN MODE: recursively fake-sign every executable "
+                             "(eboot.bin/.elf/.prx/.sprx) under DIR in place, then exit. "
+                             "Already-signed files are skipped (idempotent). No pack/unpack.")
+    parser.add_argument("--fake-sign-first", action="store_true",
+                        help="Before packing a game FOLDER, fake-sign its executables in "
+                             "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
 
     args = parser.parse_args()
+
+    # ── FAKE-SIGN MODE (standalone) ──────────────────────────────────────────────
+    # Pure folder operation: needs no game_folder positional, no mkpfs, no temp dirs.
+    # Handle it before everything else and exit (matching how PATCH/unpack end).
+    if args.fake_sign:
+        fs_dir = Path(args.fake_sign).resolve()
+        if not fs_dir.exists() or not fs_dir.is_dir():
+            print(f"[ERROR] Fake-sign target not found or not a folder: {fs_dir}", flush=True)
+            sys.exit(1)
+        print(f"[INFO] Fake-sign mode: {fs_dir}", flush=True)
+        try:
+            counts = _fake_sign_tree(fs_dir)
+        except Exception as e:
+            print(f"[ERROR] Fake-sign failed: {e}", flush=True)
+            sys.exit(1)
+        if counts.get("failed"):
+            print(f"\n[ERROR] Fake-sign finished with {counts['failed']} failure(s) — "
+                  f"see the lines above.", flush=True)
+            sys.exit(1)
+        print(f"\n[SUCCESS] Fake-signed {counts.get('signed', 0)} file(s); "
+              f"skipped {counts.get('skipped', 0)} non-ELF.", flush=True)
+        return
 
     # ── PS5 console compatibility: force a 64 KiB PFS block size ─────────────────
     # The PS5 reads PFS filesystems with the native 64 KiB (0x10000) logical block.
@@ -1081,6 +1122,21 @@ def main() -> None:
             src_pfs_family = item.is_dir() or item.suffix.lower() == ".ffpfs"
             uncompressed = getattr(args, "no_compress", False) and src_pfs_family
             ext = ".ffpfs" if uncompressed else ".ffpfsc"
+
+            # Opt-in: fake-sign the game's executables in place before packing. Only
+            # genuine game FOLDERS can be signed (we can't reach into an opaque disk
+            # image / PFS); warn-and-skip for those.
+            if getattr(args, "fake_sign_first", False):
+                if item.is_dir():
+                    print(f"[INFO] Fake-signing executables in {item.name} before packing…", flush=True)
+                    try:
+                        _fake_sign_tree(item)
+                    except Exception as e:
+                        print(f"[ERROR] Fake-sign before pack failed: {e}", flush=True)
+                        sys.exit(1)
+                else:
+                    print(f"[WARN] --fake-sign-first only applies to game folders; "
+                          f"ignoring for image/PFS source {item.name}.", flush=True)
 
             if (args.batch and not explicit_file) or ffpfs_path.is_dir():
                 current_ffpfs_path = ffpfs_path / f"{title_id}{ext}"

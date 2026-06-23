@@ -338,6 +338,11 @@ def _build_exfat_image(folder: Path, outdir: Path, title_id: str):
     if shutil.which("hdiutil") is None:
         print("[WARN] hdiutil not found; using the two-pass folder image instead.", flush=True)
         return None
+    # Strip any pre-existing OS junk from the source first; COPYFILE_DISABLE below
+    # only stops NEW AppleDouble sidecars, it won't drop ones already on disk.
+    _stripped = _strip_junk_files(folder)
+    if _stripped:
+        print(f"[INFO] Removed {_stripped} macOS/Windows junk file(s)/folder(s) before building exFAT.", flush=True)
     vol = (re.sub(r"[^A-Za-z0-9_]", "", (title_id or "PS5GAME"))[:15] or "PS5GAME")
     base = outdir / f"{title_id or 'game'}_exfat"
     out = outdir / f"{title_id or 'game'}.exfat"
@@ -475,6 +480,50 @@ def _fully_unwrap(out_dir: Path, mkpfs_cmd_base, mkpfs_cwd) -> None:
         return   # nothing single to unwrap (empty / multiple images)
 
 
+def _phase(name: str) -> None:
+    """Emit a machine-readable phase marker the GUI maps directly to its stage
+    tracker (with force=True, so multi-phase jobs like patch/convert — which
+    extract THEN repack — advance correctly instead of latching on 'Extracting').
+    The *name* must be a canonical GUI stage name."""
+    print(f"[PHASE] {name}", flush=True)
+
+
+# macOS / Windows metadata sidecars that must never be packed into a PFS image.
+# All are OS-generated junk, never game data — safe to delete unconditionally.
+_JUNK_FILE_NAMES = frozenset({
+    ".DS_Store", ".localized", ".AppleDouble", ".LSOverride", ".apdisk",
+    ".VolumeIcon.icns", "Thumbs.db", "ehthumbs.db", "desktop.ini",
+})
+_JUNK_DIR_NAMES = frozenset({
+    "__MACOSX", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems",
+    ".DocumentRevisions-V100", ".AppleDouble",
+})
+
+
+def _strip_junk_files(root: Path) -> int:
+    """Recursively remove macOS/Windows metadata junk from *root* so it never
+    lands in the PFS image: AppleDouble sidecars (``._*``), ``.DS_Store``,
+    Spotlight/Trash/fseventsd folders, ``Thumbs.db``/``desktop.ini``, etc. These
+    are OS-generated, never game files. Returns the number of entries removed.
+    (Also why a build can fail with structure-verify on: a stray .DS_Store.)"""
+    root = Path(root)
+    removed = 0
+    # topdown=False so we can rmtree junk dirs after their contents are handled.
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            if name.startswith("._") or name in _JUNK_FILE_NAMES:
+                try:
+                    os.remove(os.path.join(dirpath, name))
+                    removed += 1
+                except OSError:
+                    pass
+        for name in list(dirnames):
+            if name in _JUNK_DIR_NAMES:
+                shutil.rmtree(os.path.join(dirpath, name), ignore_errors=True)
+                removed += 1
+    return removed
+
+
 def pack_folder_uncompressed(
     game_folder: Path,
     pfs_path: Path,
@@ -489,6 +538,11 @@ def pack_folder_uncompressed(
     verbose: bool = False,
     temp_folder: Path | None = None,
 ) -> None:
+    # Never pack OS metadata junk (._*, .DS_Store, Spotlight/Trash dirs, …) into the
+    # image. Done here so EVERY folder-pack path (normal pack + patch repack) is covered.
+    _stripped = _strip_junk_files(game_folder)
+    if _stripped:
+        print(f"[INFO] Removed {_stripped} macOS/Windows junk file(s)/folder(s) before packing.", flush=True)
     print(f"[INFO] Packing folder {game_folder.name} to uncompressed PFS image {pfs_path.name}...")
     cmd = mkpfs_cmd_base + [
         "pack", "folder",
@@ -991,8 +1045,12 @@ def main() -> None:
                     print(f"[ERROR] Patch archive extraction failed ('{patch_arg.name}'): {exc} "
                           "(corrupt archive, or wrong/missing password)")
                     sys.exit(1)
+            # Temp intermediates we create and may free mid-flow so temp doesn't grow to
+            # ~3x the game size (only one of these layers is needed at a time).
+            temp_game_dir = None   # the extracted/copied game folder we own (None = patch_inplace)
             if game_folder.is_file() and game_folder.suffix.lower() == ".ffpfsc":
                 print("[INFO] Unpacking the existing .ffpfsc to patch it (outer → inner → files)...", flush=True)
+                _phase("Extracting")
                 outer = td / "_outer"
                 unpack_pfs_image(game_folder, outer, mkpfs_cmd_base, mkpfs_cwd, overwrite=True)
                 inner = next((p for p in sorted(outer.rglob("*"))
@@ -1003,6 +1061,11 @@ def main() -> None:
                 game_unpacked = td / "_game"
                 unpack_pfs_image(inner, game_unpacked, mkpfs_cmd_base, mkpfs_cwd, overwrite=True)
                 game_root = _patch_find_game_root(game_unpacked)
+                temp_game_dir = game_unpacked
+                # The inner .ffpfs (inside _outer) is now fully extracted into _game and is
+                # no longer needed — drop it to reclaim ~1x the game size before we repack.
+                shutil.rmtree(outer, ignore_errors=True)
+                print("[INFO] Freed the intermediate outer image (no longer needed).", flush=True)
             elif game_folder.is_dir():
                 if args.patch_inplace:
                     game_root = _patch_find_game_root(game_folder)
@@ -1011,6 +1074,7 @@ def main() -> None:
                     game_copy = td / "_game"
                     shutil.copytree(game_folder, game_copy)
                     game_root = _patch_find_game_root(game_copy)
+                    temp_game_dir = game_copy
             else:
                 print(f"[ERROR] Patch game must be a folder or a .ffpfsc: {game_folder}")
                 sys.exit(1)
@@ -1031,10 +1095,18 @@ def main() -> None:
             title_id = _patch_dir_title_id(game_root) or "patched"
             with tempfile.TemporaryDirectory(dir=user_temp) as td2:
                 temp_pfs = Path(td2) / f"{title_id}.ffpfs"
+                _phase("Creating Temp PFS")
                 pack_folder_uncompressed(
                     game_root, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
                     verify_enabled=args.verify, temp_folder=Path(td2), **patch_pack_kwargs,
                 )
+                # Pass 1 has consumed the patched game folder into temp_pfs; pass 2 reads
+                # only temp_pfs. Drop the (temp) game folder now to reclaim ~1x the game
+                # size before compression. Never touch a patch_inplace source (temp_game_dir
+                # is None then) — that's the user's own library folder.
+                if temp_game_dir is not None:
+                    shutil.rmtree(temp_game_dir, ignore_errors=True)
+                    print("[INFO] Freed the extracted game folder (no longer needed for compression).", flush=True)
                 pass2_kwargs = dict(patch_pack_kwargs)
                 if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
                     print("[INFO] Patched image sampled as incompressible — storing without compression.", flush=True)
@@ -1044,6 +1116,7 @@ def main() -> None:
                         ffpfs_path.unlink()
                     except Exception:
                         pass
+                _phase("Compressing")
                 spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, td2, ffpfs_path, spill_base=user_spill)
                 try:
                     _assert_pass2_spool_space(temp_pfs, spool_dir)

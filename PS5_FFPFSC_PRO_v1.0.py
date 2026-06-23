@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.54"
+APP_VERSION = "1.0.55"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2879,6 +2879,7 @@ class GameItem:
     # always have these attributes even when an older saved queue predates them.
     ampr_emu = False        # PlayGo/APR title? (auto-detected)
     output_path = None      # per-job output folder/file snapshot; None → use the global Output
+    output_compressed = None # per-job format: True=.ffpfsc, False=.ffpfs; None → not yet set
     patch_source = None     # patch dir/archive (operation == "patch")
     patch_overwrite = False # patch: overwrite the source .ffpfsc in place vs a "[patched]" copy
     patch_inplace = False   # patch: overlay onto a throwaway temp extract (archive game source)
@@ -3927,20 +3928,21 @@ class PackDialog(ctk.CTkToplevel):
         super().__init__(app.root)
         self.app = app
         self.title("Pack — add job to queue")
-        self.geometry("620x340")
+        self.geometry("620x410")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
         self.src_var = tk.StringVar()
         self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
+        self.fmt_compressed = tk.BooleanVar(value=bool(app.output_compressed_var.get()))
+        self.fmt_hint = tk.StringVar()
 
         ctk.CTkLabel(self, text="📦  Pack — add job",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs "
-                                "into a .ffpfsc — to its own output folder. The .ffpfsc/.ffpfs format "
-                                "is the toggle at the top of the main window. Adds a job to the queue.",
+        ctk.CTkLabel(self, text="Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs — "
+                                "to its own output folder and format. Adds a job to the queue.",
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
@@ -3963,6 +3965,17 @@ class PackDialog(ctk.CTkToplevel):
                       placeholder_text="choose where this job's output goes").pack(side="left", fill="x", expand=True)
         ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_out).pack(side="left", padx=(6, 0))
+
+        frow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); frow.pack(fill="x", padx=20, pady=4)
+        finner = ctk.CTkFrame(frow, fg_color=PANEL); finner.pack(fill="x", padx=10, pady=8)
+        ctk.CTkLabel(finner, text="Format:", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 10))
+        ctk.CTkSwitch(finner, text="", width=46, variable=self.fmt_compressed,
+                       onvalue=True, offvalue=False, progress_color=GREEN,
+                       command=self._on_fmt).pack(side="left")
+        ctk.CTkLabel(finner, textvariable=self.fmt_hint, text_color=WHITE,
+                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
+        self._on_fmt()
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
         ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
@@ -3993,6 +4006,10 @@ class PackDialog(ctk.CTkToplevel):
         if p:
             self.out_var.set(p)
 
+    def _on_fmt(self):
+        self.fmt_hint.set("📦 Compressed (.ffpfsc, smaller)" if self.fmt_compressed.get()
+                          else "⚡ Uncompressed (.ffpfs, faster)")
+
     def _add(self):
         s = self.src_var.get().strip()
         if not s:
@@ -4008,9 +4025,14 @@ class PackDialog(ctk.CTkToplevel):
         if not outf:
             messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
         # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
-        # image / .ffpfs and queues the right pack item. Setting output_var makes this the
-        # output snapshotted onto the item (per-job) AND the remembered default next time.
+        # image / .ffpfs and queues the right pack item. Setting output_var + the format var
+        # makes this job's output + format the values snapshotted onto the item (per-job),
+        # and the remembered defaults the next submenu pre-fills.
         self.app.output_var.set(outf)
+        try:
+            self.app.output_compressed_var.set(bool(self.fmt_compressed.get()))
+        except Exception:
+            pass
         self.app.source_var.set(s)
         try:
             self.app.unpack_mode_var.set(False)
@@ -4636,21 +4658,15 @@ class App:
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
         # AMPR/APR emu folder (PlayGo titles): holds libSceAmpr.sprx + libScePlayGo.sprx.
         self.ampr_var = tk.StringVar(value=settings.get("ampr_folder", ""))
-        # Toolbar (header row 2): a slide switch sets the Output format for the WHOLE queue
-        # (ON = compressed .ffpfsc, OFF = uncompressed .ffpfs); the label states which.
-        ctk.CTkLabel(self._toolbar, text="Output", text_color=MUTED,
-                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 8))
-        ctk.CTkSwitch(self._toolbar, text="", width=46, variable=self.output_compressed_var,
-                       onvalue=True, offvalue=False, progress_color=GREEN,
-                       command=self._on_format_toggle).pack(side="left")
-        self.format_hint_var = tk.StringVar()
-        ctk.CTkLabel(self._toolbar, textvariable=self.format_hint_var, text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
+        # The Output FORMAT (.ffpfsc vs .ffpfs) is chosen PER JOB in the Pack submenu now —
+        # a global switch was misleading (you couldn't tell which job it applied to).
+        # output_compressed_var persists the last choice as the default the submenu pre-fills.
+        ctk.CTkLabel(self._toolbar, text="Build jobs into .ffpfsc / .ffpfs — format is set per job",
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 0))
         # Tools, grouped on the right. (Job entry points — Pack/Convert/Patch/Sign —
-        # now live in the 'Add job' bar below, so they're no longer duplicated here.)
+        # live in the 'Add job' bar below.)
         self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
         self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
-        self._update_format_label()
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
         # Auto-patch: when a release folder holds a base game plus a clearly-smaller
@@ -4705,18 +4721,8 @@ class App:
         ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image to add a Pack job",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
-        # Output is chosen PER JOB (in each job's submenu); only Temp is shared/universal,
-        # so the bar shows just Temp. (output_var still exists as the remembered default
-        # each submenu pre-fills.)
-        iorow = ctk.CTkFrame(top, fg_color="transparent")
-        iorow.pack(fill="x", padx=14, pady=(0, 12))
-        ctk.CTkLabel(iorow, text="TEMP", text_color=WHITE,
-                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 6))
-        ctk.CTkEntry(iorow, textvariable=self.temp_var, placeholder_text="Shared temp folder on a fast drive…",
-                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._button(iorow, "Browse", self.browse_temp_folder, width=78).pack(side="left", padx=(0, 12))
-        ctk.CTkLabel(iorow, text="Output is set per job", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).pack(side="left")
+        # Output + format are per job (each submenu); the shared Temp folder lives in
+        # Settings → Default Temp Folder. So the job bar needs no Output/Temp fields here.
 
         # ── Vertical split: content area (top) ↕ log/tabs area (bottom). A horizontal
         #    divider the user drags up/down to grow or shrink the log; its position
@@ -6018,8 +6024,10 @@ class App:
         archive = getattr(item, "archive_path", None)
         # Record the output format so the space gate sizes the OUTPUT-drive reservation
         # correctly (compressed .ffpfsc → realistic; uncompressed .ffpfs → full size).
+        # Honour the per-job format when set, else the remembered default.
         try:
-            item._output_compressed = bool(self.output_compressed_var.get())
+            _pj = getattr(item, "output_compressed", None)
+            item._output_compressed = bool(self.output_compressed_var.get() if _pj is None else _pj)
         except Exception:
             item._output_compressed = True
         temp_base = self.temp_var.get().strip()
@@ -6658,11 +6666,13 @@ class App:
         # with (patch/sign set their own; fake-sign has none). Runs right after an item is
         # appended (update_queue_box is called then), capturing the output at add time.
         _gout = (self.output_var.get() or "").strip()
-        if _gout:
-            for _it in self.queue:
-                if (getattr(_it, "output_path", None) is None
-                        and getattr(_it, "operation", "pack") in ("pack", "unpack")):
-                    _it.output_path = Path(_gout)
+        for _it in self.queue:
+            _op = getattr(_it, "operation", "pack")
+            if _gout and getattr(_it, "output_path", None) is None and _op in ("pack", "unpack"):
+                _it.output_path = Path(_gout)
+            # Format is per-job: snapshot the current default onto a pack item once.
+            if _op == "pack" and getattr(_it, "output_compressed", None) is None:
+                _it.output_compressed = bool(self.output_compressed_var.get())
         self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
         if select_item is None:
@@ -6855,7 +6865,10 @@ class App:
             src_pfs_family = _ip.is_dir() or _ip.suffix.lower() == ".ffpfs"
         except Exception:
             src_pfs_family = False
-        self._cmd_uncompressed = (op == "pack") and src_pfs_family and not self.output_compressed_var.get()
+        _comp = getattr(item, "output_compressed", None)
+        if _comp is None:
+            _comp = self.output_compressed_var.get()
+        self._cmd_uncompressed = (op == "pack") and src_pfs_family and not _comp
         out_ext = ".ffpfs" if self._cmd_uncompressed else ".ffpfsc"
         explicit_file = out.suffix.lower() in (".ffpfsc", ".ffpfs")
         sub = getattr(item, "bundle_subfolder", None)

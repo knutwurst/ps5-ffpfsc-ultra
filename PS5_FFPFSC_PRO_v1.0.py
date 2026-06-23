@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.51"
+APP_VERSION = "1.0.52"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -343,7 +343,11 @@ def _item_is_single_pass(item) -> bool:
     compressed in a SINGLE pass by the backend — no inner image on the temp drive.
     Derived purely from persistent attributes so it works after queue save/restore."""
     try:
-        return (getattr(item, "source_kind", "") == "inplace"
+        # Only a PACK of a single image file is single-pass. A patch job also has a
+        # .ffpfsc file path + inplace source_kind, but it extracts AND repacks (needs
+        # temp) — so it must NOT be treated as single-pass. unpack/fake-sign likewise.
+        return (getattr(item, "operation", "pack") == "pack"
+                and getattr(item, "source_kind", "") == "inplace"
                 and not getattr(item, "archive_path", None)
                 and Path(getattr(item, "path", "") or "").is_file())
     except Exception:
@@ -4019,7 +4023,7 @@ class PatchDialog(ctk.CTkToplevel):
         super().__init__(app.root)
         self.app = app
         self.title("Integrate Patch into Game")
-        self.geometry("640x360")
+        self.geometry("640x450")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
@@ -4027,11 +4031,13 @@ class PatchDialog(ctk.CTkToplevel):
         self.game_var = tk.StringVar()
         self.patch_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="new")
+        self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
 
         ctk.CTkLabel(self, text="🩹  Integrate Patch into Game",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Unpacks the game, overlays the patch files (overwrite + new), and repacks.",
+        ctk.CTkLabel(self, text="Unpacks the game, overlays the patch files (overwrite + new), and repacks. "
+                                "Adds a patch job to the queue — press ▶ START to run it.",
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         self._file_row("Game  (.ffpfsc, folder, or archive):", self.game_var,
@@ -4046,8 +4052,17 @@ class PatchDialog(ctk.CTkToplevel):
         ctk.CTkRadioButton(mode_row, text="Overwrite original", variable=self.mode_var,
                             value="overwrite", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
 
+        out_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); out_row.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(out_row, text="Output folder  (for the [patched] copy):", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        out_inner = ctk.CTkFrame(out_row, fg_color=PANEL); out_inner.pack(fill="x", padx=10, pady=(2, 8))
+        ctk.CTkEntry(out_inner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
+                      placeholder_text="defaults to the game's folder").pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(out_inner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=lambda: self._pick_dir(self.out_var)).pack(side="left", padx=(6, 0))
+
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="▶  Start patch", fg_color=GREEN, hover_color=GREEN2,
+        ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
                        command=self._go).pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
@@ -4078,9 +4093,38 @@ class PatchDialog(ctk.CTkToplevel):
         if not g or not p:
             messagebox.showerror("Missing", "Please select BOTH a game and a patch.", parent=self)
             return
+        game, patch = Path(g), Path(p)
+        if not game.exists():
+            messagebox.showerror("Not found", f"Game not found:\n{game}", parent=self); return
+        if not patch.exists():
+            messagebox.showerror("Not found", f"Patch not found:\n{patch}", parent=self); return
+        # v1 queue scope: game must be a folder or .ffpfsc; patch a folder / .zip / .rar
+        # (the backend extracts zip/rar patches itself). Archive GAMES and .7z patches
+        # still need the pre-extract path — not yet wired into the queue.
+        gsfx = game.suffix.lower()
+        if not (game.is_dir() or gsfx == ".ffpfsc"):
+            messagebox.showerror(
+                "Unsupported game source",
+                "For a queued patch job the game must be a FOLDER or a .ffpfsc.\n\n"
+                "Extract the game archive to a folder first, then queue the patch.",
+                parent=self); return
+        psfx = patch.suffix.lower()
+        if not (patch.is_dir() or psfx in (".zip", ".rar")):
+            messagebox.showerror(
+                "Unsupported patch source",
+                "For a queued patch job the patch must be a FOLDER, .zip or .rar.\n\n"
+                "Extract a .7z patch to a folder first, then queue it.",
+                parent=self); return
         overwrite = self.mode_var.get() == "overwrite"
+        out_folder = self.out_var.get().strip()
+        out_path = Path(out_folder) if out_folder else game.parent
+        item = GameItem.from_patch(game, patch, output_path=out_path, overwrite=overwrite)
         self.destroy()
-        self.app._start_patch(g, p, overwrite)
+        self.app.queue.append(item)
+        self.app.update_queue_box(select_item=item)
+        self.app.log("OK", f"Patch job queued: {item.name}.  Press ▶ START to run.")
+        self.app.status_update("Ready", f"Patch queued: {item.name} — press START.",
+                               "Ready", 0, 0, "00:00", "—", "—")
 
 
 class ConverterDialog(ctk.CTkToplevel):
@@ -5343,51 +5387,29 @@ class App:
         ConverterDialog(self)
 
     def fake_sign_folder(self):
-        """Pick a decrypted PS5 dump folder and fake-sign its executables in place
-        (eboot.bin / .elf / .prx / .sprx) by running `cli.py --fake-sign <folder>`
-        through a lightweight off-thread worker that streams to the Logs tab."""
-        if getattr(self, "_batch_running", False) or (getattr(self, "worker", None)
-                                                      and self.worker and self.worker.is_alive()):
-            messagebox.showinfo("Please wait",
-                                "A job is already running. Wait for it to finish or cancel it first.")
-            return
+        """Fake Sign job: pick a decrypted PS5 dump folder and ADD it to the queue as a
+        fake-sign job (eboot.bin / .elf / .prx / .sprx are signed in place when it runs).
+        Press START to run — like every other job type."""
         path = filedialog.askdirectory(
             title="Select a PS5 game folder (or a parent folder of dumps) to fake-sign")
         if not path:
             return
         folder = Path(path)
+        if not folder.is_dir():
+            messagebox.showerror("Not a folder", f"This is not a folder:\n{folder}")
+            return
         if not messagebox.askyesno(
                 "Fake Sign — in place",
-                f"Fake-sign every executable (eboot.bin, .elf, .prx, .sprx) under:\n\n{folder}\n\n"
-                "Files are modified IN PLACE. Already-signed files are skipped, so this is "
-                "safe to repeat. Continue?"):
+                f"Queue a fake-sign job for:\n\n{folder}\n\n"
+                "When it runs it modifies the executables IN PLACE (already-signed files are "
+                "skipped, so it is safe to repeat). Add to queue?"):
             return
-        try:
-            self.bottom_tabs.set("Logs")
-        except Exception:
-            pass
-        pycmd = get_backend_python_command()
-        if not pycmd:
-            messagebox.showerror("Python not found",
-                                 "No backend Python available to run the fake-signer.")
-            return
-        backend = backend_base_dir()
-        cli_py = backend / "cli.py"
-        # --fake-sign needs no positional source (the standalone mode returns before the
-        # game_folder guard), so the command is just the head + the flag + the folder.
-        head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
-        cmd = head + ["--fake-sign", str(folder)]
-        self._batch_total = 1; self._batch_done = 0; self._batch_failed = 0
-        self._batch_running = False
-        self._update_batch_counter()
-        self._last_cmd_str = " ".join(str(c) for c in cmd)
-        self.cancel_requested = False
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="normal")
-        self.status_update("Fake-signing", f"Fake-signing {folder.name}…",
-                           "Reading Game", 0, 0, "00:00", "—", "—")
-        self.worker = FakeSignWorker(self, folder, cmd, backend)
-        self.worker.start()
+        item = GameItem.from_fake_sign(folder)
+        self.queue.append(item)
+        self.update_queue_box(select_item=item)
+        self.log("OK", f"Fake-sign queued: {folder.name}.  Press ▶ START to run.")
+        self.status_update("Ready", f"Fake-sign queued: {folder.name} — press START.",
+                            "Ready", 0, 0, "00:00", "—", "—")
 
     def _queue_conversion(self, path: Path, action: str):
         """Add a converter job to the queue (the user then presses START — it reuses the
@@ -6637,6 +6659,16 @@ class App:
         though the listbox selection is stale).  When omitted the previously
         selected item is looked up by object identity; falls back to row 0.
         """
+        # Per-job output: snapshot the current global Output onto any pack/convert item
+        # that doesn't already carry one, so each queued job keeps the output it was added
+        # with (patch/sign set their own; fake-sign has none). Runs right after an item is
+        # appended (update_queue_box is called then), capturing the output at add time.
+        _gout = (self.output_var.get() or "").strip()
+        if _gout:
+            for _it in self.queue:
+                if (getattr(_it, "output_path", None) is None
+                        and getattr(_it, "operation", "pack") in ("pack", "unpack")):
+                    _it.output_path = Path(_gout)
         self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
         if select_item is None:
@@ -6656,12 +6688,21 @@ class App:
         total = sum(x.size for x in self.queue)
         for i, item in enumerate(self.queue):
             prefix = "▶ " if (self._batch_running and i == 0) else f"{i + 1}. "
-            op = "UNPACK" if getattr(item, "operation", "pack") == "unpack" else "PACK"
-            # Archives store the COMPRESSED set size in .size; show the EXTRACTED size
-            # (what space/placement actually use), tagged with ~ as a header estimate.
-            _szs = (f"~{format_size(display_size(item))} unpacked"
-                    if shows_extracted_size(item) else format_size(item.size))
-            line = f"{prefix}{op}  {item.title_id}  {item.name}  [{_szs}]  {item.status}"
+            opn = getattr(item, "operation", "pack")
+            badge = {"unpack": "CONVERT", "patch": "PATCH ",
+                     "fake-sign": "SIGN   "}.get(opn, "PACK   ")
+            # Per-job detail: jobs that don't have a meaningful source size show their
+            # target/mode instead of "0 B".
+            if opn == "fake-sign":
+                detail = "in place"
+            elif opn == "patch":
+                detail = "overwrite" if getattr(item, "patch_overwrite", False) else "→ [patched]"
+            else:
+                # Archives store the COMPRESSED set size in .size; show the EXTRACTED size
+                # (what space/placement actually use), tagged with ~ as a header estimate.
+                detail = (f"~{format_size(display_size(item))} unpacked"
+                          if shows_extracted_size(item) else format_size(item.size))
+            line = f"{prefix}{badge}  {item.title_id}  {item.name}  [{detail}]  {item.status}"
             self.queue_listbox.insert("end", line)
             if self._batch_running and i == 0:
                 self.queue_listbox.itemconfig(i, fg="#4ade80")
@@ -6690,7 +6731,8 @@ class App:
     def update_game_details(self, item):
         self._details_item = item   # record before any call that might raise
         self.game_name_var.set(f"Name: {item.name}")
-        mode = "Unpack" if getattr(item, "operation", "pack") == "unpack" else "Pack"
+        mode = {"unpack": "Convert", "patch": "Integrate patch",
+                "fake-sign": "Fake sign"}.get(getattr(item, "operation", "pack"), "Pack")
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")
         self.source_detail_var.set(f"Source: {item.path}")
         if shows_extracted_size(item):

@@ -2871,7 +2871,15 @@ def scan_parent_for_bundles(parent: Path, candidate_passwords=None, log_fn=None,
 
 
 class GameItem:
-    ampr_emu = False   # class-level default — guards history/from_* items built via __new__
+    # Class-level defaults so items built via __new__ (from_*, history, restored queue)
+    # always have these attributes even when an older saved queue predates them.
+    ampr_emu = False        # PlayGo/APR title? (auto-detected)
+    output_path = None      # per-job output folder/file snapshot; None → use the global Output
+    patch_source = None     # patch dir/archive (operation == "patch")
+    patch_overwrite = False # patch: overwrite the source .ffpfsc in place vs a "[patched]" copy
+    patch_inplace = False   # patch: overlay onto a throwaway temp extract (archive game source)
+    unwrap = True           # convert/unpack: True = unwrap to a folder, False = stop at inner .ffpfs
+
     def __init__(self, path: Path):
         self.path       = path
         self.archive_path: Path | None = None   # set for archive placeholders
@@ -2970,6 +2978,49 @@ class GameItem:
         obj.status       = "Queued"
         obj.source_kind    = "inplace"   # unpack op — no second copy on the build drive
         obj.extracted_size = obj.size
+        return obj
+
+    @classmethod
+    def from_fake_sign(cls, folder: Path) -> "GameItem":
+        """Job that recursively fake-signs the executables in *folder* in place."""
+        obj              = cls.__new__(cls)
+        obj.path         = folder
+        obj.archive_path = None
+        obj.operation    = "fake-sign"
+        obj.name         = folder.name
+        obj.title_id     = parse_title_id(folder) or "🖊"
+        obj.size         = 0
+        obj.files        = 0
+        obj.artwork      = None
+        obj.status       = "Queued"
+        obj.source_kind    = "inplace"   # signs in place — no second copy
+        obj.extracted_size = 0
+        return obj
+
+    @classmethod
+    def from_patch(cls, game: Path, patch: Path, *, output_path=None,
+                   overwrite: bool = False, inplace: bool = False) -> "GameItem":
+        """Job that overlays *patch* onto *game* (a .ffpfsc / folder / archive) and
+        repacks. Archives are resolved when the job reaches the front of the queue."""
+        obj              = cls.__new__(cls)
+        obj.path         = game
+        obj.archive_path = None
+        obj.operation    = "patch"
+        obj.name         = (game.stem if game.suffix.lower() == ".ffpfsc" else game.name)
+        try:
+            obj.title_id = parse_title_id(game) or "🩹"
+        except Exception:
+            obj.title_id = "🩹"
+        obj.size         = 0
+        obj.files        = 0
+        obj.artwork      = None
+        obj.status       = "Queued"
+        obj.source_kind    = "inplace"
+        obj.extracted_size = 0
+        obj.patch_source    = patch
+        obj.output_path     = output_path
+        obj.patch_overwrite = bool(overwrite)
+        obj.patch_inplace   = bool(inplace)
         return obj
 
 
@@ -3186,7 +3237,9 @@ class CLIWorker(threading.Thread):
         self.app.log("INFO", f"{APP_NAME} {APP_VERSION} started")
         self.app.log("INFO", f"Backend: {BACKEND_NAME}")
         self.app.log("INFO", f"MkPFS: {MKPFS_NAME} v{MKPFS_VERSION}")
-        self.app.log("INFO", f"Operation: {'Unpack' if self.operation == 'unpack' else 'Pack'}")
+        _op_label = {"unpack": "Unpack", "patch": "Integrate patch",
+                     "fake-sign": "Fake sign"}.get(self.operation, "Pack")
+        self.app.log("INFO", f"Operation: {_op_label}")
         self.app.log("INFO", f"Game: {self.item.title_id} | {self.item.name}")
         self.app.log("INFO", f"Original: {format_size(self.item.size)} | Files: {self.item.files}")
         self.app.log("INFO", f"Backend Python: {' '.join(get_backend_python_command()) or 'NOT FOUND'}")
@@ -3312,6 +3365,15 @@ class CLIWorker(threading.Thread):
                 self.temp_peak_size = max(self.temp_peak_size, get_folder_size(self.temp_dir))
             except Exception:
                 pass
+
+            # Fake-sign produces NO new output file (it rewrites executables in place),
+            # so the output-detection / bundle / ShadowMount checks below don't apply —
+            # a clean exit 0 is success.
+            if self.operation == "fake-sign":
+                self._write_report(True)
+                self.app.finish(True, "Fake-signing completed successfully.", self.last_cmd_str)
+                return
+
             if not self._find_output():
                 self._write_report(False)
                 expected = "extracted output folder" if self.operation == "unpack" else "new .ffpfsc output"
@@ -6496,7 +6558,7 @@ class App:
         self.update_queue_box()
 
     # GameItem fields that hold a Path (everything else is str/int/None and JSON-safe).
-    _QUEUE_PATH_FIELDS = ("path", "archive_path", "bundle_dir", "patch_source")
+    _QUEUE_PATH_FIELDS = ("path", "archive_path", "bundle_dir", "patch_source", "output_path")
 
     def _save_queue(self):
         """Persist the current queue (paths + metadata, minus the PIL artwork and the
@@ -6737,7 +6799,10 @@ class App:
         self.command_label.configure(text=" ".join(f'"{x}"' if " " in x else x for x in cmd))
 
     def build_command(self, item):
-        out = Path(self.output_var.get().strip())
+        # Per-job output: each queued job can carry its own output target (snapshotted
+        # when it was added); fall back to the current global Output folder otherwise.
+        _job_out = getattr(item, "output_path", None)
+        out = Path(str(_job_out)) if _job_out else Path(self.output_var.get().strip())
         # Give every pack job a findable, descriptive, collision-resistant output name
         # "<Game> [v<ver>] [<TITLEID>].ffpfsc" when the user picked an output FOLDER.
         # The backend honours an explicit .ffpfsc path (it only auto-names by title id
@@ -6779,6 +6844,52 @@ class App:
         pycmd = get_backend_python_command()
         if not pycmd:
             raise RuntimeError("Python was not found. Install Python, or run the app from source.")
+
+        # ── FAKE-SIGN job ────────────────────────────────────────────────────
+        if op == "fake-sign":
+            head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
+            cmd = head + ["--fake-sign", str(item.path)]
+            return cmd, backend, Path(item.path), temp
+
+        # ── PATCH job (manual Integrate Patch as a queue item) ───────────────
+        if op == "patch":
+            game = Path(item.path)
+            patch_src = getattr(item, "patch_source", None)
+            if not patch_src:
+                raise RuntimeError("Patch job has no patch source.")
+            if getattr(item, "patch_overwrite", False) and game.suffix.lower() == ".ffpfsc":
+                pout = game                                  # patch the .ffpfsc in place
+            else:
+                stem = game.stem if game.suffix.lower() == ".ffpfsc" else game.name
+                pout = out / f"{sanitize_filename(stem)} [patched].ffpfsc"
+            try:
+                pout.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            head = (pycmd + [str(game), str(pout)] if getattr(sys, "frozen", False)
+                    else pycmd + ["-u", str(cli_py), str(game), str(pout)])
+            cmd = head + ["--patch", str(patch_src), "--overwrite"]
+            if getattr(item, "patch_inplace", False):
+                cmd.append("--patch-inplace")
+            bt = getattr(item, "_build_temp", None)
+            tstr = str(Path(bt)) if bt else str(temp)
+            if tstr:
+                cmd += ["--temp-dir", tstr]
+            _cl = self.compression_level_var.get()
+            if _cl != 7:
+                cmd += ["--compression-level", str(_cl)]
+            _cpu = getattr(item, "_cpu_retry_override", None)
+            if _cpu is None:
+                _cpu = self.cpu_count_var.get()
+            if _cpu:
+                cmd += ["--cpu-count", str(_cpu)]
+            _bs = self.block_size_var.get()
+            if _bs and _bs != "auto":
+                cmd += ["--block-size", _bs]
+            if self.verbose_var.get():
+                cmd.append("--verbose")
+            return cmd, backend, pout.parent, temp
+
         if getattr(sys, "frozen", False):
             cmd = pycmd + [str(item.path), str(out)]
         else:
@@ -6843,7 +6954,7 @@ class App:
         # OUTPUT ROOT (a big drive). The backend writes the spool under <root>/_ffpfsc_temp,
         # which the startup sweep and failure cleanup already reclaim. Lets a big game keep
         # its inner image on the fast SSD instead of falling entirely onto the HDD.
-        out_root = self.output_var.get().strip()
+        out_root = str(_job_out) if _job_out else self.output_var.get().strip()
         if out_root:
             cmd += ["--spool-fallback-dir", out_root]
         # Auto-patch: overlay a detected patch sibling onto the game before packing,
@@ -7318,7 +7429,10 @@ class App:
         (ask / auto / skip) and the diagnostics-dialog toggle. Honest extracted size +
         per-kind factor + safety factor feed the check, so a game that fits a drive (the
         big HDD) is routed there and proceeds; only a game that fits NO drive is skipped."""
-        if getattr(item, "operation", "pack") == "unpack":
+        op = getattr(item, "operation", "pack")
+        # Unpack writes to the output drive only; fake-sign rewrites in place (no temp,
+        # no new output). Neither needs the pack space gate — let them through.
+        if op in ("unpack", "fake-sign"):
             return "proceed"
         out_dir = Path(out_dir)
         try:
@@ -8707,7 +8821,9 @@ class App:
                 # Auto-fill compatibility form with completed game data
                 _final_sz = getattr(self.worker, "final_size", 0) if self.worker else 0
                 completed_operation = getattr(completed_item, "operation", "pack") if completed_item else "pack"
-                if completed_operation != "unpack":
+                # Compat form + history apply only to jobs that PRODUCE a .ffpfsc (pack,
+                # patch). Unpack and fake-sign create no packed game → skip them.
+                if completed_operation not in ("unpack", "fake-sign"):
                     self._compat_autofill(item=completed_item, final_size=_final_sz)
                     # Record history HERE (main thread) — add_history mutates Tk widgets.
                     try:
@@ -8751,7 +8867,7 @@ class App:
 
                 # Prompt user to share compatibility data — only if enabled, and never
                 # stacked on top of the summary popup (wait until no modal is grabbing).
-                if completed_operation != "unpack" and self.compat_prompt_var.get():
+                if completed_operation not in ("unpack", "fake-sign") and self.compat_prompt_var.get():
                     def _share_when_free(_i=completed_item, _s=_final_sz):
                         try:
                             if self.root.grab_current() is not None:

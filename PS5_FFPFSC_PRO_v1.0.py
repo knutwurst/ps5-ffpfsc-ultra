@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.49"
+APP_VERSION = "1.0.50"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3084,6 +3084,24 @@ class CLIWorker(threading.Thread):
         "Complete":            (100, 100),
     }
 
+    # A PATCH/auto-patch job runs the backend's PATCH MODE: it EXTRACTS the source
+    # first (one or two unpack passes) and THEN repacks (pass-1 build → pass-2
+    # compress). The normal WEIGHTS put "Extracting" at 18-93%, which makes the bar
+    # shoot to 93% during the extract and then jump BACKWARD when repacking starts.
+    # These weights order the bands the way a patch actually runs, so progress only
+    # ever moves forward. Selected when "--patch" is in the command.
+    PATCH_WEIGHTS = {
+        "Scanning Files":      (0,    2),
+        "Extracting":          (2,   40),   # outer→inner→files unpack(s)
+        "Reading Game":        (40,  42),   # overlay / prep
+        "Creating Temp PFS":   (42,  64),   # pass-1: build patched PFS image
+        "Compressing":         (64,  92),   # pass-2: compress to .ffpfsc
+        "Writing Final Image": (92,  98),
+        "Verifying Output":    (98,  99),
+        "Cleaning Up":         (99, 100),
+        "Complete":            (100, 100),
+    }
+
     def __init__(self, app, item, cmd, cwd, output_dir, temp_dir):
         super().__init__(daemon=True)
         self.app = app
@@ -3100,6 +3118,11 @@ class CLIWorker(threading.Thread):
         self.last_log_ui = 0
         self.phase = "Starting"
         self.operation = getattr(item, "operation", "pack")
+        # PATCH MODE (manual Integrate Patch OR auto-integrate) extracts-then-repacks,
+        # so it needs the forward-only patch weights and honours the backend's explicit
+        # [PHASE] markers to advance past "Extracting". Detected by the --patch flag.
+        self._is_patch = "--patch" in (cmd or [])
+        self._weights = self.PATCH_WEIGHTS if self._is_patch else self.WEIGHTS
         # Snapshot the copy-extras toggle on the MAIN thread (CLIWorker is constructed
         # there); Tk variables are not safe to read from the worker thread.
         try:
@@ -3387,7 +3410,7 @@ class CLIWorker(threading.Thread):
         return None
 
     def _overall_for_stage(self, stage: str, pct: float) -> float:
-        start, end = self.WEIGHTS.get(stage, (0, 100))
+        start, end = self._weights.get(stage, (0, 100))
         return max(0, min(100, start + (max(0, min(100, pct)) / 100) * (end - start)))
 
     def _overall(self):
@@ -3488,6 +3511,17 @@ class CLIWorker(threading.Thread):
         lower = line.lower()
         upper = line.upper()
 
+        # ── Explicit backend phase marker ────────────────────────────────────
+        # Multi-phase jobs (PATCH MODE: extract → repack) print "[PHASE] <Stage>"
+        # at each step. Force the stage so the display advances even when the new
+        # stage ranks "earlier" than the current one (the no-regress guard assumes
+        # one forward pack sequence; a patch extracts first, then packs).
+        if line.startswith("[PHASE] "):
+            stage = line[8:].strip()
+            if stage in self._weights:
+                self._set_stage(stage, 0, force=True)
+            return
+
         # ── Intercept raw Python exception tracebacks from the backend ────────
         # Convert confusing Python tracebacks into readable, actionable messages
         # and always include UI settings suggestions the user can act on right now.
@@ -3576,7 +3610,11 @@ class CLIWorker(threading.Thread):
         if "Compression complete:" in line:
             self.output_path = line.split("Compression complete:", 1)[-1].strip()
         if "Extraction complete:" in line:
-            self._set_stage("Extracting", 100, "Extraction complete.")
+            # Only an UNPACK job ends at extraction. In PATCH MODE the backend
+            # extracts then repacks, so latching "Extracting"=100 here would freeze
+            # the bar for the whole repack — the [PHASE] markers drive it instead.
+            if self.operation == "unpack":
+                self._set_stage("Extracting", 100, "Extraction complete.")
             maybe_path = line.split("Extraction complete:", 1)[-1].strip()
             if maybe_path:
                 self.output_path = maybe_path

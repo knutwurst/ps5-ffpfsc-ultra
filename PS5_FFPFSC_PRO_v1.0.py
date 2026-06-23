@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.52"
+APP_VERSION = "1.0.53"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3028,102 +3028,6 @@ class GameItem:
         return obj
 
 
-# ─── Fake-Sign Worker ───────────────────────────────────────────────────────────
-
-class FakeSignWorker(threading.Thread):
-    """One-off worker that runs ``cli.py --fake-sign <folder>`` and streams its
-    stdout into the Logs tab.
-
-    Deliberately NOT a CLIWorker: fake-signing is not a pack/unpack, so it must
-    not drive the pack progress stages or trigger pack-completion side effects
-    (output detection, history, AMPR cleanup, space gate, batch advance). It
-    only: spawns the backend, forwards each line via ``app.log()``, exposes its
-    process as ``app.current_process`` so the Cancel button can kill it, and
-    restores the buttons on the Tk thread when done."""
-
-    def __init__(self, app, folder, cmd, cwd):
-        super().__init__(daemon=True)
-        self.app = app
-        self.folder = folder
-        self.cmd = cmd
-        self.cwd = cwd
-        self.proc = None
-        # The main-thread poll loop (_tick_elapsed) reads worker.start_time every
-        # tick; without it the loop would raise and stall the Logs/status drains
-        # for the whole run. Mirror CLIWorker: 0 here, real clock in run().
-        self.start_time = 0
-
-    def run(self):
-        app = self.app
-        self.start_time = time.time()
-        app.log("INFO", f"{APP_NAME} {APP_VERSION} — Fake Sign")
-        app.log("INFO", f"Folder: {self.folder}")
-        app.log("CMD", " ".join(str(c) for c in self.cmd))
-        rc = 1
-        try:
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            self.proc = subprocess.Popen(
-                self.cmd,
-                cwd=str(self.cwd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                start_new_session=(os.name != "nt"),
-            )
-            app.current_process = self.proc
-            for line in self.proc.stdout:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                up = line.upper()
-                if "[ERROR]" in up or "[FAIL]" in up:
-                    tag = "ERROR"
-                elif "[WARN]" in up:
-                    tag = "WARN"
-                elif "[OK]" in up or "[DONE]" in up or "[SUCCESS]" in up:
-                    tag = "OK"
-                else:
-                    tag = "INFO"
-                app.log(tag, line)
-            rc = self.proc.wait()
-        except Exception as e:
-            app.log("ERROR", f"Fake-sign worker failed: {e}")
-            rc = 1
-        finally:
-            app.current_process = None
-
-        cancelled = bool(getattr(app, "cancel_requested", False))
-
-        def _finish():
-            try:
-                app.start_btn.configure(state="normal")
-                app.cancel_btn.configure(state="disabled")
-            except Exception:
-                pass
-            app.cancel_requested = False
-            if cancelled:
-                app.status_update("Cancelled", "Fake-sign cancelled.", "Complete", 0, 0, "00:00", "—", "—")
-                app.log("WARN", "Fake-sign cancelled by user.")
-            elif rc == 0:
-                app.status_update("Done", f"Fake-sign complete: {self.folder.name}",
-                                  "Complete", 100, 100, "00:00", "—", "—")
-            else:
-                app.status_update("Failed", "Fake-sign failed — see the Logs tab.",
-                                  "Complete", 0, 0, "00:00", "—", "—")
-                app.log("ERROR", f"Fake-sign exited with code {rc}.")
-
-        try:
-            app.root.after(0, _finish)
-        except Exception:
-            pass
-
-
 # ─── CLI Worker ────────────────────────────────────────────────────────────────
 
 class CLIWorker(threading.Thread):
@@ -4015,6 +3919,117 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
+class PackDialog(ctk.CTkToplevel):
+    """Collect a pack source (game folder, archive, disk image, or .ffpfs) + output +
+    format, and ADD a pack job to the queue. A .ffpfsc is already packed → use Convert."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Pack — add job to queue")
+        self.geometry("640x360")
+        self.configure(fg_color=BLACK)
+        self.resizable(False, False)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+        self.src_var = tk.StringVar()
+        self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
+        self.fmt_compressed = tk.BooleanVar(value=bool(app.output_compressed_var.get()))
+
+        ctk.CTkLabel(self, text="📦  Pack — add job",
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text="Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs "
+                                "into a .ffpfsc. Adds a job to the queue — press ▶ START to run it.",
+                      text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+
+        srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(srow, text="Source  (folder, archive, .exfat/.ffpkg, or .ffpfs):", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
+        ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(sinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_folder).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="Archive", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_archive).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="Image", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_image).pack(side="left", padx=(6, 0))
+
+        orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(orow, text="Output folder:", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
+        ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
+                      placeholder_text="defaults to the global Output folder").pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=lambda: self._pick_dir(self.out_var)).pack(side="left", padx=(6, 0))
+
+        frow = ctk.CTkFrame(self, fg_color=BLACK); frow.pack(fill="x", padx=20, pady=(6, 4))
+        ctk.CTkLabel(frow, text="Format:", text_color=WHITE).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(frow, text="Compressed (.ffpfsc)", variable=self.fmt_compressed, value=True,
+                            fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+        ctk.CTkRadioButton(frow, text="Uncompressed (.ffpfs)", variable=self.fmt_compressed, value=False,
+                            fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+                       command=self._add).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+
+    def _pick_folder(self):
+        p = filedialog.askdirectory(title="Select a game folder")
+        if p:
+            self.src_var.set(p)
+
+    def _pick_archive(self):
+        p = filedialog.askopenfilename(title="Select an archive",
+                                       filetypes=[("Archives", "*.zip *.rar *.7z"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_image(self):
+        p = filedialog.askopenfilename(title="Select a disk/PFS image",
+                                       filetypes=[("Images", "*.exfat *.ffpkg *.ffpfs"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_dir(self, var):
+        p = filedialog.askdirectory()
+        if p:
+            var.set(p)
+
+    def _add(self):
+        s = self.src_var.get().strip()
+        if not s:
+            messagebox.showerror("Missing", "Please choose a source to pack.", parent=self); return
+        src = Path(s)
+        if not src.exists():
+            messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
+        if src.is_file() and src.suffix.lower() == ".ffpfsc":
+            messagebox.showerror("Use Convert",
+                                 "A .ffpfsc is already packed. Use the Convert job to unpack/convert it.",
+                                 parent=self); return
+        # Hand off to the shared add-to-queue path: it classifies folder / archive /
+        # disk image / .ffpfs and queues the right pack item; update_queue_box snapshots
+        # this output onto the item (per-job output).
+        self.app.source_var.set(s)
+        outf = self.out_var.get().strip()
+        if outf:
+            self.app.output_var.set(outf)
+        try:
+            self.app.output_compressed_var.set(bool(self.fmt_compressed.get()))
+        except Exception:
+            pass
+        try:
+            self.app.unpack_mode_var.set(False)
+        except Exception:
+            pass
+        self.destroy()
+        self.app.add_source_to_queue()
+
+
 class PatchDialog(ctk.CTkToplevel):
     """Collect a game (.ffpfsc / folder / archive) + a patch (folder / archive) and
     kick off 'patch into game' — unpack the game, overlay the patch files, repack."""
@@ -4098,22 +4113,20 @@ class PatchDialog(ctk.CTkToplevel):
             messagebox.showerror("Not found", f"Game not found:\n{game}", parent=self); return
         if not patch.exists():
             messagebox.showerror("Not found", f"Patch not found:\n{patch}", parent=self); return
-        # v1 queue scope: game must be a folder or .ffpfsc; patch a folder / .zip / .rar
-        # (the backend extracts zip/rar patches itself). Archive GAMES and .7z patches
-        # still need the pre-extract path — not yet wired into the queue.
-        gsfx = game.suffix.lower()
-        if not (game.is_dir() or gsfx == ".ffpfsc"):
+        # Accept folder / .ffpfsc / archive game, and folder / archive patch. An archive
+        # game or a .7z patch is extracted to a folder when the job reaches the front of
+        # the queue (_prepare_patch_item); .zip/.rar patches go straight to the backend.
+        ARCH = (".zip", ".rar", ".7z")
+        gsfx, psfx = game.suffix.lower(), patch.suffix.lower()
+        if not (game.is_dir() or gsfx == ".ffpfsc" or gsfx in ARCH):
             messagebox.showerror(
                 "Unsupported game source",
-                "For a queued patch job the game must be a FOLDER or a .ffpfsc.\n\n"
-                "Extract the game archive to a folder first, then queue the patch.",
+                "The game must be a folder, a .ffpfsc, or an archive (.zip/.rar/.7z).",
                 parent=self); return
-        psfx = patch.suffix.lower()
-        if not (patch.is_dir() or psfx in (".zip", ".rar")):
+        if not (patch.is_dir() or psfx in ARCH):
             messagebox.showerror(
                 "Unsupported patch source",
-                "For a queued patch job the patch must be a FOLDER, .zip or .rar.\n\n"
-                "Extract a .7z patch to a folder first, then queue it.",
+                "The patch must be a folder or an archive (.zip/.rar/.7z).",
                 parent=self); return
         overwrite = self.mode_var.get() == "overwrite"
         out_folder = self.out_var.get().strip()
@@ -4643,12 +4656,10 @@ class App:
         self.format_hint_var = tk.StringVar()
         ctk.CTkLabel(self._toolbar, textvariable=self.format_hint_var, text_color=WHITE,
                       font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
-        # Tools, grouped on the right.
+        # Tools, grouped on the right. (Job entry points — Pack/Convert/Patch/Sign —
+        # now live in the 'Add job' bar below, so they're no longer duplicated here.)
         self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
         self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
-        self._button(self._toolbar, "🩹  Integrate Patch", self._open_patch_dialog, width=160).pack(side="right", padx=(0, 8))
-        self._button(self._toolbar, "🖊  Fake Sign (Folder)", self.fake_sign_folder, width=170).pack(side="right", padx=(0, 8))
-        self._button(self._toolbar, "🔄  Converter", self.open_converter, green=True, width=130).pack(side="right", padx=(0, 8))
         self._update_format_label()
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
@@ -4687,29 +4698,35 @@ class App:
         self.cpu_count_var.trace_add("write", lambda *_: save_settings({"cpu_count": self.cpu_count_var.get()}))
         self.block_size_var.trace_add("write", lambda *_: save_settings({"block_size": self.block_size_var.get()}))
 
-        # ── Top folder row ───────────────────────────────────────────────────
+        # ── Job builder ───────────────────────────────────────────────────────
+        # Every operation is a JOB. Pick a type → its submenu collects the inputs +
+        # output and ADDS the job to the queue. Nothing runs until ▶ START. Output and
+        # Temp below are the shared defaults each submenu pre-fills.
         top = self.panel(main, row=1, column=0, sticky="ew", padx=18, pady=8)
-        top.grid_columnconfigure(1, weight=1)
-        top.grid_columnconfigure(3, weight=1)
-        top.grid_columnconfigure(5, weight=1)
 
-        add_btns = ctk.CTkFrame(top, fg_color="transparent")
-        add_btns.grid(row=0, column=0, padx=(14, 8), pady=14)
-        self._button(add_btns, "📁  FOLDER",  self.browse_source_folder,  green=True, width=120).pack(pady=(0, 4))
-        self._button(add_btns, "📦  ARCHIVE", self.browse_source_archive,             width=120).pack(pady=(0, 4))
-        self._button(add_btns, "📤  PFS",     self.browse_pfs_image,                 width=120).pack()
-        ctk.CTkEntry(top, textvariable=self.source_var,
-                      placeholder_text="Game folder, archive, disk image (.exfat/.ffpkg), or PFS image (.ffpfs/.ffpfsc)…",
-                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(
-            row=0, column=1, sticky="ew", padx=(0, 16), pady=14)
+        jobbar = ctk.CTkFrame(top, fg_color="transparent")
+        jobbar.pack(fill="x", padx=14, pady=(12, 6))
+        ctk.CTkLabel(jobbar, text="Add job:", text_color=WHITE,
+                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 12))
+        self._button(jobbar, "📦  Pack",    self.open_pack_dialog,   green=True, width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "🔄  Convert", self.open_converter,                 width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "🩹  Patch",   self._open_patch_dialog,             width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image to add a Pack job",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
-        self._button(top, "OUTPUT", self.browse_output_folder, width=100).grid(row=0, column=2, padx=(0, 8), pady=14)
-        ctk.CTkEntry(top, textvariable=self.output_var, placeholder_text="Output folder...",
-                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=3, sticky="ew", padx=(0, 16), pady=14)
-
-        self._button(top, "TEMP", self.browse_temp_folder, width=90).grid(row=0, column=4, padx=(0, 8), pady=14)
-        ctk.CTkEntry(top, textvariable=self.temp_var, placeholder_text="Temp folder on fast drive...",
-                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=5, sticky="ew", padx=(0, 14), pady=14)
+        iorow = ctk.CTkFrame(top, fg_color="transparent")
+        iorow.pack(fill="x", padx=14, pady=(0, 12))
+        ctk.CTkLabel(iorow, text="OUTPUT", text_color=WHITE,
+                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 6))
+        ctk.CTkEntry(iorow, textvariable=self.output_var, placeholder_text="Default output folder…",
+                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(iorow, "Browse", self.browse_output_folder, width=78).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(iorow, text="TEMP", text_color=WHITE,
+                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 6))
+        ctk.CTkEntry(iorow, textvariable=self.temp_var, placeholder_text="Temp folder on fast drive…",
+                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._button(iorow, "Browse", self.browse_temp_folder, width=78).pack(side="left")
 
         # ── Vertical split: content area (top) ↕ log/tabs area (bottom). A horizontal
         #    divider the user drags up/down to grow or shrink the log; its position
@@ -5252,130 +5269,13 @@ class App:
         # so CTk picks the correct value automatically on appearance mode change.
 
     def _open_patch_dialog(self):
-        if getattr(self, "_batch_running", False) or (getattr(self, "worker", None) and self.worker and self.worker.is_alive()):
-            messagebox.showinfo("Please wait", "A job is already running. Wait for it to finish or cancel it first.")
-            return
+        # No busy-guard: adding a job to the queue while another runs is fine (it just
+        # waits its turn) — same as Pack/Convert/Sign.
         PatchDialog(self)
 
-    def _patch_failed(self, msg: str):
-        self.start_btn.configure(state="normal")
-        self.cancel_btn.configure(state="disabled")
-        self.status_update("Failed", msg, "Failed", 0, 0, "00:00", "—", "—")
-        self.log("ERROR", f"Patch failed: {msg}")
-        messagebox.showerror("Patch fehlgeschlagen", msg)
+    def open_pack_dialog(self):
+        PackDialog(self)
 
-    def _launch_patch_worker(self, item, cmd, cwd, out_dir, temp_dir):
-        self._batch_total = 1; self._batch_done = 0; self._batch_failed = 0
-        self._batch_running = False
-        self._update_batch_counter()
-        self._last_cmd_str = " ".join(str(c) for c in cmd)
-        self.cancel_requested = False
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="normal")
-        self.status_update("Patching", f"Patching {item.name}…", "Creating Temp PFS", 0, 0, "00:00", "—", "—")
-        self._active_item = item
-        self.worker = CLIWorker(self, item, cmd, cwd, out_dir, temp_dir)
-        self.worker.start()
-
-    def _start_patch(self, game_str: str, patch_str: str, overwrite: bool):
-        """Integrate a patch into a game: unpack the game (.ffpfsc/folder/archive),
-        overlay the patch files, repack. Extraction of any archives runs in a worker
-        thread; the actual unpack→overlay→repack is the backend --patch flow."""
-        game = Path(self._clean_path_str(game_str))
-        patch = Path(self._clean_path_str(patch_str))
-        if not game.exists():
-            messagebox.showerror("Not found", f"Game not found:\n{game}"); return
-        if not patch.exists():
-            messagebox.showerror("Not found", f"Patch not found:\n{patch}"); return
-        temp_base = self.temp_var.get().strip() or str(game.parent / "_ffpfsc_temp")
-        self.temp_var.set(temp_base)
-        out_base = self.output_var.get().strip()
-        self.start_btn.configure(state="disabled"); self.cancel_btn.configure(state="normal")
-        self.cancel_requested = False; self.extract_cancel_event.clear()
-        self.status_update("Patching", f"Preparing patch: {game.name}…", "Scanning Files", 0, 0, "00:00", "—", "—")
-        try:
-            self.bottom_tabs.set("Logs")
-        except Exception:
-            pass
-        ARCH = (".zip", ".rar", ".7z")
-
-        # Snapshot every Tk var on the MAIN thread — reading tk.*Var.get() from the worker
-        # thread below is cross-thread Tcl access (RuntimeError / corrupt value / segfault,
-        # especially on macOS). Everywhere else in the app already snapshots like this.
-        snap_pw = self._candidate_passwords()
-        snap_cl = self.compression_level_var.get()
-        snap_cpu = self.cpu_count_var.get()
-        snap_bs = self.block_size_var.get()
-        snap_verbose = self.verbose_var.get()
-
-        def work():
-            try:
-                pw = snap_pw
-                patch_inplace = False
-                gsfx = game.suffix.lower()
-                # resolve the GAME to something the backend --patch understands
-                if gsfx == ".ffpfsc" or game.is_dir():
-                    game_arg = game
-                elif gsfx in ARCH:
-                    self.log("INFO", f"Extracting game archive: {game.name}")
-                    self.status_update("Extracting", f"Unpacking game: {game.name}…", "Extracting", 0, 0, "—", "—", "—")
-                    game_arg = ArchiveExtractor.extract_with_passwords(
-                        game, Path(temp_base) / "_patch_game", pw,
-                        log_fn=self.log, cancel_event=self.extract_cancel_event)
-                    patch_inplace = True   # extracted to a throwaway temp dir → overlay in place
-                else:
-                    raise RuntimeError(f"Unsupported game type: {game.name}")
-                # resolve the PATCH to a folder of loose files
-                if patch.is_dir():
-                    patch_dir = patch
-                elif patch.suffix.lower() in ARCH:
-                    self.log("INFO", f"Extracting patch archive: {patch.name}")
-                    self.status_update("Extracting", f"Unpacking patch: {patch.name}…", "Extracting", 0, 0, "—", "—", "—")
-                    patch_dir = ArchiveExtractor.extract_with_passwords(
-                        patch, Path(temp_base) / "_patch_files", pw,
-                        log_fn=self.log, cancel_event=self.extract_cancel_event)
-                else:
-                    raise RuntimeError(f"Patch must be a folder or archive: {patch.name}")
-                if self.cancel_requested:
-                    raise ArchiveExtractionCancelled("Cancelled by user.")
-                # output path (ask-per-run choice from the dialog)
-                if overwrite and gsfx == ".ffpfsc":
-                    out = game
-                else:
-                    stem = game.stem if gsfx == ".ffpfsc" else game.name
-                    folder = Path(out_base) if out_base else game.parent
-                    out = folder / f"{sanitize_filename(stem)} [patched].ffpfsc"
-                out.parent.mkdir(parents=True, exist_ok=True)
-                # build the backend command
-                pycmd = get_backend_python_command()
-                backend = backend_base_dir()
-                cli_py = backend / "cli.py"
-                head = (pycmd + [str(game_arg), str(out)] if getattr(sys, "frozen", False)
-                        else pycmd + ["-u", str(cli_py), str(game_arg), str(out)])
-                cmd = head + ["--patch", str(patch_dir), "--temp-dir", temp_base, "--overwrite"]
-                if patch_inplace:
-                    cmd += ["--patch-inplace"]
-                if snap_cl != 7: cmd += ["--compression-level", str(snap_cl)]
-                if snap_cpu != 0: cmd += ["--cpu-count", str(snap_cpu)]
-                if snap_bs and snap_bs != "auto": cmd += ["--block-size", snap_bs]
-                if snap_verbose: cmd.append("--verbose")
-                # lightweight item for progress / report / history
-                item = GameItem.__new__(GameItem)
-                item.path = Path(game_arg)
-                item.archive_path = None
-                item.operation = "pack"
-                item.name = (game.stem if gsfx == ".ffpfsc" else game.name) + " (patched)"
-                try:
-                    item.title_id = parse_title_id(Path(game_arg)) if Path(game_arg).is_dir() else "🩹"
-                except Exception:
-                    item.title_id = "🩹"
-                item.size = 0; item.files = 0; item.artwork = None; item.status = "Patching"
-                self.root.after(0, lambda: self._launch_patch_worker(item, cmd, backend, out.parent, Path(temp_base)))
-            except ArchiveExtractionCancelled as e:
-                self.root.after(0, lambda m=str(e): self._patch_failed(m))
-            except Exception as e:
-                self.root.after(0, lambda m=str(e): self._patch_failed(m))
-        threading.Thread(target=work, daemon=True).start()
 
     def open_settings(self):
         if self._settings_win and self._settings_win.winfo_exists():
@@ -6501,6 +6401,110 @@ class App:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # ── Patch jobs: resolve archive game / .7z patch before the job runs ───────
+    def _patch_needs_prepare(self, item) -> bool:
+        """True when a queued patch job still has an ARCHIVE game (.zip/.rar/.7z) or a
+        .7z patch that must be extracted to a folder before packing. After prepare the
+        game path is a folder, so this naturally returns False on re-entry. (.zip/.rar
+        patches are NOT pre-extracted — the backend --patch handles those itself.)"""
+        if getattr(item, "operation", "") != "patch":
+            return False
+        try:
+            gp = Path(getattr(item, "path", "") or "")
+            if gp.is_file() and gp.suffix.lower() in (".zip", ".rar", ".7z"):
+                return True
+            ps = getattr(item, "patch_source", None)
+            if ps and Path(ps).suffix.lower() == ".7z":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _patch_prepare_failed(self, item, msg: str):
+        try:
+            item.status = "Failed"
+        except Exception:
+            pass
+        self.log("ERROR", f"Patch prepare failed: {msg}")
+        self.status_update("Failed", f"Patch prepare failed: {msg}", "Failed", 0, 0, "00:00", "—", "—")
+        if self._batch_running:
+            self._batch_failed += 1
+            try:
+                if self.queue and self.queue[0] is item:
+                    self.queue.pop(0)
+            except Exception:
+                pass
+            self._update_batch_counter()
+            self.update_queue_box()
+            self.root.after(600, self._batch_auto_start)
+        else:
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self.update_queue_box()
+
+    def _prepare_patch_item(self, item):
+        """Extract a patch job's archive game and/or .7z patch to temp folders, update the
+        item to point at the extracted folders, then re-enter the launcher. Runs on a
+        background thread (extraction is slow); Tk touches are marshalled to the main loop."""
+        self._active_item = item
+        item.status = "Extracting"
+        self.cancel_requested = False
+        self.extract_cancel_event.clear()
+        self.update_queue_box()
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        try:
+            self.bottom_tabs.set("Logs")
+        except Exception:
+            pass
+        temp_base = self.temp_var.get().strip() or str(Path(item.path).parent / "_ffpfsc_temp")
+        self.temp_var.set(temp_base)
+        pw = self._candidate_passwords(item)
+        game = Path(item.path)
+        patch = Path(item.patch_source) if getattr(item, "patch_source", None) else None
+        ARCH = (".zip", ".rar", ".7z")
+
+        def work():
+            try:
+                gp = game
+                inplace = bool(getattr(item, "patch_inplace", False))
+                if game.is_file() and game.suffix.lower() in ARCH:
+                    self.log("INFO", f"Extracting patch game archive: {game.name}")
+                    self.status_update("Extracting", f"Unpacking game: {game.name}…",
+                                       "Extracting", 0, 0, "—", "—", "—")
+                    gp = ArchiveExtractor.extract_with_passwords(
+                        game, Path(temp_base) / "_patch_game", pw,
+                        log_fn=self.log, cancel_event=self.extract_cancel_event)
+                    inplace = True   # extracted to a throwaway temp → overlay in place
+                pp = patch
+                if patch is not None and patch.suffix.lower() == ".7z":
+                    self.log("INFO", f"Extracting .7z patch: {patch.name}")
+                    self.status_update("Extracting", f"Unpacking patch: {patch.name}…",
+                                       "Extracting", 0, 0, "—", "—", "—")
+                    pp = ArchiveExtractor.extract_with_passwords(
+                        patch, Path(temp_base) / "_patch_files", pw,
+                        log_fn=self.log, cancel_event=self.extract_cancel_event)
+                if self.cancel_requested:
+                    raise ArchiveExtractionCancelled("Cancelled by user.")
+
+                def _done():
+                    item.path = Path(gp)
+                    if pp is not None:
+                        item.patch_source = Path(pp)
+                    item.patch_inplace = inplace
+                    item.status = "Queued"
+                    self.update_queue_box()
+                    if self._batch_running:
+                        self._batch_auto_start()
+                    else:
+                        self.start()
+                self.root.after(0, _done)
+            except ArchiveExtractionCancelled as e:
+                self.root.after(0, lambda m=str(e): self._patch_prepare_failed(item, m))
+            except Exception as e:
+                self.root.after(0, lambda m=str(e): self._patch_prepare_failed(item, m))
+        threading.Thread(target=work, daemon=True).start()
+
     # ── Listbox keyboard reorder ──────────────────────────────────────────────
     def _lb_key_up(self, _event=None):
         self.queue_move_up()
@@ -7578,6 +7582,10 @@ class App:
         except Exception as e:
             self.log("WARN", f"Space pre-check skipped: {e}")
 
+        # Patch job with an archive game / .7z patch — resolve to folders first, re-enter.
+        if self._patch_needs_prepare(item):
+            self._prepare_patch_item(item)
+            return
         # Archive placeholder — extract first
         if getattr(item, "archive_path", None):
             self._extract_queued_item(item)
@@ -7693,6 +7701,10 @@ class App:
                 self.status_update("Ready", f"Skipped — low space: {item.name}", "Ready", 0, 0, "00:00", "—", "—")
             return
 
+        # ── Patch job with an archive game / .7z patch — resolve to folders first ────
+        if self._patch_needs_prepare(item):
+            self._prepare_patch_item(item)
+            return
         # ── Archive placeholder — extract first, then compress (re-gates after) ──────
         if getattr(item, "archive_path", None):
             self._extract_queued_item(item)

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.55"
+APP_VERSION = "1.0.56"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -6197,20 +6197,51 @@ class App:
                     return None
         return None
 
+    def _reclaim_temp_base_inline(self, tp: str) -> None:
+        """Remove our throwaway patch-extract dirs and, when the app-managed _ffpfsc_temp
+        folder is empty, the folder itself — so no empty temp folder lingers after a job.
+        Runs INLINE on the calling cleanup thread (after the heavy rmtree), so by the time
+        it checks 'empty' this item's own scratch is already gone. *tp* is the temp path
+        snapshotted on the MAIN thread (Tk vars aren't thread-safe). Only ever touches an
+        _ffpfsc_temp dir we manage; a user's custom-named temp folder is left alone."""
+        tp = (tp or "").strip()
+        if not tp:
+            return
+        base = Path(tp)
+        for name in ("_patch_game", "_patch_files"):
+            try:
+                shutil.rmtree(str(base / name), ignore_errors=True)
+            except Exception:
+                pass
+        try:
+            ex = base / "_extracted"
+            if ex.is_dir() and not any(ex.iterdir()):
+                ex.rmdir()
+        except Exception:
+            pass
+        # Remove the app-managed temp base only when no more jobs are queued (the last
+        # job is done) — mid-batch it's reused, so don't churn-delete it every item.
+        try:
+            if (not self.queue and base.name == "_ffpfsc_temp"
+                    and base.is_dir() and not any(base.iterdir())):
+                base.rmdir()
+                self.log("INFO", "Removed the now-empty temp folder.")
+        except Exception:
+            pass
+
     def _cleanup_item_extract(self, item) -> None:
         """After an item finishes, remove ITS OWN extracted-source subdir (temp or output
-        drive). Safe — only this item's subdir, never another's. Threaded (rmtree large)."""
+        drive), then reclaim the temp base if it's now empty. Threaded (rmtree large)."""
         own = self._extract_dir_for_item(item)
-        if own is None:
-            return
-        def _work(d=own):
+        _tp = (self.temp_var.get() or "").strip()   # snapshot on the main thread
+        def _work(d=own, tp=_tp):
             try:
-                if d.exists():
+                if d is not None and d.exists():
                     sz = get_folder_size(d)
                     shutil.rmtree(str(d), ignore_errors=True)
                     if sz:
                         self.log("INFO", f"Cleaned {format_size(sz)} extracted source from {d.parent.name}.")
-                if d.parent.name == "_ffpfsc_extract":
+                if d is not None and d.parent.name == "_ffpfsc_extract":
                     try:
                         if not any(d.parent.iterdir()):
                             d.parent.rmdir()
@@ -6218,6 +6249,9 @@ class App:
                         pass
             except Exception:
                 pass
+            # Always (even for folder/fake-sign jobs with no extracted dir): drop our
+            # throwaway patch dirs and the now-empty temp base.
+            self._reclaim_temp_base_inline(tp)
         self._run_cleanup(_work)
 
     def _extract_and_queue_archive(self, archive: Path):
@@ -7337,7 +7371,8 @@ class App:
         if not roots and self._extract_dir_for_item(item) is None:
             return
 
-        def _work():
+        _tp = (self.temp_var.get() or "").strip()   # snapshot on the main thread
+        def _work(tp=_tp):
             freed = 0
             for root in roots:
                 try:
@@ -7364,6 +7399,8 @@ class App:
                 pass
             if freed:
                 self.log("INFO", f"Cleaned {format_size(freed)} of scratch from the failed/skipped run.")
+            # Drop throwaway patch dirs + the now-empty temp base, like the success path.
+            self._reclaim_temp_base_inline(tp)
 
         self._run_cleanup(_work)
 
@@ -7443,9 +7480,11 @@ class App:
         freed = 0
         errors = 0
         for p in list(temp_dir.iterdir()):
-            # Only remove THIS app's working data (mkpfs tmp* dirs and the _extracted
-            # tree); never wipe unrelated files a user may keep in their temp folder.
-            if not (_is_app_tmp_dir(p.name) or p.name == "_extracted"):
+            # Only remove THIS app's working data (mkpfs tmp* dirs, the _extracted tree,
+            # and the patch-prepare extract dirs); never wipe unrelated files a user may
+            # keep in their temp folder.
+            if not (_is_app_tmp_dir(p.name)
+                    or p.name in ("_extracted", "_patch_game", "_patch_files")):
                 continue
             try:
                 sz = get_folder_size(p) if p.is_dir() else (p.stat().st_size if p.is_file() else 0)

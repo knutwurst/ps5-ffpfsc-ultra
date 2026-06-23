@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.53"
+APP_VERSION = "1.0.54"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3927,20 +3927,20 @@ class PackDialog(ctk.CTkToplevel):
         super().__init__(app.root)
         self.app = app
         self.title("Pack — add job to queue")
-        self.geometry("640x360")
+        self.geometry("620x340")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
         self.src_var = tk.StringVar()
         self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
-        self.fmt_compressed = tk.BooleanVar(value=bool(app.output_compressed_var.get()))
 
         ctk.CTkLabel(self, text="📦  Pack — add job",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
         ctk.CTkLabel(self, text="Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs "
-                                "into a .ffpfsc. Adds a job to the queue — press ▶ START to run it.",
+                                "into a .ffpfsc — to its own output folder. The .ffpfsc/.ffpfs format "
+                                "is the toggle at the top of the main window. Adds a job to the queue.",
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
@@ -3956,20 +3956,13 @@ class PackDialog(ctk.CTkToplevel):
                        command=self._pick_image).pack(side="left", padx=(6, 0))
 
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(orow, text="Output folder:", text_color=WHITE,
+        ctk.CTkLabel(orow, text="Output folder  (this job's .ffpfsc lands here):", text_color=WHITE,
                       font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
-                      placeholder_text="defaults to the global Output folder").pack(side="left", fill="x", expand=True)
+                      placeholder_text="choose where this job's output goes").pack(side="left", fill="x", expand=True)
         ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=lambda: self._pick_dir(self.out_var)).pack(side="left", padx=(6, 0))
-
-        frow = ctk.CTkFrame(self, fg_color=BLACK); frow.pack(fill="x", padx=20, pady=(6, 4))
-        ctk.CTkLabel(frow, text="Format:", text_color=WHITE).pack(side="left", padx=(0, 10))
-        ctk.CTkRadioButton(frow, text="Compressed (.ffpfsc)", variable=self.fmt_compressed, value=True,
-                            fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
-        ctk.CTkRadioButton(frow, text="Uncompressed (.ffpfs)", variable=self.fmt_compressed, value=False,
-                            fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+                       command=self._pick_out).pack(side="left", padx=(6, 0))
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
         ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
@@ -3995,10 +3988,10 @@ class PackDialog(ctk.CTkToplevel):
         if p:
             self.src_var.set(p)
 
-    def _pick_dir(self, var):
-        p = filedialog.askdirectory()
+    def _pick_out(self):
+        p = filedialog.askdirectory(title="Select the output folder for this job")
         if p:
-            var.set(p)
+            self.out_var.set(p)
 
     def _add(self):
         s = self.src_var.get().strip()
@@ -4011,17 +4004,14 @@ class PackDialog(ctk.CTkToplevel):
             messagebox.showerror("Use Convert",
                                  "A .ffpfsc is already packed. Use the Convert job to unpack/convert it.",
                                  parent=self); return
-        # Hand off to the shared add-to-queue path: it classifies folder / archive /
-        # disk image / .ffpfs and queues the right pack item; update_queue_box snapshots
-        # this output onto the item (per-job output).
-        self.app.source_var.set(s)
         outf = self.out_var.get().strip()
-        if outf:
-            self.app.output_var.set(outf)
-        try:
-            self.app.output_compressed_var.set(bool(self.fmt_compressed.get()))
-        except Exception:
-            pass
+        if not outf:
+            messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
+        # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
+        # image / .ffpfs and queues the right pack item. Setting output_var makes this the
+        # output snapshotted onto the item (per-job) AND the remembered default next time.
+        self.app.output_var.set(outf)
+        self.app.source_var.set(s)
         try:
             self.app.unpack_mode_var.set(False)
         except Exception:
@@ -4715,18 +4705,18 @@ class App:
         ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image to add a Pack job",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
+        # Output is chosen PER JOB (in each job's submenu); only Temp is shared/universal,
+        # so the bar shows just Temp. (output_var still exists as the remembered default
+        # each submenu pre-fills.)
         iorow = ctk.CTkFrame(top, fg_color="transparent")
         iorow.pack(fill="x", padx=14, pady=(0, 12))
-        ctk.CTkLabel(iorow, text="OUTPUT", text_color=WHITE,
-                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 6))
-        ctk.CTkEntry(iorow, textvariable=self.output_var, placeholder_text="Default output folder…",
-                      fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._button(iorow, "Browse", self.browse_output_folder, width=78).pack(side="left", padx=(0, 16))
         ctk.CTkLabel(iorow, text="TEMP", text_color=WHITE,
                       font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 6))
-        ctk.CTkEntry(iorow, textvariable=self.temp_var, placeholder_text="Temp folder on fast drive…",
+        ctk.CTkEntry(iorow, textvariable=self.temp_var, placeholder_text="Shared temp folder on a fast drive…",
                       fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._button(iorow, "Browse", self.browse_temp_folder, width=78).pack(side="left")
+        self._button(iorow, "Browse", self.browse_temp_folder, width=78).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(iorow, text="Output is set per job", text_color=MUTED,
+                      font=ctk.CTkFont(size=11)).pack(side="left")
 
         # ── Vertical split: content area (top) ↕ log/tabs area (bottom). A horizontal
         #    divider the user drags up/down to grow or shrink the log; its position

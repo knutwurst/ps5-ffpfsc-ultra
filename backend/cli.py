@@ -728,6 +728,21 @@ def compress_file_to_ffpfsc(
     print(f"[OK] Compression complete: {ffpfsc_path}")
 
 
+def _dir_size(path: Path) -> int:
+    """Sum of file sizes under *path* (cheap stat walk; PS5 games have modest file counts)."""
+    total = 0
+    try:
+        for dirpath, _d, filenames in os.walk(path):
+            for f in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
 def unpack_pfs_image(
     image_file: Path,
     output_dir: Path,
@@ -741,10 +756,39 @@ def unpack_pfs_image(
     if overwrite:
         cmd.append("--overwrite")
     print(f"[INFO] Running: {' '.join(cmd)}", flush=True)
+    # mkpfs unpack emits no incremental progress, so a big extraction (e.g. the inner image
+    # of a 100+ GB game) looks frozen in the GUI for many minutes. Run it via Popen and,
+    # while it works, poll the destination size and emit a GUI-parsable progress bar
+    # ("[####----] NN% extract (X.X GB)") every ~12 s so the user sees live movement. The
+    # source image size is a good size estimate for an inner-.ffpfs → folder extraction;
+    # for an outer .ffpfsc (compressed) the % saturates early but the GB readout keeps moving.
     try:
-        subprocess.run(cmd, cwd=mkpfs_cwd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] mkpfs unpack failed with exit code {e.returncode}.", flush=True)
+        expected = image_file.stat().st_size if image_file.is_file() else 0
+    except OSError:
+        expected = 0
+    try:
+        proc = subprocess.Popen(cmd, cwd=mkpfs_cwd)
+    except Exception as e:
+        print(f"[ERROR] Could not start mkpfs unpack: {e}", flush=True)
+        sys.exit(1)
+    _last_pct = 0
+    while True:
+        try:
+            rc = proc.wait(timeout=12)
+            break
+        except subprocess.TimeoutExpired:
+            done = _dir_size(output_dir)
+            gb = done / (1024 ** 3)
+            if expected > 0:
+                pct = max(1, min(99, int(done * 100 / expected)))
+            else:
+                pct = min(99, _last_pct + 2)
+            _last_pct = pct
+            filled = pct // 5
+            bar = "#" * filled + "-" * (20 - filled)
+            print(f"[{bar}] {pct}% extract ({gb:.1f} GB)", flush=True)
+    if rc != 0:
+        print(f"[ERROR] mkpfs unpack failed with exit code {rc}.", flush=True)
         print(f"[ERROR] Source image: {image_file}", flush=True)
         print(f"[ERROR] Output folder: {output_dir}", flush=True)
         sys.exit(1)

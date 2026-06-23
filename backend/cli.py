@@ -797,6 +797,12 @@ def _fake_sign_tree(folder) -> dict:
     Thin wrapper around backend/fake_sign.py (which imports the vendored
     make_fself). Routes the signer's per-file lines through print(..., flush=True)
     so the GUI's stdout scraper shows them live. Returns the counts dict."""
+    # Strip OS junk here too, so EVERY folder operation (pack, patch, via-exfat AND
+    # the standalone Fake Sign tool) cleans macOS/Windows metadata — never any junk
+    # left behind regardless of which action touched the folder.
+    _stripped = _strip_junk_files(Path(folder))
+    if _stripped:
+        print(f"[INFO] Removed {_stripped} macOS/Windows junk file(s)/folder(s).", flush=True)
     if _CLI_DIR not in sys.path:
         sys.path.insert(0, _CLI_DIR)
     from fake_sign import fake_sign_tree

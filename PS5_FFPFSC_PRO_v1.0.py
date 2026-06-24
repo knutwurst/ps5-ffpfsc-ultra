@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.57"
+APP_VERSION = "1.0.58"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -7687,6 +7687,27 @@ class App:
             self.log("WARN", f"🏁 Batch complete — {done}/{total} succeeded, {fail} failed.")
         messagebox.showinfo("Batch Complete", msg)
 
+    def _ensure_batch_started(self):
+        """Establish batch state for a FRESH queue run (idempotent via the _batch_running
+        guard). MUST run before the first item is processed — including before an archive
+        extraction or patch-prepare, which return early from start() — so that a FIRST-item
+        failure advances the queue (the done/extract error handlers only continue while
+        _batch_running is True) instead of aborting the whole queue. Re-entry after a
+        successful archive extraction (the _extract_q 'ok' branch calls start() again) is a
+        no-op thanks to the guard, preserving running progress."""
+        if not self._batch_running:
+            self._batch_total   = len(self.queue)
+            self._batch_done    = 0
+            self._batch_failed  = 0
+            self._batch_running = self._batch_total > 0
+            # Size-weighted total progress: a 187 GB game advances the queue bar far more
+            # than a 35 GB one (games finish in queue order; done-bytes = sum of first _done).
+            try:
+                self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in self.queue]
+            except Exception:
+                self._batch_sizes = []
+        self._update_batch_counter()
+
     # ── Start / Cancel ────────────────────────────────────────────────────────
     def start(self):
         if not self.output_var.get().strip():
@@ -7745,11 +7766,13 @@ class App:
 
         # ── Patch job with an archive game / .7z patch — resolve to folders first ────
         if self._patch_needs_prepare(item):
+            self._ensure_batch_started()   # mark the batch running BEFORE the early return
             self._prepare_patch_item(item)
             return
         # ── Archive placeholder — extract first, then compress (re-gates after) ──────
         if getattr(item, "archive_path", None):
-            self._extract_queued_item(item)
+            self._ensure_batch_started()   # so a first-item extraction failure advances,
+            self._extract_queued_item(item)  # not aborts, the rest of the queue
             return
 
         # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
@@ -7800,24 +7823,9 @@ class App:
         except Exception:
             pass
 
-        # Initialise batch counters only for a FRESH start. An archive item re-enters
-        # start() after extraction (the _extract_q "ok" handler calls start() again);
-        # re-running this block then would wipe a running batch's progress and skip the
-        # Batch Complete dialog for all-archive batches.
-        if not self._batch_running:
-            self._batch_total   = len(self.queue)
-            self._batch_done    = 0
-            self._batch_failed  = 0
-            self._batch_running = self._batch_total > 0
-            # Snapshot each queued game's size (in queue order) so the QUEUE bar can show
-            # SIZE-weighted total progress — a 187 GB game advances it far more than a 35 GB
-            # one, instead of every game counting an equal 1/N. Games finish in queue order,
-            # so done-bytes = sum of the first _done sizes (see the status drain).
-            try:
-                self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in self.queue]
-            except Exception:
-                self._batch_sizes = []
-        self._update_batch_counter()
+        # Establish batch state for a fresh start (idempotent; archive/patch items already
+        # did this before their early return, and a re-entry after extraction is a no-op).
+        self._ensure_batch_started()
 
         self._last_cmd_str = " ".join(cmd)
         self.cancel_requested = False

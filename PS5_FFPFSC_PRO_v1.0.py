@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.61"
+APP_VERSION = "1.0.62"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -6193,10 +6193,26 @@ class App:
             item._image_only_on_temp = image_only
             item._extract_on_pool = on_pool
 
-        # 1) Everything on ONE fast drive (source + image + spool). Best-fit = most free.
-        fit_full = [(d, f) for d, f in pool if f >= full_need]
+        def _is_ssd(d):
+            # Pure speed test for a pool drive (independent of the same-drive-rw policy):
+            # used to keep the inner image / SSD↔SSD legs on actual flash, never a slow HDD
+            # pool entry that merely happens to have the most free space.
+            try:
+                dt = drive_type_cached(Path(d))
+                if dt == "Unknown":
+                    dt = get_drive_type(Path(d))
+                return dt == "SSD"
+            except Exception:
+                return False
+
+        # 1) Everything on ONE fast drive (source + image + spool) — this is a same-drive
+        #    read+write, so only consider drives where that's allowed (an SSD under 'auto');
+        #    a big HDD pool entry must NOT win here just by having the most free space (that's
+        #    the slow same-spindle case we avoid). Prefer an SSD, then most free.
+        fit_full = [(d, f) for d, f in pool if f >= full_need and self._same_drive_rw_allowed(d)]
         if size > 0 and fit_full:
-            best = max(fit_full, key=lambda t: t[1])[0]
+            ssd_full = [(d, f) for d, f in fit_full if _is_ssd(d)]
+            best = max(ssd_full or fit_full, key=lambda t: t[1])[0]
             _set(best, Path(best) / "_extracted", False, False)
             if _drive_cache_key(best) != _drive_cache_key(temp_base_p):
                 _plog("INFO", f"Auto: {item.name} (~{szs}): whole scratch on pool drive {best}.")
@@ -6204,14 +6220,14 @@ class App:
         # 2) TWO fast drives (archives only): inner image on one, extracted source on
         #    ANOTHER — keeps pass 1 SSD↔SSD when no single fast drive holds image+source.
         if size > 0 and is_archive_pre:
-            img_fit = [(d, f) for d, f in pool if f >= image_need]
+            img_fit = [(d, f) for d, f in pool if f >= image_need and _is_ssd(d)]
             if img_fit:
-                img_dir = min(img_fit, key=lambda t: t[1])[0]    # smallest fast drive that fits the image
+                img_dir = min(img_fit, key=lambda t: t[1])[0]    # smallest SSD that fits the image
                 img_dev = _drive_cache_key(img_dir)
                 ext_fit = [(d, f) for d, f in pool
-                           if _drive_cache_key(d) != img_dev and f >= int(size)]
+                           if _is_ssd(d) and _drive_cache_key(d) != img_dev and f >= int(size)]
                 if ext_fit:
-                    ext_dir = max(ext_fit, key=lambda t: t[1])[0]  # most-free OTHER fast drive
+                    ext_dir = max(ext_fit, key=lambda t: t[1])[0]  # most-free OTHER SSD
                     _set(img_dir, Path(ext_dir) / "_extracted", True, True)
                     _plog("INFO", f"Auto: {item.name} (~{szs}): extract source → {ext_dir}; "
                                      f"inner image → {img_dir}; final → {out_dir}. Pass 1 stays SSD↔SSD.")
@@ -6221,7 +6237,8 @@ class App:
         #    the image to the other, so neither HDD does a same-drive read+write.
         img_fit = [(d, f) for d, f in pool if f >= image_need]
         if size > 0 and img_fit and out_free >= out_split_need:
-            img_dir = max(img_fit, key=lambda t: t[1])[0]
+            ssd_img = [(d, f) for d, f in img_fit if _is_ssd(d)]
+            img_dir = max(ssd_img or img_fit, key=lambda t: t[1])[0]  # prefer an SSD for the image
             _set(img_dir, spread_root, True, False)          # source extracts to the big output drive
             _plog("INFO", f"Auto: {item.name} (~{szs}): 1) extract source → output drive "
                              f"({out_dir}); 2) build inner image → {temp_drive_label(img_dir)} "

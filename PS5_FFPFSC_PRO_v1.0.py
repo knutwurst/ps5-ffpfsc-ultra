@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.60"
+APP_VERSION = "1.0.61"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -560,7 +560,11 @@ def get_drive_type(path: Path) -> str:
     if key in _DRIVE_TYPE_CACHE:
         return _DRIVE_TYPE_CACHE[key]
     dt = _probe_drive_type(path)
-    _DRIVE_TYPE_CACHE[key] = dt
+    # Only cache a DEFINITIVE result. A transient "Unknown" (diskutil/df slow or busy under
+    # heavy I/O, a just-mounted external drive) must not stick for the whole session and
+    # mislabel an SSD — leave it uncached so the next call re-probes when the drive is idle.
+    if dt != "Unknown":
+        _DRIVE_TYPE_CACHE[key] = dt
     return dt
 
 
@@ -6029,7 +6033,23 @@ class App:
         if mode == "never":
             return False
         try:
-            return get_drive_type(Path(path)) == "SSD"
+            # Use the warmed cache first; only block on a probe if it's not known yet
+            # (now self-healing — Unknown is never cached, so a transient miss re-probes).
+            dt = drive_type_cached(Path(path))
+            if dt == "Unknown":
+                dt = get_drive_type(Path(path))
+            # Log the detection ONCE per drive so it's visible why same-drive is on/off.
+            try:
+                k = _drive_cache_key(Path(path))
+                if not hasattr(self, "_drive_type_logged"):
+                    self._drive_type_logged = set()
+                if k not in self._drive_type_logged:
+                    self._drive_type_logged.add(k)
+                    self.log("INFO", f"Temp drive detected as {dt} — same-drive read+write "
+                                     f"{'allowed (kept on this drive)' if dt == 'SSD' else 'avoided (split to output)'}.")
+            except Exception:
+                pass
+            return dt == "SSD"
         except Exception:
             return False
 

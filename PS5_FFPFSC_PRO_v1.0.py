@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.59"
+APP_VERSION = "1.0.60"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -499,7 +499,10 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
         return image_ok and get_free_space(out_dir) >= out_need
     same = same_drive(temp_dir, out_dir)
     factor = _peak_factor_for(item)
-    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same)
+    # On a same-drive-OK drive (SSD) skip the extra final-image padding — matches the
+    # router's leaner one-drive estimate so a single fast SSD isn't false-skipped.
+    same_pad = same and not getattr(item, "_same_drive_ok", False)
+    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same_pad)
     out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
     return temp_ok and out_ok
 
@@ -1887,6 +1890,17 @@ class SettingsWindow(ctk.CTkToplevel):
             command=lambda disp: save_settings({"low_space_policy": lp_rev.get(disp, "ask")}))
         lp_menu.set(lp_labels.get(s.get("low_space_policy", "ask"), "Ask me"))
         lp_menu.pack(side="left")
+
+        # Same-drive read+write: costless on an SSD, slow (seek thrashing) on an HDD. When
+        # allowed, the build keeps the source on the temp drive instead of routing it to a
+        # slower output drive. Auto = allow only when the temp drive probes as an SSD.
+        sd_labels = {"auto": "Auto (allow on SSD)", "always": "Always allow", "never": "Never (always split)"}
+        sd_rev = {v: k for k, v in sd_labels.items()}
+        sd_menu = ctk.CTkOptionMenu(
+            _ds_row("Same-drive read+write:"), values=list(sd_labels.values()), width=200,
+            command=lambda disp: save_settings({"same_drive_rw": sd_rev.get(disp, "auto")}))
+        sd_menu.set(sd_labels.get(s.get("same_drive_rw", "auto"), sd_labels["auto"]))
+        sd_menu.pack(side="left")
 
         ctk.CTkCheckBox(ds, text="Show drive-space dialog before each pack",
                          variable=self.app.show_space_dialog_var, fg_color=GREEN,
@@ -6003,6 +6017,22 @@ class App:
             # Ping on the fast interval during a run; otherwise just poll the gate every 5 s.
             self._keepawake_stop.wait(interval if active else 5)
 
+    def _same_drive_rw_allowed(self, path) -> bool:
+        """Whether reading the source and writing the image/output on the SAME drive is OK
+        for *path* — costless on an SSD (no seek), painful on an HDD. Controlled by the
+        'same_drive_rw' setting: 'always' / 'never' / 'auto' (default → allow only when the
+        drive probes as an SSD). When allowed, the router keeps everything on this drive
+        instead of routing the source onto a slower output drive."""
+        mode = (load_settings().get("same_drive_rw", "auto") or "auto").lower()
+        if mode == "always":
+            return True
+        if mode == "never":
+            return False
+        try:
+            return get_drive_type(Path(path)) == "SSD"
+        except Exception:
+            return False
+
     def _resolve_extract_root(self, item) -> Path:
         """Place this run's artifacts across drives to maximise fast (SSD) temp use, and
         record the choice on the item: _build_root (where an archive extracts) and
@@ -6077,7 +6107,15 @@ class App:
             probe_out, out_is_source = out_dir, False
 
         same_to = same_drive(temp_base_p, out_dir)
-        full_need  = estimate_peak_space_needed(size, factor, same_to)   # src+image+spool on temp
+        # Same-drive read+write: on an SSD (or when forced) it costs nothing, so DON'T
+        # pre-reserve the extra final-image padding for a single-drive build — that padding
+        # is what makes "everything on one drive" fail and pushes the source onto a slower
+        # output drive. Keeping it off lets the source stay on the fast temp drive. The
+        # backend's pre-pass-2 assert is the backstop if a title is unusually incompressible.
+        same_rw_ok = self._same_drive_rw_allowed(temp_base_p)
+        item._same_drive_ok = bool(same_rw_ok)
+        same_pad = same_to and not same_rw_ok
+        full_need  = estimate_peak_space_needed(size, factor, same_pad)  # src+image+spool on temp
         image_need = estimate_image_space_needed(size)                   # just the inner image on temp
         out_full   = estimate_peak_space_needed(size, factor, True)      # everything on the output drive
         # Output drive must hold, in the split: the source copy extracted there (archives
@@ -7763,10 +7801,24 @@ class App:
                 self.start()
             return
 
+        # A FRESH Start re-arms previously failed/skipped/cancelled jobs so they're retried
+        # (within a run they stay skipped to avoid an endless loop; pressing Start again
+        # retries them). The user deletes any they don't want. NOT on the internal re-entry
+        # after an archive extraction — that's mid-batch (_batch_running is True then).
+        if not self._batch_running:
+            requeued = 0
+            for it in self.queue:
+                if getattr(it, "status", "") in ("Failed", "Skipped", "Cancelled"):
+                    it.status = "Queued"
+                    requeued += 1
+            if requeued:
+                self.log("INFO", f"Retrying {requeued} previously failed/skipped job(s).")
+                self.update_queue_box()
+
         # Run the first NOT-yet-run item; kept Failed/Skipped items are left in place and
         # skipped. If everything left is terminal, there's nothing to start.
         if not self._next_pending_to_front():
-            self.log("INFO", "Nothing to start — all queued items are already done/failed/skipped.")
+            self.log("INFO", "Nothing to start — the queue is empty.")
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             return

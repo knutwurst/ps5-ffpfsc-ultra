@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.58"
+APP_VERSION = "1.0.59"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -6453,22 +6453,23 @@ class App:
         return False
 
     def _patch_prepare_failed(self, item, msg: str):
-        try:
-            item.status = "Failed"
-        except Exception:
-            pass
         self.log("ERROR", f"Patch prepare failed: {msg}")
         self.status_update("Failed", f"Patch prepare failed: {msg}", "Failed", 0, 0, "00:00", "—", "—")
+        # Keep the failed item in the queue (marked Failed, moved to the end) — only
+        # successful items disappear.
+        self._retire_failed(item, "Failed")
         if self._batch_running:
             self._batch_failed += 1
-            try:
-                if self.queue and self.queue[0] is item:
-                    self.queue.pop(0)
-            except Exception:
-                pass
             self._update_batch_counter()
             self.update_queue_box()
-            self.root.after(600, self._batch_auto_start)
+            if self._has_pending():
+                self.root.after(600, self._batch_auto_start)
+            else:
+                self._batch_running = False
+                self.start_btn.configure(state="normal")
+                self.cancel_btn.configure(state="disabled")
+                if self._batch_total > 1:
+                    self._show_batch_complete()
         else:
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
@@ -7552,6 +7553,36 @@ class App:
             return "skip"
         return _ask()   # 'ask' — show the dialog and let the user decide
 
+    # Statuses that mean an item has finished its run and must NOT be processed again.
+    _TERMINAL_STATUSES = ("Done", "Failed", "Skipped", "Cancelled")
+
+    def _has_pending(self) -> bool:
+        """True if any queued item still needs to run (not in a terminal status)."""
+        return any(getattr(it, "status", "") not in self._TERMINAL_STATUSES for it in self.queue)
+
+    def _next_pending_to_front(self) -> bool:
+        """Move the first not-yet-run item to queue[0], so the queue[0]-based run/pop logic
+        always acts on a PENDING item while kept failed/skipped items sit behind it. Returns
+        False when nothing is left to run (queue empty or all items terminal)."""
+        for i, it in enumerate(self.queue):
+            if getattr(it, "status", "") not in self._TERMINAL_STATUSES:
+                if i:
+                    self.queue.insert(0, self.queue.pop(i))
+                return True
+        return False
+
+    def _retire_failed(self, item, status: str = "Failed") -> None:
+        """Keep a failed/skipped item in the queue (marked, moved to the END) instead of
+        discarding it — only SUCCESSFUL items leave the queue. Works whether the item is
+        still in the queue (move it) or was already popped (re-add it)."""
+        try:
+            item.status = status
+            if item in self.queue:
+                self.queue.remove(item)
+            self.queue.append(item)
+        except Exception:
+            pass
+
     def _batch_auto_start(self):
         """Start the next game in the queue — rechecks disk space before each game."""
         # Honor a cancel requested during the 600 ms advance gap (cancel_requested is
@@ -7579,11 +7610,16 @@ class App:
                 return
             self.log("WARN", "Cleanup still running past the wait cap — continuing; the space gate decides.")
         self._cleanup_wait_ticks = 0
-        if not self.queue:
+        # Bring the next NOT-yet-run item to the front (kept Failed/Skipped items are skipped).
+        # When none remain, the batch is complete — failed/skipped items stay in the queue.
+        if not self._next_pending_to_front():
             self._batch_running = False
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             self._update_batch_counter()
+            self.update_queue_box()
+            if self._batch_total > 1:
+                self._show_batch_complete()
             return
         item = self.queue[0]
         self.update_game_details(item)   # refreshes art + space stats for next game
@@ -7615,7 +7651,7 @@ class App:
                     return
                 if gate == "skip":
                     self._cleanup_after_failure(item)   # reclaim any partial scratch
-                    self.queue.pop(0)
+                    self._retire_failed(item, "Skipped")   # keep it in the queue, marked
                     self._batch_failed += 1
                     self._update_batch_counter()
                     self.update_queue_box()
@@ -7727,6 +7763,13 @@ class App:
                 self.start()
             return
 
+        # Run the first NOT-yet-run item; kept Failed/Skipped items are left in place and
+        # skipped. If everything left is terminal, there's nothing to start.
+        if not self._next_pending_to_front():
+            self.log("INFO", "Nothing to start — all queued items are already done/failed/skipped.")
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            return
         item = self.queue[0]
 
         # ── Pre-flight space gate FIRST — place the run on a drive sized for its real
@@ -7749,7 +7792,7 @@ class App:
             # before the post-extraction re-gate), then skip.
             self._cleanup_after_failure(item)
             if self._batch_running:
-                self.queue.pop(0)
+                self._retire_failed(item, "Skipped")   # keep it in the queue, marked
                 self._batch_failed += 1
                 self._update_batch_counter()
                 self.update_queue_box()
@@ -8875,20 +8918,18 @@ class App:
                 self.status_update("Ready", str(payload), "Ready", 0, 0, "00:00", "—", "—")
                 self.log("WARN", str(payload))
             else:
-                # Extraction failed — clean the partial tree, pop the stuck archive so the
-                # queue doesn't freeze, then continue or end the batch like a pack failure.
+                # Extraction failed — clean the partial tree, KEEP the item in the queue
+                # (marked Failed, moved to the end) so only successful items disappear, then
+                # continue or end the batch like a pack failure.
                 failed_item = self.queue[0] if self.queue else self._active_item
                 if failed_item is not None:
                     self._cleanup_after_failure(failed_item)
-                if self.queue:
-                    self.queue[0].status = "Failed"
-                    self.queue.pop(0)
-                    self._batch_failed += 1   # only count when an item was actually popped
+                    self._retire_failed(failed_item, "Failed")
+                    self._batch_failed += 1
                 self.update_queue_box()
                 self.log("ERROR", f"Extraction failed: {payload}")
-                if self._batch_running and self.queue:
+                if self._batch_running and self._has_pending():
                     self.log("WARN", "Continuing batch with the next item after extraction failure.")
-                    self._refresh_space_for_item(self.queue[0])
                     self.root.after(600, self._batch_auto_start)
                 else:
                     self._batch_running = False
@@ -8950,10 +8991,10 @@ class App:
                     self._cleanup_item_extract(completed_item)
                     self._ampr_cleanup(completed_item)   # restore a direct source folder
 
-                # Feature 4: batch auto-advance
-                if self._batch_running and self.queue:
+                # Feature 4: batch auto-advance (the next PENDING item; kept failed/skipped
+                # items don't count as work left to do).
+                if self._batch_running and self._has_pending():
                     self.update_queue_box()
-                    self._refresh_space_for_item(self.queue[0])
                     self.root.after(600, self._batch_auto_start)
                 else:
                     self._batch_running = False
@@ -9004,16 +9045,18 @@ class App:
                         and completed_item is not None and self._oom_retry(completed_item)):
                     return
                 self._batch_failed += 1
-                self.update_queue_box()
                 self.status_update("Failed", msg, "Failed", 0, 0, "—", "—", "—")
                 self.log("ERROR", msg)
                 self.play_complete_sound(False)
                 if completed_item is not None:
                     self._cleanup_after_failure(completed_item)
+                    # Keep the failed item in the queue (marked Failed, moved to the end) —
+                    # only successful items disappear.
+                    self._retire_failed(completed_item, "Failed")
+                self.update_queue_box()
                 # Batch resilience: one failure must not abort the rest of the queue.
-                if self._batch_running and self.queue:
+                if self._batch_running and self._has_pending():
                     self.log("WARN", "Continuing batch with the next item after failure.")
-                    self._refresh_space_for_item(self.queue[0])
                     self.root.after(600, self._batch_auto_start)
                 else:
                     self._batch_running = False

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.62"
+APP_VERSION = "1.0.63"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3940,27 +3940,47 @@ def _kill_process_tree(proc) -> None:
 
 class PackDialog(ctk.CTkToplevel):
     """Collect a pack source (game folder, archive, disk image, or .ffpfs) + output +
-    format, and ADD a pack job to the queue. A .ffpfsc is already packed → use Convert."""
+    format, and ADD a pack job to the queue. A .ffpfsc is already packed → use Convert.
 
-    def __init__(self, app):
+    Edit mode (item=existing GameItem): the dialog opens pre-filled with that item's
+    source/output/format; saving mutates it in place (or, if the source changed, swaps
+    the GameItem at the same queue index)."""
+
+    def __init__(self, app, item=None):
         super().__init__(app.root)
         self.app = app
-        self.title("Pack — add job to queue")
+        self.edit_item = item
+        self.title("Pack — edit job" if item else "Pack — add job to queue")
         self.geometry("620x410")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
-        self.src_var = tk.StringVar()
-        self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
-        self.fmt_compressed = tk.BooleanVar(value=bool(app.output_compressed_var.get()))
+        # Pre-fill from the existing item when editing; else from the remembered defaults.
+        if item is not None:
+            init_src = str(getattr(item, "archive_path", None) or getattr(item, "path", "") or "")
+            init_out = str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip()
+            init_fmt = getattr(item, "output_compressed", None)
+            if init_fmt is None:
+                init_fmt = bool(app.output_compressed_var.get())
+        else:
+            init_src = ""
+            init_out = (app.output_var.get() or "").strip()
+            init_fmt = bool(app.output_compressed_var.get())
+        self.src_var = tk.StringVar(value=init_src)
+        self.out_var = tk.StringVar(value=init_out)
+        self.fmt_compressed = tk.BooleanVar(value=bool(init_fmt))
         self.fmt_hint = tk.StringVar()
 
-        ctk.CTkLabel(self, text="📦  Pack — add job",
+        header_text = "📦  Pack — edit job" if item else "📦  Pack — add job"
+        ctk.CTkLabel(self, text=header_text,
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs — "
-                                "to its own output folder and format. Adds a job to the queue.",
+        sub = ("Change this job's source, output folder, or format. The job stays at its "
+               "current queue position." if item else
+               "Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs — "
+               "to its own output folder and format. Adds a job to the queue.")
+        ctk.CTkLabel(self, text=sub,
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
@@ -3996,7 +4016,8 @@ class PackDialog(ctk.CTkToplevel):
         self._on_fmt()
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
+        save_text = "💾  Save changes" if item else "➕  Add to queue"
+        ctk.CTkButton(btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
                        command=self._add).pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
@@ -4042,13 +4063,49 @@ class PackDialog(ctk.CTkToplevel):
         outf = self.out_var.get().strip()
         if not outf:
             messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
+        fmt = bool(self.fmt_compressed.get())
+
+        # ── Edit mode: mutate the existing item in place; if the source changed, swap
+        #    the GameItem at the same queue index so the job keeps its position. ──
+        if self.edit_item is not None:
+            it = self.edit_item
+            try:
+                old_src_p = Path(str(getattr(it, "archive_path", None) or getattr(it, "path", ""))).resolve()
+                new_src_p = src.resolve()
+                same_source = (old_src_p == new_src_p)
+            except Exception:
+                same_source = False
+            if same_source:
+                it.output_path = Path(outf)
+                it.output_compressed = fmt
+                if it.status not in ("Done",):
+                    it.status = "Queued"
+                self.app.update_queue_box(select_item=it)
+                self.app.log("OK", f"Job updated: {it.name}")
+                self.destroy(); return
+            # Source changed → build a fresh GameItem of the right kind and replace.
+            new_item = self.app._build_pack_item_for(src, parent=self)
+            if new_item is None:
+                return  # validation already shown
+            new_item.output_path     = Path(outf)
+            new_item.output_compressed = fmt
+            try:
+                idx = self.app.queue.index(it)
+                self.app.queue[idx] = new_item
+            except ValueError:
+                self.app.queue.append(new_item)
+            self.app.update_queue_box(select_item=new_item)
+            self.app.log("OK", f"Job replaced: {it.name} → {new_item.name}")
+            self.destroy(); return
+
+        # ── Add mode (original path) ─────────────────────────────────────────
         # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
         # image / .ffpfs and queues the right pack item. Setting output_var + the format var
         # makes this job's output + format the values snapshotted onto the item (per-job),
         # and the remembered defaults the next submenu pre-fills.
         self.app.output_var.set(outf)
         try:
-            self.app.output_compressed_var.set(bool(self.fmt_compressed.get()))
+            self.app.output_compressed_var.set(fmt)
         except Exception:
             pass
         self.app.source_var.set(s)
@@ -4062,27 +4119,43 @@ class PackDialog(ctk.CTkToplevel):
 
 class PatchDialog(ctk.CTkToplevel):
     """Collect a game (.ffpfsc / folder / archive) + a patch (folder / archive) and
-    kick off 'patch into game' — unpack the game, overlay the patch files, repack."""
+    kick off 'patch into game' — unpack the game, overlay the patch files, repack.
 
-    def __init__(self, app):
+    Edit mode (item=existing GameItem): opens pre-filled with that item's game/patch/
+    output/mode; saving mutates the item in place."""
+
+    def __init__(self, app, item=None):
         super().__init__(app.root)
         self.app = app
-        self.title("Integrate Patch into Game")
+        self.edit_item = item
+        self.title("Integrate Patch — edit job" if item else "Integrate Patch into Game")
         self.geometry("640x450")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
-        self.game_var = tk.StringVar()
-        self.patch_var = tk.StringVar()
-        self.mode_var = tk.StringVar(value="new")
-        self.out_var = tk.StringVar(value=(app.output_var.get() or "").strip())
+        if item is not None:
+            init_game = str(getattr(item, "path", "") or "")
+            init_patch = str(getattr(item, "patch_source", "") or "")
+            init_mode = "overwrite" if getattr(item, "patch_overwrite", False) else "new"
+            init_out = str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip()
+        else:
+            init_game = ""; init_patch = ""; init_mode = "new"
+            init_out = (app.output_var.get() or "").strip()
+        self.game_var = tk.StringVar(value=init_game)
+        self.patch_var = tk.StringVar(value=init_patch)
+        self.mode_var = tk.StringVar(value=init_mode)
+        self.out_var = tk.StringVar(value=init_out)
 
-        ctk.CTkLabel(self, text="🩹  Integrate Patch into Game",
+        header_text = "🩹  Integrate Patch — edit job" if item else "🩹  Integrate Patch into Game"
+        ctk.CTkLabel(self, text=header_text,
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Unpacks the game, overlays the patch files (overwrite + new), and repacks. "
-                                "Adds a patch job to the queue — press ▶ START to run it.",
+        sub = ("Change this patch job's game, patch source, mode, or output. The job stays "
+               "at its current queue position." if item else
+               "Unpacks the game, overlays the patch files (overwrite + new), and repacks. "
+               "Adds a patch job to the queue — press ▶ START to run it.")
+        ctk.CTkLabel(self, text=sub,
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         self._file_row("Game  (.ffpfsc, folder, or archive):", self.game_var,
@@ -4107,7 +4180,8 @@ class PatchDialog(ctk.CTkToplevel):
                        command=lambda: self._pick_dir(self.out_var)).pack(side="left", padx=(6, 0))
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="➕  Add to queue", fg_color=GREEN, hover_color=GREEN2,
+        save_text = "💾  Save changes" if item else "➕  Add to queue"
+        ctk.CTkButton(btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
                        command=self._go).pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
@@ -4161,6 +4235,26 @@ class PatchDialog(ctk.CTkToplevel):
         overwrite = self.mode_var.get() == "overwrite"
         out_folder = self.out_var.get().strip()
         out_path = Path(out_folder) if out_folder else game.parent
+
+        # ── Edit mode: mutate the existing patch item in place ───────────────
+        if self.edit_item is not None:
+            it = self.edit_item
+            it.path            = game
+            it.name            = (game.stem if game.suffix.lower() == ".ffpfsc" else game.name)
+            try:
+                it.title_id = parse_title_id(game) or "🩹"
+            except Exception:
+                it.title_id = "🩹"
+            it.patch_source    = patch
+            it.output_path     = out_path
+            it.patch_overwrite = overwrite
+            if it.status not in ("Done",):
+                it.status = "Queued"
+            self.destroy()
+            self.app.update_queue_box(select_item=it)
+            self.app.log("OK", f"Patch job updated: {it.name}")
+            return
+
         item = GameItem.from_patch(game, patch, output_path=out_path, overwrite=overwrite)
         self.destroy()
         self.app.queue.append(item)
@@ -4309,6 +4403,131 @@ class ConverterDialog(ctk.CTkToplevel):
             return
         self.app._queue_conversion(Path(raw), action)
         self.destroy()
+
+
+class JobEditMiniDialog(ctk.CTkToplevel):
+    """Lightweight edit dialog for jobs whose ConverterDialog/PackDialog/PatchDialog flows
+    don't fit a simple two-field shape: an Unpack/Convert item (the .ffpfsc image source
+    + an output folder) or a Fake-Sign item (just the folder to sign in place). For Pack
+    and Patch use the full PackDialog / PatchDialog in edit mode instead."""
+
+    def __init__(self, app, item):
+        super().__init__(app.root)
+        self.app = app
+        self.edit_item = item
+        op = getattr(item, "operation", "pack")
+        title = {"unpack": "Convert — edit job",
+                 "fake-sign": "Fake Sign — edit job"}.get(op, "Edit job")
+        self.title(title); self.geometry("620x260")
+        self.configure(fg_color=BLACK); self.resizable(False, False)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+
+        if op == "unpack":
+            head = "🔄  Convert — edit job"
+            sub  = "Change this conversion's source image or output folder. The job stays at its current queue position."
+            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
+            self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
+        else:   # fake-sign
+            head = "🖊  Fake Sign — edit job"
+            sub  = "Change the folder this fake-sign job operates on. The job stays at its current queue position."
+            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
+            self.out_var = None
+
+        ctk.CTkLabel(self, text=head,
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text=sub, text_color=MUTED, wraplength=600, justify="left"
+                      ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # Source row
+        srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
+        src_label = ("Source image (.ffpfsc / .ffpfs):" if op == "unpack"
+                     else "Folder (to fake-sign in place):")
+        ctk.CTkLabel(srow, text=src_label, text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
+        ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE
+                      ).pack(side="left", fill="x", expand=True)
+        if op == "unpack":
+            ctk.CTkButton(sinner, text="File", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                           command=self._pick_image).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="Folder", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_folder).pack(side="left", padx=(6, 0))
+
+        # Output row (unpack only)
+        if op == "unpack":
+            orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
+            ctk.CTkLabel(orow, text="Output folder  (where extracted files land):", text_color=WHITE,
+                          font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+            oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
+            ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE
+                          ).pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                           command=self._pick_outdir).pack(side="left", padx=(6, 0))
+
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btns, text="💾  Save changes", fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+                       command=self._save).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+
+    def _pick_image(self):
+        p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
+                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_folder(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.src_var.set(p)
+
+    def _pick_outdir(self):
+        p = filedialog.askdirectory()
+        if p and self.out_var is not None:
+            self.out_var.set(p)
+
+    def _save(self):
+        s = self.src_var.get().strip()
+        if not s:
+            messagebox.showerror("Missing", "Please choose a source.", parent=self); return
+        src = Path(s)
+        if not src.exists():
+            messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
+        it = self.edit_item
+        op = getattr(it, "operation", "pack")
+        if op == "unpack":
+            if not (src.is_file() and src.suffix.lower() in (".ffpfsc", ".ffpfs")):
+                messagebox.showerror("Wrong type", "Convert needs a .ffpfsc or .ffpfs image.", parent=self); return
+            it.path = src
+            it.name = src.stem
+            try:
+                it.title_id = parse_title_id(src) or "📤"
+            except Exception:
+                it.title_id = "📤"
+            try:
+                it.size = src.stat().st_size
+                it.extracted_size = it.size
+            except Exception:
+                pass
+            outf = (self.out_var.get() or "").strip() if self.out_var else ""
+            it.output_path = Path(outf) if outf else None
+        else:   # fake-sign
+            if not src.is_dir():
+                messagebox.showerror("Wrong type", "Fake Sign needs a folder.", parent=self); return
+            it.path = src
+            it.name = src.name
+            try:
+                it.title_id = parse_title_id(src) or "🖊"
+            except Exception:
+                it.title_id = "🖊"
+        if it.status not in ("Done",):
+            it.status = "Queued"
+        self.destroy()
+        self.app.update_queue_box(select_item=it)
+        self.app.log("OK", f"Job updated: {it.name}")
 
 
 # ─── Main Application ──────────────────────────────────────────────────────────
@@ -4793,8 +5012,9 @@ class App:
         self.queue_listbox.configure(yscrollcommand=lb_scrollbar.set)
         self.queue_listbox.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
         lb_scrollbar.grid(row=0, column=1, sticky="ns", pady=4, padx=(0, 2))
-        # Clicking a row refreshes game details; arrow keys reorder
+        # Clicking a row refreshes game details; arrow keys reorder; double-click edits.
         self.queue_listbox.bind("<<ListboxSelect>>", self._on_queue_select)
+        self.queue_listbox.bind("<Double-Button-1>", self._on_queue_double_click)
         self.queue_listbox.bind("<Up>",   self._lb_key_up)
         self.queue_listbox.bind("<Down>", self._lb_key_down)
 
@@ -6107,6 +6327,19 @@ class App:
         mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
         out_str = self.output_var.get().strip()
         size = _build_size_of(item)
+        size_is_estimate = False
+        # Encrypted-header archives (rar -hp / 7z with encrypted file names) report
+        # extracted_size=0, so _build_size_of returns UNKNOWN and the SSD-aware routing
+        # options (1/2/3 — all gated on `size > 0`) would fall through to the safe path
+        # = the bigger output drive. But game .rar/.zip is already heavily compressed
+        # game data, so the on-disk volume size is a tight lower bound for the extracted
+        # payload (~1.0–1.05x). Estimate from on-disk size so the SSD routes can run;
+        # the space gate is the backstop if the estimate ever undershoots reality.
+        if size == 0 and getattr(item, "archive_path", None):
+            on_disk = int(getattr(item, "size", 0) or 0)
+            if on_disk > 0:
+                size = int(on_disk * 1.05)
+                size_is_estimate = True
         factor = _peak_factor_for(item)
         if not out_str:
             return temp_root
@@ -6146,7 +6379,7 @@ class App:
         out_split_need = int(src_on_out) + estimate_output_space_needed(size, comp_out, known_out)
         temp_free = get_free_space(temp_base_p)
         out_free  = get_free_space(probe_out)
-        szs = format_size(size) if size else "?"
+        szs = (format_size(size) + " est.") if size_is_estimate else (format_size(size) if size else "?")
         contention = " (output is the source drive: read+write contention, slower)" if out_is_source else ""
 
         # ── Disk images (.exfat, .ffpkg): single-pass — mkpfs compresses the file
@@ -6633,6 +6866,73 @@ class App:
         idx = self._queue_sel_idx()
         if idx is not None and idx < len(self.queue):
             self.update_game_details(self.queue[idx])
+
+    def _on_queue_double_click(self, event=None):
+        """Double-click a queue row → open the matching submenu dialog pre-filled with
+        this item's settings, so the user can change source / output / format etc. The
+        item that is currently RUNNING (queue[0] during a batch) and any TERMINAL item
+        (Done/Failed/Skipped/Cancelled) are not edited — those just refresh details."""
+        # Resolve which row was clicked. event.y gives the precise row (nearest()) even
+        # if the listbox selection has not yet caught up to the click.
+        idx = None
+        try:
+            if event is not None:
+                idx = self.queue_listbox.nearest(event.y)
+        except Exception:
+            idx = None
+        if idx is None:
+            idx = self._queue_sel_idx()
+        if idx is None or idx >= len(self.queue):
+            return "break"
+        item = self.queue[idx]
+        # Block edit on the running job (queue[0] during a batch) — its paths are in use.
+        if self._batch_running and idx == 0:
+            self.log("WARN", "Cannot edit the currently running job.")
+            return "break"
+        status = (getattr(item, "status", "") or "").lower()
+        if status in ("done",):
+            self.log("INFO", "This job is already done — remove and re-add to run it again with new settings.")
+            return "break"
+
+        op = getattr(item, "operation", "pack")
+        try:
+            if op == "pack":
+                PackDialog(self, item=item)
+            elif op == "patch":
+                PatchDialog(self, item=item)
+            elif op in ("unpack", "fake-sign"):
+                JobEditMiniDialog(self, item)
+            else:
+                self.log("WARN", f"No editor for job type '{op}'.")
+        except Exception as e:
+            self.log("ERROR", f"Could not open editor: {e}")
+        return "break"
+
+    def _build_pack_item_for(self, src: Path, parent=None):
+        """Build the right GameItem flavour for a pack source path so the Pack edit
+        dialog can REPLACE an item at the same queue index without going through
+        add_source_to_queue (which only appends). Returns None and shows an error
+        dialog (parented to *parent* if provided) when *src* is not a valid pack source."""
+        try:
+            if src.is_file() and src.suffix.lower() == ".ffpfs":
+                return GameItem.from_exfat(src)
+            if src.is_file() and src.suffix.lower() in DISK_IMAGE_SUFFIXES:
+                return GameItem.from_exfat(src)
+            if src.is_file() and src.suffix.lower() in (".zip", ".rar", ".7z"):
+                return GameItem.from_archive(src)
+            if src.is_dir():
+                # GameItem(path) is the plain folder constructor — it scans size/files
+                # synchronously, which is fine for an explicit edit action.
+                return GameItem(src)
+        except Exception as e:
+            messagebox.showerror("Build failed", f"Could not classify the source:\n{e}",
+                                 parent=parent or self.root)
+            return None
+        messagebox.showerror("Unsupported source",
+                             f"Not a valid pack source:\n{src}\n\nUse a folder, archive, "
+                             ".exfat/.ffpkg, or .ffpfs.",
+                             parent=parent or self.root)
+        return None
 
     # ── Queue management ──────────────────────────────────────────────────────
     def queue_move_up(self):

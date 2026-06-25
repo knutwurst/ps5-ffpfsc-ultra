@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.70"
+APP_VERSION = "1.0.71"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -600,60 +600,6 @@ def poke_drive_keepalive(d: Path) -> bool:
         return True
     except Exception:
         return False
-
-
-def pick_file_or_folder(prompt: str = "Pick a file or folder",
-                         initial: str = "") -> str:
-    """Show a native picker that accepts EITHER a file or a folder in one dialog.
-
-    macOS: spawn osascript -l JavaScript to drive NSOpenPanel with
-    canChooseFiles=YES + canChooseDirectories=YES — Tk's askopenfilename can't
-    do this and prompting twice (file, then folder) is awful UX.
-
-    Other platforms: fall back to filedialog.askopenfilename with a broad type
-    filter (the caller should expose a separate Folder button on Win/Linux).
-
-    Returns the chosen POSIX path or '' on cancel."""
-    if sys.platform == "darwin":
-        init_bit = ""
-        if initial:
-            init_dir = initial if os.path.isdir(initial) else os.path.dirname(initial) or ""
-            if init_dir:
-                init_dir_esc = init_dir.replace("\\", "\\\\").replace('"', '\\"')
-                init_bit = f'panel.directoryURL = $.NSURL.fileURLWithPath("{init_dir_esc}");'
-        prompt_esc = (prompt or "").replace("\\", "\\\\").replace('"', '\\"')
-        script = f'''
-            ObjC.import('AppKit');
-            const panel = $.NSOpenPanel.openPanel;
-            panel.canChooseFiles = true;
-            panel.canChooseDirectories = true;
-            panel.allowsMultipleSelection = false;
-            panel.title = "{prompt_esc}";
-            panel.prompt = "Choose";
-            {init_bit}
-            if (panel.runModal == $.NSModalResponseOK) {{
-                ObjC.unwrap(panel.URLs.objectAtIndex(0).path);
-            }} else {{
-                "";
-            }}
-        '''
-        try:
-            r = subprocess.run(["osascript", "-l", "JavaScript", "-e", script],
-                               capture_output=True, text=True, timeout=600)
-            return r.stdout.strip()
-        except Exception:
-            return ""
-    # Non-macOS fallback — file picker only (a separate folder button is recommended).
-    try:
-        return filedialog.askopenfilename(
-            title=prompt,
-            initialdir=(initial if initial and os.path.isdir(initial)
-                        else (os.path.dirname(initial) if initial else "")),
-            filetypes=[("Any supported", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs"),
-                       ("All files", "*.*")]
-        ) or ""
-    except Exception:
-        return ""
 
 
 def _probe_drive_speed(path: Path) -> str:
@@ -4185,11 +4131,14 @@ class PackDialog(ctk.CTkToplevel):
                       text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        # ONE picker that accepts either kind — the type is auto-detected from the path
-        # at save time (no Folder/Archive/Image triage button needed).
-        ctk.CTkButton(sinner, text="📂  Open…", width=104, fg_color=GREEN, hover_color=GREEN2,
+        # Tk can't pick a file AND a folder in one native dialog, so two buttons —
+        # but no archive-vs-image triage: ONE broad file filter covers them all, and
+        # the kind is auto-detected from the path at save time.
+        ctk.CTkButton(sinner, text="📄  File…", width=76, fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
-                       command=self._pick_any).pack(side="left", padx=(6, 0))
+                       command=self._pick_file).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="📁  Folder…", width=88, fg_color=CARD2, hover_color=GREEN2,
+                       text_color=WHITE, command=self._pick_folder).pack(side="left", padx=(6, 0))
 
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(orow, text="Output folder  (this job's .ffpfsc lands here):", text_color=WHITE,
@@ -4219,43 +4168,35 @@ class PackDialog(ctk.CTkToplevel):
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
 
-    def _pick_any(self):
-        """One native picker that takes either a folder OR any supported file —
-        kind is auto-detected when the job runs (folder → game/bundle/library;
-        file → archive vs disk-image vs .ffpfs by suffix).
-
-        The macOS NSOpenPanel runs in a separate osascript process and blocks until
-        the user picks/cancels, so it MUST run off the Tk main thread — calling it
-        inline froze the event loop (beachball). Run it in a worker thread and poll
-        a queue for the result so Tk keeps redrawing."""
+    def _pick_file(self):
+        """Pick any supported SOURCE FILE — one broad filter (archive / disk image /
+        .ffpfs), no archive-vs-image triage; the kind is auto-detected from the path
+        when the job runs. Tk's native askopenfilename is reliable (the JXA NSOpenPanel
+        route didn't open for the user)."""
         init = (self.src_var.get() or "").strip()
-        rq: queue.Queue = queue.Queue()
+        p = filedialog.askopenfilename(
+            parent=self,
+            title="Pick a source file (archive, disk image .exfat/.ffpkg, or .ffpfs)",
+            initialdir=(init if os.path.isdir(init)
+                        else (os.path.dirname(init) if init else "")),
+            filetypes=[("Supported sources", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs"),
+                       ("All files", "*.*")],
+        )
+        if p:
+            self.src_var.set(p)
 
-        def _worker():
-            try:
-                rq.put(pick_file_or_folder(
-                    "Pick a source: folder, archive, disk image (.exfat/.ffpkg), or .ffpfs",
-                    initial=init))
-            except Exception:
-                rq.put("")
-        threading.Thread(target=_worker, daemon=True).start()
-
-        def _poll():
-            try:
-                p = rq.get_nowait()
-            except queue.Empty:
-                if self.winfo_exists():
-                    self.after(120, _poll)
-                return
-            if p and self.winfo_exists():
-                self.src_var.set(p)
-            # Bring the dialog back to the front after the external panel closed.
-            try:
-                if self.winfo_exists():
-                    self.lift(); self.focus_force()
-            except Exception:
-                pass
-        self.after(120, _poll)
+    def _pick_folder(self):
+        """Pick a SOURCE FOLDER — a game folder, or a folder holding a game/archive
+        (the folder name is mirrored to the output)."""
+        init = (self.src_var.get() or "").strip()
+        p = filedialog.askdirectory(
+            parent=self,
+            title="Pick a source folder",
+            initialdir=(init if os.path.isdir(init)
+                        else (os.path.dirname(init) if init else "")),
+        )
+        if p:
+            self.src_var.set(p)
 
     def _pick_out(self):
         p = filedialog.askdirectory(title="Select the output folder for this job")

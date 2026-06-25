@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.73"
+APP_VERSION = "1.0.74"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1092,9 +1092,21 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     tid = (getattr(item, "title_id", "") or "").strip()
     if tid in PLACEHOLDERS:
         tid = ""
-    name = (getattr(item, "name", "") or "").strip()
+    # Prefer the stable friendly name (the bundle/folder name the user saw, or a folder
+    # pack's param.json title) over item.name, which collapses to the extracted stem
+    # (e.g. "PPSA13427") after an archive/bundle is unpacked. This makes the .ffpfsc
+    # named after the GAME, the same as packing a folder directly.
+    name = (getattr(item, "display_name", "") or getattr(item, "name", "") or "").strip()
     if name in PLACEHOLDERS or name == tid:
         name = tid or "output"
+    elif tid:
+        # Drop a bare title-id embedded at the end of the name (a dump folder like
+        # "Horizon Zero Dawn Remastered PPSA13427") so it is re-added cleanly as
+        # [TITLEID] below — matching the "Name [TITLEID] [ver]" library convention.
+        stripped = re.sub(r"[\s_\-]*\b" + re.escape(tid) + r"\b[\s_\-]*$", "",
+                          name, flags=re.I).strip(" -_")
+        if stripped:
+            name = stripped
     suffix_parts = []
     if tid and tid.lower() not in name.lower():
         suffix_parts.append(f"[{tid}]")

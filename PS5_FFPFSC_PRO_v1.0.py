@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.65"
+APP_VERSION = "1.0.66"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2666,11 +2666,60 @@ class ArchiveExtractor:
         )
 
     @staticmethod
+    def _find_native_7z() -> str | None:
+        """Locate a native 7-Zip binary: PATH first, then well-known Homebrew install
+        paths (a .app bundled with PyInstaller doesn't inherit the user's shell PATH,
+        so /opt/homebrew/bin is invisible without explicit probing). Prefer '7zz' —
+        Igor Pavlov's official 22.x+ binary that replaces the dormant p7zip fork —
+        then fall back to '7z' / '7za'. Returns the absolute path or None.
+
+        Native 7-Zip is 3-10x faster than py7zr (pure-Python LZMA, single-threaded)
+        because LZMA decode is the bottleneck of any large solid 7z game archive."""
+        names = ("7zz", "7z", "7za")
+        for name in names:
+            p = shutil.which(name)
+            if p:
+                return p
+        # macOS: Homebrew binaries when PATH was sanitised (e.g. /usr/bin only).
+        if sys.platform == "darwin":
+            for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
+                for name in names:
+                    cand = f"{prefix}/{name}"
+                    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                        return cand
+        return None
+
+    @staticmethod
     def _sevenz(archive: Path, dest: Path, log_fn, progress_fn=None, password: str = "",
                 cancel_event: threading.Event | None = None):
+        ArchiveExtractor._check_cancel(cancel_event)
+        # Native CLI first — py7zr's pure-Python LZMA decoder is the slow path; the
+        # native binary uses optimised C code and saturates the I/O instead.
+        exe = ArchiveExtractor._find_native_7z()
+        if exe:
+            try:
+                if log_fn:
+                    log_fn("INFO", f"  7z: using native {os.path.basename(exe)} (fast).")
+                cmd = [exe, "x", str(archive), f"-o{dest}", "-y", "-bsp1"]   # -bsp1: progress to stdout
+                if password:
+                    cmd.append(f"-p{password}")
+                ArchiveExtractor._run_extract_process(
+                    cmd, os.path.basename(exe), log_fn=log_fn,
+                    progress_fn=progress_fn, cancel_event=cancel_event
+                )
+                return
+            except FileNotFoundError:
+                pass    # disappeared between probe and exec
+            except ArchiveExtractionCancelled:
+                raise
+            except RuntimeError as e:
+                if log_fn:
+                    log_fn("WARN", f"  7z: native CLI failed ({e}) — falling back to py7zr.")
+        # Fallback: pure-Python py7zr (slow but always available with our deps).
         try:
-            ArchiveExtractor._check_cancel(cancel_event)
             import py7zr  # type: ignore
+            if log_fn:
+                log_fn("INFO", "  7z: using py7zr (pure-Python — install p7zip / 7-Zip CLI for ~5x speedup).")
             kwargs = {}
             if password:
                 kwargs["password"] = password
@@ -2680,26 +2729,9 @@ class ArchiveExtractor:
             return
         except ImportError:
             pass
-        # Fallback: 7z / 7za CLI
-        for exe in ("7z", "7za"):
-            try:
-                cmd = [exe, "x", str(archive), f"-o{dest}", "-y"]
-                if password:
-                    cmd.append(f"-p{password}")
-                ArchiveExtractor._run_extract_process(
-                    cmd, exe, log_fn=log_fn,
-                    progress_fn=progress_fn, cancel_event=cancel_event
-                )
-                return
-            except FileNotFoundError:
-                pass
-            except ArchiveExtractionCancelled:
-                raise
-            except RuntimeError:
-                pass
         raise RuntimeError(
             "Cannot extract 7z — install py7zr:  pip install py7zr\n"
-            "or put 7z.exe on your PATH."
+            "or put 7z / 7zz / 7za on your PATH (Homebrew: brew install p7zip)."
         )
 
     # ── helper ─────────────────────────────────────────────────────────────────

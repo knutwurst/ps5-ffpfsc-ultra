@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.69"
+APP_VERSION = "1.0.70"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -838,6 +838,10 @@ def find_files_by_suffix(root: Path, suffixes: set[str], max_depth: int = 6) -> 
             return
         try:
             for child in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+                # Skip filesystem junk — a '._image.ffpfs' AppleDouble sidecar carries
+                # the real suffix and would otherwise be picked up as a real image.
+                if child.name.startswith("._") or child.name == ".DS_Store":
+                    continue
                 if child.is_file() and child.suffix.lower() in suffixes:
                     found.append(child)
                 elif child.is_dir() and not child.name.startswith("."):
@@ -2925,6 +2929,9 @@ def detect_game_bundle(folder: Path, candidate_passwords=None, log_fn=None, dete
         entries = list(folder.iterdir())
     except Exception:
         return None, [], [], None   # 4-tuple — callers unpack (game, siblings, all_games, patch)
+    # Drop filesystem junk up front (._* AppleDouble carry real suffixes, .DS_Store,
+    # Thumbs.db, junk dirs) so it is never mistaken for a game file or kept as a sibling.
+    entries = [p for p in entries if not is_fs_junk_name(p.name)]
     files = [p for p in entries if p.is_file()]
     subdirs = [p for p in entries if p.is_dir()]
 
@@ -4215,13 +4222,40 @@ class PackDialog(ctk.CTkToplevel):
     def _pick_any(self):
         """One native picker that takes either a folder OR any supported file —
         kind is auto-detected when the job runs (folder → game/bundle/library;
-        file → archive vs disk-image vs .ffpfs by suffix)."""
-        p = pick_file_or_folder(
-            "Pick a source: folder, archive, disk image (.exfat/.ffpkg), or .ffpfs",
-            initial=(self.src_var.get() or "").strip()
-        )
-        if p:
-            self.src_var.set(p)
+        file → archive vs disk-image vs .ffpfs by suffix).
+
+        The macOS NSOpenPanel runs in a separate osascript process and blocks until
+        the user picks/cancels, so it MUST run off the Tk main thread — calling it
+        inline froze the event loop (beachball). Run it in a worker thread and poll
+        a queue for the result so Tk keeps redrawing."""
+        init = (self.src_var.get() or "").strip()
+        rq: queue.Queue = queue.Queue()
+
+        def _worker():
+            try:
+                rq.put(pick_file_or_folder(
+                    "Pick a source: folder, archive, disk image (.exfat/.ffpkg), or .ffpfs",
+                    initial=init))
+            except Exception:
+                rq.put("")
+        threading.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            try:
+                p = rq.get_nowait()
+            except queue.Empty:
+                if self.winfo_exists():
+                    self.after(120, _poll)
+                return
+            if p and self.winfo_exists():
+                self.src_var.set(p)
+            # Bring the dialog back to the front after the external panel closed.
+            try:
+                if self.winfo_exists():
+                    self.lift(); self.focus_force()
+            except Exception:
+                pass
+        self.after(120, _poll)
 
     def _pick_out(self):
         p = filedialog.askdirectory(title="Select the output folder for this job")
@@ -6217,6 +6251,12 @@ class App:
                 try:
                     for f in p.iterdir():
                         if not f.is_file():
+                            continue
+                        # Skip macOS/Windows filesystem junk: a '._Game.rar' AppleDouble
+                        # sidecar (created when a .rar is copied to exFAT/FAT) carries the
+                        # real file's suffix, so without this it would queue as a bogus
+                        # 'archive'. Same for ._*.exfat, .DS_Store, Thumbs.db, …
+                        if is_fs_junk_name(f.name):
                             continue
                         suffix = f.suffix.lower()
                         if suffix in DISK_IMAGE_SUFFIXES:

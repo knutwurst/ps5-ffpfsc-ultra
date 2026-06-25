@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.63"
+APP_VERSION = "1.0.64"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4530,6 +4530,67 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         self.app.log("OK", f"Job updated: {it.name}")
 
 
+class ArchivePasswordPrompt(ctk.CTkToplevel):
+    """Modal: ask the user for ONE archive's password when no saved candidate unlocks
+    its header (so the routing pre-check has no honest extracted size to work with).
+    Result is exposed via .password ('' = Skip)."""
+
+    def __init__(self, app, archive_name: str):
+        super().__init__(app.root)
+        self.app = app
+        self.password = ""
+        self.title("Archive password needed")
+        self.geometry("540x240")
+        self.configure(fg_color=BLACK); self.resizable(False, False)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+
+        ctk.CTkLabel(self, text="🔑  Archive password needed",
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self,
+                      text=f"The header of '{archive_name}' is encrypted (or could not be read) — "
+                           f"no saved password worked. Enter the password now so the real "
+                           f"extracted size is known for SSD routing; the password is then saved "
+                           f"for future archives. Skip to add the item anyway.",
+                      text_color=MUTED, wraplength=500, justify="left"
+                      ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        self.pw_var = tk.StringVar()
+        prow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); prow.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(prow, text="Password:", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        pinner = ctk.CTkFrame(prow, fg_color=PANEL); pinner.pack(fill="x", padx=10, pady=(2, 8))
+        self.entry = ctk.CTkEntry(pinner, textvariable=self.pw_var, fg_color=CARD2,
+                                   text_color=WHITE, show="•")
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.focus_set()
+        self.show_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(pinner, text="Show", variable=self.show_var,
+                         fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
+                         command=self._toggle_show).pack(side="left", padx=(6, 0))
+
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btns, text="OK", fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+                       command=self._ok).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Skip", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._skip).pack(side="right")
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._skip())
+
+    def _toggle_show(self):
+        self.entry.configure(show="" if self.show_var.get() else "•")
+
+    def _ok(self):
+        self.password = self.pw_var.get().strip()
+        self.destroy()
+
+    def _skip(self):
+        self.password = ""
+        self.destroy()
+
+
 # ─── Main Application ──────────────────────────────────────────────────────────
 
 class App:
@@ -5853,6 +5914,10 @@ class App:
             self.status_update("Ready",
                                 f"Archive queued — will extract when compression starts: {src.name}",
                                 "Ready", 0, 0, "00:00", "—", "—")
+            # If the header is encrypted and no saved password worked, ask now — so the
+            # auto routing knows the real extracted size and can place this on the SSD.
+            self._resolve_archive_password(item)
+            self.update_queue_box(select_item=item)
             return
 
         # ── Folder of existing PFS images to unpack ──────────────────────────
@@ -5950,7 +6015,7 @@ class App:
                 # 2. No extracted games — look for .exfat/.ffpkg images and archive files (one level deep)
                 self.log("INFO", "No game folders found — scanning for disk images and archives…")
                 image_files = []   # .exfat and .ffpkg
-                archives    = []
+                archives_raw = []  # every .zip/.rar/.7z on disk, including every .partN.rar volume
                 try:
                     for f in p.iterdir():
                         if not f.is_file():
@@ -5961,13 +6026,25 @@ class App:
                             label = "exFAT" if suffix == ".exfat" else "ffpkg"
                             self.log("INFO", f"  Found {label} image: {f.name}")
                         elif suffix in (".zip", ".rar", ".7z"):
-                            archives.append(f)
-                            self.log("INFO", f"  Found archive: {f.name}")
+                            archives_raw.append(f)
                 except Exception as e:
                     self.log("WARN", f"Could not list folder contents: {e}")
 
                 image_files.sort(key=lambda f: f.name.lower())
-                archives.sort(key=lambda f: f.name.lower())
+                # Dedup multi-part RAR sets: a set like name.part1.rar, name.part2.rar, …
+                # is ONE game, not N. Normalise every part to its first volume and unique
+                # the result so the queue gets ONE item per archive set (the from_archive
+                # builder already keys off the first volume for size + extraction). Log
+                # one line per SET, not per file on disk.
+                archives_raw.sort(key=lambda f: f.name.lower())
+                seen, archives = set(), []
+                for f in archives_raw:
+                    first = ArchiveExtractor._first_volume(f)
+                    if first in seen:
+                        continue
+                    seen.add(first)
+                    archives.append(first)
+                    self.log("INFO", f"  Found archive: {first.name}")
 
                 if image_files:
                     self.log("INFO", f"Found {len(image_files)} disk image(s) — queuing directly (no extraction needed)")
@@ -6866,6 +6943,53 @@ class App:
         idx = self._queue_sel_idx()
         if idx is not None and idx < len(self.queue):
             self.update_game_details(self.queue[idx])
+
+    def _resolve_archive_password(self, item) -> None:
+        """Prompt for an archive item's password when no saved candidate unlocks its
+        header (extracted_size is still 0 after from_archive's auto-probe). On success:
+        store the password ON the item (per-job override), persist it to settings (so
+        later archives unlock without asking again), AND fill in extracted_size — that
+        last bit is what the auto routing needs to place the build on the SSD instead
+        of falling back to the on-disk-size estimate. Skip leaves the item unchanged."""
+        if (getattr(item, "source_kind", "") != "archive"
+                or getattr(item, "extracted_size", 0) > 0
+                or not getattr(item, "archive_path", None)):
+            return
+        arc = item.archive_path
+        attempts = 0
+        while attempts < 3:
+            dlg = ArchivePasswordPrompt(self, arc.name)
+            try:
+                self.root.wait_window(dlg)
+            except Exception:
+                return
+            pw = (dlg.password or "").strip()
+            if not pw:
+                return   # user skipped
+            attempts += 1
+            try:
+                cands = self._candidate_passwords(item) + [pw]
+                sz = ArchiveExtractor.uncompressed_size(arc, cands)
+            except Exception:
+                sz = 0
+            if sz > 0:
+                item.extracted_size = sz
+                item.password = pw
+                try:
+                    if pw not in (self.archive_passwords or []):
+                        self.archive_passwords.append(pw)
+                        save_settings({"archive_passwords": list(self.archive_passwords)})
+                except Exception:
+                    pass
+                self.log("OK", f"Unlocked '{arc.name}' — size {format_size(sz)} read for routing.")
+                return
+            self.log("WARN", f"Password did not unlock '{arc.name}'.")
+            if not messagebox.askyesno(
+                "Wrong password",
+                f"That password did not unlock '{arc.name}'.\n\nTry again?",
+                parent=self.root):
+                return
+        self.log("WARN", f"Gave up on the password for '{arc.name}' — routing will use the size estimate.")
 
     def _on_queue_double_click(self, event=None):
         """Double-click a queue row → open the matching submenu dialog pre-filled with
@@ -9126,10 +9250,18 @@ class App:
                         "(Each archive will be extracted when it is its turn.)"
                     )
                     if ok:
+                        added = []
                         for arc in archives:
                             item = GameItem.from_archive(arc)
                             self.queue.append(item)
+                            added.append(item)
                             self.log("OK", f"Archive queued: {arc.name}")
+                        self.update_queue_box()
+                        # For each just-added archive whose header could not be read,
+                        # ask the user for its password — so the routing decision sees
+                        # the real extracted size up front.
+                        for it in added:
+                            self._resolve_archive_password(it)
                         self.update_queue_box()
                         self.status_update("Ready", f"{count} archive(s) added to queue.",
                                             "Ready", 0, 0, "00:00", "—", "—")

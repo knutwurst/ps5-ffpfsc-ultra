@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.64"
+APP_VERSION = "1.0.65"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -602,6 +602,50 @@ def poke_drive_keepalive(d: Path) -> bool:
         return False
 
 
+def _probe_drive_speed(path: Path) -> str:
+    """Fallback for drives where the OS reports no Solid-State flag (USB-attached
+    SSDs through a bridge that masks the flash bit — diskutil prints 'Info not
+    available'). Writes a small incompressible blob and times it: external SSDs
+    over USB 3.x do 200-1000 MB/s; spinning disks top out near 100-130 MB/s.
+
+    A single 32 MB write + fsync (~0.05 s SSD, ~0.3 s HDD). The temp file is
+    deleted before this returns. Returns 'SSD' / 'HDD' / 'Unknown' — never blocks
+    if the path is non-writable or too tight on free space."""
+    import time, secrets, tempfile
+    try:
+        target = path if path.exists() else path.parent
+        if not target.is_dir():
+            target = target.parent
+        # Require at least 200 MB free so a write-probe never edges a tight volume
+        # closer to ENOSPC mid-test (and never deletes user data via tempfile).
+        try:
+            if shutil.disk_usage(str(target)).free < 200 * 1024 * 1024:
+                return "Unknown"
+        except Exception:
+            return "Unknown"
+        size = 32 * 1024 * 1024
+        buf = secrets.token_bytes(size)
+        with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_probe_",
+                                          delete=True) as tf:
+            t = time.perf_counter()
+            tf.write(buf)
+            tf.flush()
+            os.fsync(tf.fileno())
+            dt = time.perf_counter() - t
+        mbps = (size / 1_048_576) / max(dt, 1e-6)
+        # 150 MB/s threshold cleanly separates USB-3 SSDs (>200) from external HDDs
+        # (<130); USB-2-bottlenecked SSDs would false-classify as HDD, but a USB-2
+        # drive shouldn't be the user's fast-temp pick anyway, so the worst case is
+        # 'route conservatively'. Returns Unknown in the ambiguous 100-150 MB/s band.
+        if mbps >= 150:
+            return "SSD"
+        if mbps < 100:
+            return "HDD"
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+
+
 def _probe_drive_type(path: Path) -> str:
     """Actually probe the drive type (may block ~1-2 s). See get_drive_type."""
     try:
@@ -646,11 +690,30 @@ def _probe_drive_type(path: Path) -> str:
             df = subprocess.run(["df", str(target)], capture_output=True, text=True, timeout=6)
             dev = df.stdout.strip().splitlines()[-1].split()[0]   # /dev/diskXsY
             whole = re.sub(r"s\d+$", "", dev)                     # /dev/diskX (whole disk)
+            saw_info_unavailable = False
             for d in ([dev, whole] if whole != dev else [dev]):
                 info = subprocess.run(["diskutil", "info", d], capture_output=True, text=True, timeout=8)
                 for line in info.stdout.splitlines():
-                    if "Solid State" in line:
-                        return "SSD" if "Yes" in line else "HDD"
+                    if "Solid State" not in line:
+                        continue
+                    # Split at ':' and compare the value exactly — substring matches on
+                    # the full line break when the value is "Info not available" (which
+                    # contains the substring "not" → false-positive for "No").
+                    parts = line.split(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    val = parts[1].strip()
+                    if val == "Yes":
+                        return "SSD"
+                    if val == "No":
+                        return "HDD"
+                    # "Info not available" — common on USB-attached SSDs (the bridge
+                    # masks the flash bit). Note it and fall through to the speed probe.
+                    saw_info_unavailable = True
+            if saw_info_unavailable:
+                speed_dt = _probe_drive_speed(target)
+                if speed_dt != "Unknown":
+                    return speed_dt
         except Exception:
             pass
         return "Unknown"

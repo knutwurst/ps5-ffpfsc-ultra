@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.67"
+APP_VERSION = "1.0.68"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -600,6 +600,60 @@ def poke_drive_keepalive(d: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def pick_file_or_folder(prompt: str = "Pick a file or folder",
+                         initial: str = "") -> str:
+    """Show a native picker that accepts EITHER a file or a folder in one dialog.
+
+    macOS: spawn osascript -l JavaScript to drive NSOpenPanel with
+    canChooseFiles=YES + canChooseDirectories=YES — Tk's askopenfilename can't
+    do this and prompting twice (file, then folder) is awful UX.
+
+    Other platforms: fall back to filedialog.askopenfilename with a broad type
+    filter (the caller should expose a separate Folder button on Win/Linux).
+
+    Returns the chosen POSIX path or '' on cancel."""
+    if sys.platform == "darwin":
+        init_bit = ""
+        if initial:
+            init_dir = initial if os.path.isdir(initial) else os.path.dirname(initial) or ""
+            if init_dir:
+                init_dir_esc = init_dir.replace("\\", "\\\\").replace('"', '\\"')
+                init_bit = f'panel.directoryURL = $.NSURL.fileURLWithPath("{init_dir_esc}");'
+        prompt_esc = (prompt or "").replace("\\", "\\\\").replace('"', '\\"')
+        script = f'''
+            ObjC.import('AppKit');
+            const panel = $.NSOpenPanel.openPanel;
+            panel.canChooseFiles = true;
+            panel.canChooseDirectories = true;
+            panel.allowsMultipleSelection = false;
+            panel.title = "{prompt_esc}";
+            panel.prompt = "Choose";
+            {init_bit}
+            if (panel.runModal == $.NSModalResponseOK) {{
+                ObjC.unwrap(panel.URLs.objectAtIndex(0).path);
+            }} else {{
+                "";
+            }}
+        '''
+        try:
+            r = subprocess.run(["osascript", "-l", "JavaScript", "-e", script],
+                               capture_output=True, text=True, timeout=600)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+    # Non-macOS fallback — file picker only (a separate folder button is recommended).
+    try:
+        return filedialog.askopenfilename(
+            title=prompt,
+            initialdir=(initial if initial and os.path.isdir(initial)
+                        else (os.path.dirname(initial) if initial else "")),
+            filetypes=[("Any supported", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs"),
+                       ("All files", "*.*")]
+        ) or ""
+    except Exception:
+        return ""
 
 
 def _probe_drive_speed(path: Path) -> str:
@@ -4120,16 +4174,15 @@ class PackDialog(ctk.CTkToplevel):
                       text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(srow, text="Source  (folder, archive, .exfat/.ffpkg, or .ffpfs):", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        ctk.CTkLabel(srow, text="Source  (folder OR file — archive, .exfat/.ffpkg, .ffpfs are all fine):",
+                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(sinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_folder).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="Archive", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_archive).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="Image", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_image).pack(side="left", padx=(6, 0))
+        # ONE picker that accepts either kind — the type is auto-detected from the path
+        # at save time (no Folder/Archive/Image triage button needed).
+        ctk.CTkButton(sinner, text="📂  Open…", width=104, fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
+                       command=self._pick_any).pack(side="left", padx=(6, 0))
 
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(orow, text="Output folder  (this job's .ffpfsc lands here):", text_color=WHITE,
@@ -4159,20 +4212,14 @@ class PackDialog(ctk.CTkToplevel):
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
 
-    def _pick_folder(self):
-        p = filedialog.askdirectory(title="Select a game folder")
-        if p:
-            self.src_var.set(p)
-
-    def _pick_archive(self):
-        p = filedialog.askopenfilename(title="Select an archive",
-                                       filetypes=[("Archives", "*.zip *.rar *.7z"), ("All files", "*.*")])
-        if p:
-            self.src_var.set(p)
-
-    def _pick_image(self):
-        p = filedialog.askopenfilename(title="Select a disk/PFS image",
-                                       filetypes=[("Images", "*.exfat *.ffpkg *.ffpfs"), ("All files", "*.*")])
+    def _pick_any(self):
+        """One native picker that takes either a folder OR any supported file —
+        kind is auto-detected when the job runs (folder → game/bundle/library;
+        file → archive vs disk-image vs .ffpfs by suffix)."""
+        p = pick_file_or_folder(
+            "Pick a source: folder, archive, disk image (.exfat/.ffpkg), or .ffpfs",
+            initial=(self.src_var.get() or "").strip()
+        )
         if p:
             self.src_var.set(p)
 
@@ -6115,10 +6162,25 @@ class App:
                 #    detected as a patch and overlaid, so a bundle can be just
                 #    base + patch with no other extras.
                 game, siblings, all_games, patch = detect_game_bundle(p, cand_pw, self.log, detect_patch)
-                if game is not None and (siblings or patch):
-                    extra = f"1 game + {len(siblings)} extra file(s)"
-                    if patch:
-                        extra += f" + patch '{patch.name}' (integrated)"
+                # Bundle triggers when:
+                #   - there's a game + extras (siblings/patch), OR
+                #   - the folder holds exactly one game which is a single FILE (archive
+                #     or disk image) and nothing else — so the folder name itself acts
+                #     as the bundle identity at the destination (user request: "pick a
+                #     folder with one RAR in it → mirror the folder name to the output").
+                # A folder whose game is a SUBFOLDER (already a game folder) doesn't
+                # trigger this — it stays a plain game pack so the output isn't pointlessly
+                # nested in a duplicate folder layer.
+                naked_file_game = (game is not None
+                                   and game.is_file()
+                                   and not siblings and not patch)
+                if game is not None and (siblings or patch or naked_file_game):
+                    if naked_file_game:
+                        extra = f"single file game '{game.name}' — folder name mirrored to output"
+                    else:
+                        extra = f"1 game + {len(siblings)} extra file(s)"
+                        if patch:
+                            extra += f" + patch '{patch.name}' (integrated)"
                     self.log("OK", f"Folder bundle: {extra} — "
                                    "the folder will be recreated at the destination.")
                     self.scan_q.put(("ok", GameItem.from_bundle(p, game, siblings, patch)))

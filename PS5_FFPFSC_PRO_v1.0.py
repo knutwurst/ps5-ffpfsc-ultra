@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.72"
+APP_VERSION = "1.0.73"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3039,6 +3039,9 @@ class GameItem:
     # Class-level defaults so items built via __new__ (from_*, history, restored queue)
     # always have these attributes even when an older saved queue predates them.
     ampr_emu = False        # PlayGo/APR title? (auto-detected)
+    display_name = None     # STABLE queue label captured at add time; survives extraction
+                            # (item.name gets rewritten to the extracted stem, which still
+                            # drives the OUTPUT filename, but the queue keeps showing this)
     output_path = None      # per-job output folder/file snapshot; None → use the global Output
     output_compressed = None # per-job format: True=.ffpfsc, False=.ffpfs; None → not yet set
     patch_source = None     # patch dir/archive (operation == "patch")
@@ -4399,6 +4402,7 @@ class PatchDialog(ctk.CTkToplevel):
             it = self.edit_item
             it.path            = game
             it.name            = (game.stem if game.suffix.lower() == ".ffpfsc" else game.name)
+            it.display_name    = None   # re-capture the stable queue label from the new name
             try:
                 it.title_id = parse_title_id(game) or "🩹"
             except Exception:
@@ -4655,6 +4659,7 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         if not src.exists():
             messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
         it = self.edit_item
+        it.display_name = None   # re-capture the stable queue label from the new name
         op = getattr(it, "operation", "pack")
         if op == "unpack":
             if not (src.is_file() and src.suffix.lower() in (".ffpfsc", ".ffpfs")):
@@ -7424,6 +7429,14 @@ class App:
 
         total = sum(x.size for x in self.queue)
         for i, item in enumerate(self.queue):
+            # Capture a STABLE display name the first time we render this item — at add
+            # time item.name is the friendly name (a bundle's folder, the archive's name).
+            # After extraction _copy_item_payload rewrites item.name to the extracted
+            # stem (e.g. "PPSA13427"), which still drives the output filename; this keeps
+            # the queue row showing what the user added.
+            if not getattr(item, "display_name", None):
+                item.display_name = (getattr(item, "bundle_subfolder", None)
+                                     or getattr(item, "name", "") or item.title_id)
             prefix = "▶ " if (self._batch_running and i == 0) else f"{i + 1}. "
             opn = getattr(item, "operation", "pack")
             badge = {"unpack": "CONVERT", "patch": "PATCH ",
@@ -7439,7 +7452,8 @@ class App:
                 # (what space/placement actually use), tagged with ~ as a header estimate.
                 detail = (f"~{format_size(display_size(item))} unpacked"
                           if shows_extracted_size(item) else format_size(item.size))
-            line = f"{prefix}{badge}  {item.title_id}  {item.name}  [{detail}]  {item.status}"
+            disp = getattr(item, "display_name", None) or item.name
+            line = f"{prefix}{badge}  {item.title_id}  {disp}  [{detail}]  {item.status}"
             self.queue_listbox.insert("end", line)
             if self._batch_running and i == 0:
                 self.queue_listbox.itemconfig(i, fg="#4ade80")
@@ -7467,7 +7481,7 @@ class App:
 
     def update_game_details(self, item):
         self._details_item = item   # record before any call that might raise
-        self.game_name_var.set(f"Name: {item.name}")
+        self.game_name_var.set(f"Name: {getattr(item, 'display_name', None) or item.name}")
         mode = {"unpack": "Convert", "patch": "Integrate patch",
                 "fake-sign": "Fake sign"}.get(getattr(item, "operation", "pack"), "Pack")
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")

@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.66"
+APP_VERSION = "1.0.67"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2693,46 +2693,87 @@ class ArchiveExtractor:
     def _sevenz(archive: Path, dest: Path, log_fn, progress_fn=None, password: str = "",
                 cancel_event: threading.Event | None = None):
         ArchiveExtractor._check_cancel(cancel_event)
-        # Native CLI first — py7zr's pure-Python LZMA decoder is the slow path; the
-        # native binary uses optimised C code and saturates the I/O instead.
-        exe = ArchiveExtractor._find_native_7z()
-        if exe:
+        # Universal progress: py7zr's extractall has no callback and p7zip 17.05's
+        # -bsp1 output is sparse, so run a background thread that polls the dest
+        # folder size every 5 s and reports %% against the header-read uncompressed
+        # total. Works regardless of which 7z code path runs.
+        expected_total = 0
+        if progress_fn:
             try:
-                if log_fn:
-                    log_fn("INFO", f"  7z: using native {os.path.basename(exe)} (fast).")
-                cmd = [exe, "x", str(archive), f"-o{dest}", "-y", "-bsp1"]   # -bsp1: progress to stdout
-                if password:
-                    cmd.append(f"-p{password}")
-                ArchiveExtractor._run_extract_process(
-                    cmd, os.path.basename(exe), log_fn=log_fn,
-                    progress_fn=progress_fn, cancel_event=cancel_event
-                )
-                return
-            except FileNotFoundError:
-                pass    # disappeared between probe and exec
-            except ArchiveExtractionCancelled:
-                raise
-            except RuntimeError as e:
-                if log_fn:
-                    log_fn("WARN", f"  7z: native CLI failed ({e}) — falling back to py7zr.")
-        # Fallback: pure-Python py7zr (slow but always available with our deps).
+                expected_total = ArchiveExtractor.uncompressed_size(
+                    archive, [password] if password else [])
+            except Exception:
+                expected_total = 0
+        stop_evt = threading.Event()
+        poll_thread = None
+        if progress_fn and expected_total > 0:
+            def _poll():
+                while not stop_evt.is_set():
+                    try:
+                        total = 0
+                        for root, _, files in os.walk(str(dest)):
+                            for f in files:
+                                try:
+                                    total += os.path.getsize(os.path.join(root, f))
+                                except Exception:
+                                    pass
+                        pct = min(99, int(100 * total / expected_total))
+                        gb = total / (1024 ** 3)
+                        progress_fn(pct, f"  ({gb:.1f} GB extracted)")
+                    except Exception:
+                        pass
+                    if stop_evt.wait(5):
+                        return
+            poll_thread = threading.Thread(target=_poll, daemon=True)
+            poll_thread.start()
+
         try:
-            import py7zr  # type: ignore
-            if log_fn:
-                log_fn("INFO", "  7z: using py7zr (pure-Python — install p7zip / 7-Zip CLI for ~5x speedup).")
-            kwargs = {}
-            if password:
-                kwargs["password"] = password
-            with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
-                sz.extractall(str(dest))
-            ArchiveExtractor._check_cancel(cancel_event)
-            return
-        except ImportError:
-            pass
-        raise RuntimeError(
-            "Cannot extract 7z — install py7zr:  pip install py7zr\n"
-            "or put 7z / 7zz / 7za on your PATH (Homebrew: brew install p7zip)."
-        )
+            # Native CLI first — py7zr is pure-Python LZMA (slow); native uses C with
+            # SIMD/threaded LZMA and saturates the I/O instead.
+            exe = ArchiveExtractor._find_native_7z()
+            if exe:
+                try:
+                    if log_fn:
+                        log_fn("INFO", f"  7z: using native {os.path.basename(exe)} (fast).")
+                    cmd = [exe, "x", str(archive), f"-o{dest}", "-y", "-bsp1"]
+                    if password:
+                        cmd.append(f"-p{password}")
+                    ArchiveExtractor._run_extract_process(
+                        cmd, os.path.basename(exe), log_fn=log_fn,
+                        progress_fn=progress_fn, cancel_event=cancel_event
+                    )
+                    return
+                except FileNotFoundError:
+                    pass    # disappeared between probe and exec
+                except ArchiveExtractionCancelled:
+                    raise
+                except RuntimeError as e:
+                    if log_fn:
+                        log_fn("WARN", f"  7z: native CLI failed ({e}) — falling back to py7zr.")
+            # Fallback: pure-Python py7zr (always available with our bundled deps).
+            try:
+                import py7zr  # type: ignore
+                if log_fn:
+                    log_fn("INFO", "  7z: using py7zr (pure-Python — install p7zip / 7-Zip CLI for ~5x speedup).")
+                kwargs = {}
+                if password:
+                    kwargs["password"] = password
+                with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
+                    sz.extractall(str(dest))
+                ArchiveExtractor._check_cancel(cancel_event)
+                return
+            except ImportError:
+                pass
+            raise RuntimeError(
+                "Cannot extract 7z — install py7zr:  pip install py7zr\n"
+                "or put 7z / 7zz / 7za on your PATH (Homebrew: brew install p7zip)."
+            )
+        finally:
+            stop_evt.set()
+            if poll_thread is not None:
+                poll_thread.join(timeout=2)
+            if progress_fn:
+                progress_fn(100, archive.name)
 
     # ── helper ─────────────────────────────────────────────────────────────────
 

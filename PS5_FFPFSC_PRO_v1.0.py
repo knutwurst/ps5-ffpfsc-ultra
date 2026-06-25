@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.68"
+APP_VERSION = "1.0.69"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -9743,20 +9743,21 @@ class App:
                     self.root.after(400, _share_when_free)
             elif self.cancel_requested or self.extract_cancel_event.is_set():
                 # A user cancel surfaces here as a failed result — treat it as a cancel,
-                # not a failure: stop the batch and don't inflate the failed count.
+                # not a failure: stop the batch, KEEP the item in the queue (marked
+                # Cancelled, moved to the end) so only successful items disappear, don't
+                # inflate the failed count. _retire_failed re-adds the popped item.
                 self._batch_running = False
                 self.cancel_requested = False
                 self.extract_cancel_event.clear()
+                if completed_item is not None:
+                    self._cleanup_after_failure(completed_item)
+                    self._retire_failed(completed_item, "Cancelled")
                 self.update_queue_box()
                 self.start_btn.configure(state="normal")
                 self.cancel_btn.configure(state="disabled")
                 self._update_batch_counter()
                 self.status_update("Ready", "Cancelled by user.", "Ready", 0, 0, "00:00", "—", "—")
                 self.log("WARN", "Cancelled by user.")
-                # Reclaim the cancelled run's scratch (it was popped above, so use it
-                # directly — not _active_item, which would double-handle).
-                if completed_item is not None:
-                    self._cleanup_after_failure(completed_item)
             else:
                 # OOM auto-retry: if the backend was out-of-memory-killed and we can still
                 # drop a core, requeue the SAME game with fewer workers instead of failing.

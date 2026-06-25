@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.71"
+APP_VERSION = "1.0.72"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4782,6 +4782,11 @@ class App:
         self._cleanup_inflight = 0
         self._cleanup_lock     = threading.Lock()
         self._cleanup_wait_ticks = 0
+        # Async source-scan tracking: a folder add launches a background scan that
+        # leaves the queue briefly empty. Without this, pressing START in that window
+        # makes start() re-add the SAME source (queue is still empty) → a duplicate.
+        self._scan_in_flight = 0
+        self._scan_lock      = threading.Lock()
 
         self.log_q      = queue.Queue()
         self.progress_q = queue.Queue()
@@ -6013,6 +6018,21 @@ class App:
         except Exception:
             target.ampr_emu = False
 
+    def _launch_scan(self, fn):
+        """Run a source-scan worker on a daemon thread while tracking that a scan is in
+        flight (so a START pressed during the scan doesn't re-add the same source). The
+        counter is decremented in the worker's finally — exactly once per launch —
+        regardless of how the scan ends (ok/error/exception)."""
+        with self._scan_lock:
+            self._scan_in_flight += 1
+        def _runner():
+            try:
+                fn()
+            finally:
+                with self._scan_lock:
+                    self._scan_in_flight = max(0, self._scan_in_flight - 1)
+        threading.Thread(target=_runner, daemon=True).start()
+
     def add_source_to_queue(self):
         src_str = self._clean_path_str(self.source_var.get())
         if not src_str:
@@ -6095,7 +6115,7 @@ class App:
                         self.scan_q.put(("pfs_found", images))
                 except Exception as e:
                     self.scan_q.put(("error", f"PFS scan error: {e}"))
-            threading.Thread(target=_scan_pfs_folder, daemon=True).start()
+            self._launch_scan(_scan_pfs_folder)
             return
 
         # ── Direct PS5 game folder ────────────────────────────────────────────
@@ -6117,7 +6137,7 @@ class App:
                     self.scan_q.put(("ok", GameItem(p)))
                 except Exception as e:
                     self.scan_q.put(("error", str(e)))
-            threading.Thread(target=_scan_single, daemon=True).start()
+            self._launch_scan(_scan_single)
             return
 
         # ── Parent / unknown folder ───────────────────────────────────────────
@@ -6277,7 +6297,7 @@ class App:
                 self.log("ERROR", f"Folder scan crashed: {e}")
                 self.scan_q.put(("error", f"Scan error: {e}"))
 
-        threading.Thread(target=_scan_folder, daemon=True).start()
+        self._launch_scan(_scan_folder)
 
     def _archive_set_size(self, archive: Path) -> int:
         """Total on-disk size of the archive's volume set (scene archives are usually
@@ -8430,6 +8450,15 @@ class App:
         if not self.temp_var.get().strip():
             self.temp_var.set(str(Path(self.output_var.get()) / "_ffpfsc_temp"))
         if not self.queue:
+            # A source-scan from a just-pressed Add may still be running (queue is briefly
+            # empty during an async folder scan). Re-adding here would scan the SAME source
+            # again → a duplicate queue item. Just arm pending_start; the in-flight scan's
+            # result handler will honor it once the item lands.
+            if getattr(self, "_scan_in_flight", 0) > 0:
+                self.pending_start = True
+                self.status_update("Scanning", "Finishing the source scan, then starting…",
+                                    "Scanning Files", 0, 0, "00:00", "—", "—")
+                return
             self.pending_start = True
             self.add_source_to_queue()
             # A synchronous path (single file in the Source field) queues immediately —

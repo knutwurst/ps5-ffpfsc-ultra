@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.77"
+APP_VERSION = "1.0.78"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3778,9 +3778,14 @@ class CLIWorker(threading.Thread):
             if sp:
                 self.speed = sp.group(1)
 
-            # Backend reports raw seconds ('ETA 1695s') — show it as 1h 05m / 28m 15s / 45s,
-            # both in the dedicated ETA field AND inside the detail line (label is shown as-is).
-            eta_match = re.search(r"ETA\s*([0-9]+\s*(?:s|m|h|sec|secs|seconds|min|mins|minutes)?)", label, re.I)
+            # Backend (mkpfs/pbar.py) emits ETA as integer seconds under 1h ('ETA 1695s')
+            # but as DECIMAL MINUTES at/over 1h ('ETA 84.2m'). The capture must allow a
+            # decimal AND the trailing unit, else '84.2m' grabs only '84' (no unit → read
+            # as 84 SECONDS) and the leftover '.2m' is re-appended → 'ETA 1m 24s.2m'.
+            # humanize_eta then renders it as 1h 05m / 28m 15s / 45s in the field + label.
+            eta_match = re.search(
+                r"ETA\s*([0-9]+(?:\.[0-9]+)?\s*(?:h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)?)",
+                label, re.I)
             if eta_match:
                 eta = humanize_eta(eta_match.group(1).strip())
                 label = label[:eta_match.start()] + f"ETA {eta}" + label[eta_match.end():]

@@ -92,8 +92,8 @@ except Exception:
     DND_FILES = None
     _HAS_DND = False
 
-APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.78"
+APP_NAME = "PS5 FFPFSC ULTRA"
+APP_VERSION = "1.0.79"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -104,9 +104,21 @@ MKPFS_NAME    = "MkPFS"
 MKPFS_VERSION = "0.0.8"
 
 if sys.platform == "darwin":
-    APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_PRO_BIZKUT"
+    APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT"
 else:
-    APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PS5_FFPFSC_PRO_BIZKUT"
+    APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PS5_FFPFSC_ULTRA_BIZKUT"
+
+# One-time migration after the PRO → ULTRA rename: if the new settings dir doesn't
+# exist yet but the old "…_PRO_BIZKUT" one does, move it over so saved settings,
+# queue, history, passwords and drive config carry across without the user noticing.
+_LEGACY_APP_DIR = APP_DIR.parent / "PS5_FFPFSC_PRO_BIZKUT"
+try:
+    if not APP_DIR.exists() and _LEGACY_APP_DIR.is_dir():
+        APP_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_LEGACY_APP_DIR), str(APP_DIR))
+except Exception:
+    pass
+
 RAW_LOG_FILE = APP_DIR / "raw_tool_output.log"
 FINAL_REPORT_FILE = APP_DIR / "last_result_report.txt"
 HISTORY_FILE = APP_DIR / "history.json"
@@ -625,7 +637,7 @@ def _probe_drive_speed(path: Path) -> str:
             return "Unknown"
         size = 32 * 1024 * 1024
         buf = secrets.token_bytes(size)
-        with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_probe_",
+        with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_ultrabe_",
                                           delete=True) as tf:
             t = time.perf_counter()
             tf.write(buf)
@@ -1237,7 +1249,7 @@ def get_last_log_lines(n: int = 50) -> str:
 class FirstRunWizard(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.title("PS5 FFPFSC PRO — First Run Setup")
+        self.title("PS5 FFPFSC ULTRA — First Run Setup")
         self.geometry("640x520")
         self.resizable(False, False)
         self.grab_set()
@@ -1341,7 +1353,7 @@ class FirstRunWizard(ctk.CTkToplevel):
             if self.output_path.get():
                 summary.append(f"Output Folder:  {self.output_path.get()}")
             summary.append("")
-            summary.append("Click Finish to launch PS5 FFPFSC PRO.")
+            summary.append("Click Finish to launch PS5 FFPFSC ULTRA.")
             for line in summary:
                 ctk.CTkLabel(self.body, text=line, text_color=WHITE, anchor="w",
                               font=ctk.CTkFont(family="Consolas", size=12)).pack(anchor="w", padx=14, pady=2)
@@ -1731,7 +1743,7 @@ def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | No
                 pass
 
             session_info = "\n".join([
-                f"PS5 FFPFSC PRO {APP_VERSION}",
+                f"PS5 FFPFSC ULTRA {APP_VERSION}",
                 f"Generated:      {now_datetime()}",
                 f"Python:         {sys.version}",
                 f"OS:             {sys.platform} {os.name}",
@@ -5077,7 +5089,7 @@ class App:
 
         title_box = ctk.CTkFrame(header, fg_color=BLACK)
         title_box.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_box, text="PS5 FFPFSC PRO",
+        ctk.CTkLabel(title_box, text="PS5 FFPFSC ULTRA",
                       font=ctk.CTkFont(size=26, weight="bold"), text_color=WHITE).pack(anchor="w")
         ctk.CTkLabel(title_box, text=f"v{APP_VERSION}  ·  Bizkut backend  ·  {MKPFS_NAME} v{MKPFS_VERSION}  ·  by Knutwurst",
                       text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=2)

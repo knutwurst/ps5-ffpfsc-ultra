@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PS5 FFPFSC PRO — backend wrapper (MkPFS 0.0.8+)"""
+"""PS5 FFPFSC ULTRA — backend wrapper (MkPFS 0.0.8+)"""
 import sys
 import os
 
@@ -931,7 +931,7 @@ def _fake_sign_tree(folder) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PS5 FFPFSC PRO backend — create .ffpfsc containers or extract .ffpfs/.ffpfsc images."
+        description="PS5 FFPFSC ULTRA backend — create .ffpfsc containers or extract .ffpfs/.ffpfsc images."
     )
     parser.add_argument("game_folder", nargs='?', help="Source game folder, .exfat/.ffpkg file, or .ffpfs/.ffpfsc image")
     parser.add_argument("output", nargs='?', default=".", help="Output .ffpfsc file/directory, or extraction directory")

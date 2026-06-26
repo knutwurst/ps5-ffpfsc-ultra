@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['PS5_FFPFSC_PRO_v1.0.py'],
+    ['PS5_FFPFSC_ULTRA_v1.0.py'],
     pathex=[],
     binaries=[],
     datas=[('backend', 'backend')],
@@ -34,7 +34,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='PS5_FFPFSC_PRO',
+    name='PS5_FFPFSC_ULTRA',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -239,13 +239,16 @@ def list_pfs_image(image_path):
         "entries": entries,
         "file_count": len(file_inodes),
         "dir_count": len([k for k in dir_inodes if k]),
+        "errors": errors,   # non-empty only on a structurally damaged image
     }
 
 
 def extract_pfs_members(image_path, members, dest_dir) -> int:
     """Extract the given files / directory subtrees from a .ffpfs/.ffpfsc into dest_dir,
     decompressing only their blocks. A member naming a directory extracts every file
-    beneath it. Prints '[####] N% extract (path)' progress the GUI can parse."""
+    beneath it AND recreates the directory itself, including EMPTY subdirectories — so
+    the result is structure-identical to mkpfs's own extractor (extract_pfs_image, which
+    mkdirs every dir_inode). Prints '[####] N% extract (path)' progress the GUI parses."""
     pfs, consts = _import_mkpfs()
     image_path = Path(image_path)
     dest_dir = Path(dest_dir)
@@ -256,25 +259,37 @@ def extract_pfs_members(image_path, members, dest_dir) -> int:
         header = pfs.parse_image_header(fh)
         inodes = pfs.parse_image_inodes(fh, header)
         uroot, *_rest = pfs.parse_superroot_and_indexes(fh, header, inodes, errors)
-        file_inodes, _dir, _de = pfs.build_tree_from_uroot(fh, header, inodes, uroot, errors)
-        targets = []
-        for rel, ino in file_inodes.items():
-            reln = rel.strip("/")
-            for m in wanted:
-                if reln == m or reln.startswith(m + "/"):
-                    targets.append((rel, ino))
-                    break
-        targets.sort()
-        if not targets:
+        file_inodes, dir_inodes, _de = pfs.build_tree_from_uroot(fh, header, inodes, uroot, errors)
+        # Fail closed on a structurally invalid image instead of silently writing a
+        # partial set — matches mkpfs extract_pfs_image, which refuses on any error.
+        # build_tree only records here on real corruption (bad inode ref, type/mode
+        # mismatch, directory cycle, duplicate name), never for a healthy image.
+        if errors:
+            for e in errors[:8]:
+                print(f"[ERROR] Image structure problem: {e}", flush=True)
+            print("[ERROR] Refusing to extract from a structurally invalid image.", flush=True)
+            return 1
+
+        def _under(reln: str) -> bool:
+            return any(reln == m or reln.startswith(m + "/") for m in wanted)
+
+        targets = sorted((rel, ino) for rel, ino in file_inodes.items() if _under(rel.strip("/")))
+        # Directories at/under a requested member, INCLUDING childless ones. Sorting the
+        # path strings is parent-first (a parent is a prefix of its children).
+        dir_targets = sorted(d for d in dir_inodes if d and _under(d.strip("/")))
+        if not targets and not dir_targets:
             print("[ERROR] None of the requested items were found in the image.", flush=True)
             return 1
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Recreate directories first so empty ones survive even when no file lands in them.
+        for d in dir_targets:
+            (dest_dir / Path(d)).mkdir(parents=True, exist_ok=True)
         total_bytes = 0
         for _rel, ino in targets:
             try:
                 total_bytes += max(0, int(inodes[ino].logical_size))
             except Exception:
                 pass
-        dest_dir.mkdir(parents=True, exist_ok=True)
         done = 0
         last_pct = -1
         for rel, ino in targets:
@@ -290,7 +305,7 @@ def extract_pfs_members(image_path, members, dest_dir) -> int:
                             last_pct = pct
                             print(f"[####] {pct}% extract ({rel})", flush=True)
     print("[####] 100% extract", flush=True)
-    print(f"[OK] Extracted {len(targets)} file(s) to {dest_dir}", flush=True)
+    print(f"[OK] Extracted {len(targets)} file(s) and {len(dir_targets)} folder(s) to {dest_dir}", flush=True)
     return 0
 
 

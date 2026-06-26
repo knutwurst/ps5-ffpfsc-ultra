@@ -1,10 +1,38 @@
 # PS5 FFPFSC ULTRA
 
+<p align="center">
+  <img src="images/full-app.jpg" alt="PS5 FFPFSC ULTRA main window" width="900">
+</p>
+
+<p align="center">
+  <b>Pack PS5 game dumps, disk images, and scene archives into mountable <code>.ffpfsc</code> containers, then open one back up to pull a single file out.</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-first-22c55e?style=for-the-badge&logo=apple&logoColor=white" alt="macOS-first">
+  <img src="https://img.shields.io/badge/Windows%20%C2%B7%20Linux-from%20source-3a3a3a?style=for-the-badge" alt="Windows and Linux from source">
+  <img src="https://img.shields.io/badge/MkPFS-0.0.8-22c55e?style=for-the-badge" alt="MkPFS 0.0.8">
+  <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" alt="MIT license">
+</p>
+
+---
+
 A desktop app that turns a PS5 game dump into a `.ffpfsc` container for ShadowMountPlus and MicroMount, and unpacks one back into a folder. Give it a game folder, a disk image (`.exfat` / `.ffpkg`), an existing `.ffpfs`, or a scene archive (ZIP / RAR / 7z, multi-part and password-protected included). It hands you a compressed `.ffpfsc` you can mount on a jailbroken console.
 
 Built by Knutwurst on the Bizkut `ps5-ffpfs-cli` backend with PSBrew MkPFS. macOS is the primary, tested platform; it also runs on Windows and Linux from source.
 
-Current version: 1.0.79
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="images/browse.jpg" width="400" alt="Browse and extract from a packed image"><br><sub><b>Browse &amp; extract</b> &nbsp;·&nbsp; peek inside a .ffpfsc and pull out one file, no full unpack</sub></td>
+    <td align="center" width="50%"><img src="images/settings.jpg" width="400" alt="Settings: drive routing and packing options"><br><sub><b>Settings</b> &nbsp;·&nbsp; smart drive routing, per-job format, fake-sign, and more</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="images/convert.jpg" width="400" alt="Image converter"><br><sub><b>Convert</b> &nbsp;·&nbsp; decompress or unpack an image, step by step</sub></td>
+    <td align="center" width="50%"><img src="images/patch.jpg" width="400" alt="Integrate a patch into a game"><br><sub><b>Patch</b> &nbsp;·&nbsp; overlay an update onto a game and repack</sub></td>
+  </tr>
+</table>
 
 ## Why this one
 

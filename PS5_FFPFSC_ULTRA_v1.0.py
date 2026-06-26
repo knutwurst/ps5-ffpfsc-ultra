@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.82"
+APP_VERSION = "1.0.83"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1105,6 +1105,13 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     # (e.g. "PPSA13427") after an archive/bundle is unpacked. This makes the .ffpfsc
     # named after the GAME, the same as packing a folder directly.
     name = (getattr(item, "display_name", "") or getattr(item, "name", "") or "").strip()
+    # The friendly name is often a release/bundle FOLDER that already carries bracketed
+    # metadata, e.g. "Alan Wake II [PPSA02572] [v01.200.007]". Strip any title-id bracket
+    # and any version bracket here so they are re-added once, canonically, below —
+    # otherwise the version (and id) would show up twice in the filename.
+    name = re.sub(r"\s*\[\s*(?:PPSA|CUSA)\d{5}\s*\]", "", name, flags=re.I)
+    name = re.sub(r"\s*\[\s*[vV]?\d{1,2}(?:\.\d{1,3}){1,3}\s*\]", "", name)
+    name = re.sub(r"\s{2,}", " ", name).strip(" -_")
     if name in PLACEHOLDERS or name == tid:
         name = tid or "output"
     elif tid:

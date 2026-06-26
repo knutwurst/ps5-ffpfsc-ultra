@@ -93,7 +93,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC PRO"
-APP_VERSION = "1.0.76"
+APP_VERSION = "1.0.77"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -6735,8 +6735,13 @@ class App:
         #    read+write, so only consider drives where that's allowed (an SSD under 'auto');
         #    a big HDD pool entry must NOT win here just by having the most free space (that's
         #    the slow same-spindle case we avoid). Prefer an SSD, then most free.
+        #    Skip this when the size is only an ESTIMATE (archive header unreadable): a
+        #    well-compressing game can be far bigger than the on-disk guess, and putting the
+        #    source on the SSD would then fill it so the inner image can't fit there and
+        #    falls back to the slow output drive. With an estimate we reserve the SSD for
+        #    the image and extract the source to the output drive (option 3) instead.
         fit_full = [(d, f) for d, f in pool if f >= full_need and self._same_drive_rw_allowed(d)]
-        if size > 0 and fit_full:
+        if size > 0 and fit_full and not size_is_estimate:
             ssd_full = [(d, f) for d, f in fit_full if _is_ssd(d)]
             best = max(ssd_full or fit_full, key=lambda t: t[1])[0]
             _set(best, Path(best) / "_extracted", False, False)
@@ -6745,7 +6750,9 @@ class App:
             return item._build_root
         # 2) TWO fast drives (archives only): inner image on one, extracted source on
         #    ANOTHER — keeps pass 1 SSD↔SSD when no single fast drive holds image+source.
-        if size > 0 and is_archive_pre:
+        #    Also skipped on an estimate (same reason as option 1 — don't commit the
+        #    source to an SSD until the real size is known).
+        if size > 0 and is_archive_pre and not size_is_estimate:
             img_fit = [(d, f) for d, f in pool if f >= image_need and _is_ssd(d)]
             if img_fit:
                 img_dir = min(img_fit, key=lambda t: t[1])[0]    # smallest SSD that fits the image

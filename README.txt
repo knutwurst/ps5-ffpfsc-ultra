@@ -1,4 +1,4 @@
-PS5 FFPFSC PRO v1.0.32
+PS5 FFPFSC ULTRA v1.0.32
 by Knutwurst | Powered by Bizkut Backend
 
 ════════════════════════════════════════════════
@@ -9,7 +9,7 @@ HOW TO RUN (Python)
 
 HOW TO BUILD EXE
   Double-click BUILD_EXE.bat
-  Output: dist\PS5_FFPFSC_PRO.exe
+  Output: dist\PS5_FFPFSC_ULTRA.exe
 
 ════════════════════════════════════════════════
 

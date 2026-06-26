@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Vendored verbatim into PS5 FFPFSC PRO for the in-app "Fake Sign" feature.
+# Vendored verbatim into PS5 FFPFSC ULTRA for the in-app "Fake Sign" feature.
 # Source: https://github.com/alex-free/ps5-make-fself-recursive (BSD 3-Clause,
 # Copyright (c) 2026 Alex Free), which bundles make_fself.py from the
 # ps5-payload-dev SDK (https://github.com/ps5-payload-dev/sdk), originally by

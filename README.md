@@ -1,4 +1,4 @@
-# PS5 FFPFSC PRO
+# PS5 FFPFSC ULTRA
 
 A desktop app that packs PS5 game dumps into `.ffpfsc` containers for ShadowMountPlus, and unpacks them again. Feed it a game folder, an `.exfat`/`.ffpkg` disk image, or an archive (ZIP, RAR, or 7z, password-protected included), and it produces a compressed `.ffpfsc` you can mount.
 
@@ -30,18 +30,18 @@ macOS and Linux:
 ```bash
 python3 -m pip install customtkinter pillow tkinterdnd2 py7zr rarfile cryptography
 python3 -m pip install ./backend/unrar
-python3 PS5_FFPFSC_PRO_v1.0.py
+python3 PS5_FFPFSC_ULTRA_v1.0.py
 ```
 
 ## Build a standalone app
 
-macOS, produces `dist/PS5 FFPFSC PRO.app`:
+macOS, produces `dist/PS5 FFPFSC ULTRA.app`:
 
 ```bash
 ./BUILD_MACOS_APP.sh
 ```
 
-Windows, produces `dist\PS5_FFPFSC_PRO.exe`:
+Windows, produces `dist\PS5_FFPFSC_ULTRA.exe`:
 
 ```
 BUILD_EXE.bat
@@ -50,7 +50,7 @@ BUILD_EXE.bat
 The macOS app is ad-hoc signed. On a Mac other than the one it was built on, clear the quarantine flag before the first launch:
 
 ```bash
-xattr -dr com.apple.quarantine "PS5 FFPFSC PRO.app"
+xattr -dr com.apple.quarantine "PS5 FFPFSC ULTRA.app"
 ```
 
 ## Sources and credits

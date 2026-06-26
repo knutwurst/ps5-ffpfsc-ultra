@@ -1,7 +1,7 @@
 @echo off
-title Build PS5 FFPFSC PRO v1.0
+title Build PS5 FFPFSC ULTRA v1.0
 echo ============================================================
-echo  PS5 FFPFSC PRO v1.0 - EXE Builder
+echo  PS5 FFPFSC ULTRA v1.0 - EXE Builder
 echo ============================================================
 echo.
 echo Installing / updating dependencies...
@@ -14,9 +14,9 @@ rmdir /s /q dist  2>nul
 
 echo.
 echo Running syntax check...
-py -m py_compile PS5_FFPFSC_PRO_v1.0.py
+py -m py_compile PS5_FFPFSC_ULTRA_v1.0.py
 if errorlevel 1 (
-  echo [FAIL] Syntax check failed on PS5_FFPFSC_PRO_v1.0.py
+  echo [FAIL] Syntax check failed on PS5_FFPFSC_ULTRA_v1.0.py
   pause
   exit /b 1
 )
@@ -30,7 +30,7 @@ echo Syntax OK.
 
 echo.
 echo Building EXE...
-py -m PyInstaller PS5_FFPFSC_PRO_v1.0.spec
+py -m PyInstaller PS5_FFPFSC_ULTRA_v1.0.spec
 if errorlevel 1 (
   echo [FAIL] PyInstaller build failed.
   pause
@@ -40,6 +40,6 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  Build complete!
-echo  Output: dist\PS5_FFPFSC_PRO.exe
+echo  Output: dist\PS5_FFPFSC_ULTRA.exe
 echo ============================================================
 pause

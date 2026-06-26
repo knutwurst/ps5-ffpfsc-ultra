@@ -25,11 +25,273 @@ import contextlib
 import json
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import zipfile
 import zlib
 from pathlib import Path
+
+
+# ── PFS browse (list a .ffpfs/.ffpfsc tree + extract selected members) ─────────
+# These read an image WITHOUT a full decompression: a _PfscReader presents the inner
+# raw-PFS bytes of a compressed .ffpfsc and only decompresses the blocks actually
+# touched, so listing the tree reads just the inode table + dirents, and extracting
+# one file reads just that file's blocks.
+
+def _import_mkpfs():
+    """Import the bundled mkpfs pfs + consts modules (backend/ on sys.path)."""
+    if _CLI_DIR not in sys.path:
+        sys.path.insert(0, _CLI_DIR)
+    from mkpfs import pfs as _pfs, consts as _consts  # type: ignore
+    return _pfs, _consts
+
+
+class _PfscReader:
+    """Random-access, decompressing file-like over a compressed .ffpfsc that presents
+    the inner raw .ffpfs bytes. Supports seek()/read()/tell() so the mkpfs image
+    parsers can read it as if it were an uncompressed image. Only the logical blocks
+    actually read are decompressed (small block cache), never the whole image."""
+
+    def __init__(self, path, pfs, consts, base: int = 0):
+        self._pfs = pfs
+        self._base = base                       # start of the PFSC stream within the file
+        self._fh = open(path, "rb")
+        self._fh.seek(base)
+        head = self._fh.read(consts.PFSC_HEADER_SIZE)
+        (self._lbs, self._block_count, boff, self._data_offset,
+         self._logical_size) = pfs._parse_pfsc_header(head)
+        self._fh.seek(base + boff)
+        raw = self._fh.read((self._block_count + 1) * consts.PFSC_OFFSET_ENTRY_SIZE)
+        self._offsets = list(struct.unpack_from(f"<{self._block_count + 1}Q", raw, 0))
+        self._pos = 0
+        self._cache: dict[int, bytes] = {}
+        self._order: list[int] = []
+
+    def _block(self, idx: int) -> bytes:
+        cached = self._cache.get(idx)
+        if cached is not None:
+            return cached
+        start, end = self._offsets[idx], self._offsets[idx + 1]
+        self._fh.seek(self._base + start)
+        stored = self._fh.read(end - start)
+        blk = self._pfs._decode_pfsc_block(stored, self._lbs, idx)
+        self._cache[idx] = blk
+        self._order.append(idx)
+        if len(self._order) > 64:                      # ~4 MiB cap at 64 KiB blocks
+            self._cache.pop(self._order.pop(0), None)
+        return blk
+
+    def seek(self, off: int, whence: int = 0) -> int:
+        if whence == 1:
+            self._pos += off
+        elif whence == 2:
+            self._pos = self._logical_size + off
+        else:
+            self._pos = off
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._logical_size - self._pos
+        end = min(self._pos + size, self._logical_size)
+        out = bytearray()
+        pos = self._pos
+        while pos < end:
+            blk = self._block(pos // self._lbs)
+            within = pos % self._lbs
+            take = min(self._lbs - within, end - pos)
+            out += blk[within:within + take]
+            pos += take
+        self._pos = pos
+        return bytes(out)
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        self.close()
+
+
+class _SubRangeReader:
+    """Plain seek/read window over [base, base+length) of a file — used when a
+    .ffpfsc wraps an UNCOMPRESSED inner image (no per-block decode needed)."""
+
+    def __init__(self, path, base: int, length: int):
+        self._fh = open(path, "rb")
+        self._base = base
+        self._length = length
+        self._pos = 0
+
+    def seek(self, off: int, whence: int = 0) -> int:
+        if whence == 1:
+            self._pos += off
+        elif whence == 2:
+            self._pos = self._length + off
+        else:
+            self._pos = off
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._length - self._pos
+        size = max(0, min(size, self._length - self._pos))
+        self._fh.seek(self._base + self._pos)
+        data = self._fh.read(size)
+        self._pos += len(data)
+        return data
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        self.close()
+
+
+_NESTED_IMAGE_SUFFIXES = (".ffpfs", ".exfat", ".ffpkg")
+
+
+def _open_inner_pfs(image_path, pfs, consts):
+    """Return a seek/read handle over the GAME PFS bytes.
+
+    A .ffpfs IS the game PFS directly. A .ffpfsc is an OUTER PFS holding one compressed
+    member (the inner .ffpfs); this descends into that member and presents its
+    decompressed bytes through a _PfscReader, so only touched blocks are decompressed —
+    never the whole inner image. Raises ValueError for an unsupported nested format
+    (exFAT / UFS)."""
+    image_path = Path(image_path)
+    outer = open(image_path, "rb")
+    try:
+        header = pfs.parse_image_header(outer)
+        inodes = pfs.parse_image_inodes(outer, header)
+        errors: list[str] = []
+        uroot, *_rest = pfs.parse_superroot_and_indexes(outer, header, inodes, errors)
+        if uroot < 0:
+            raise ValueError("could not locate the filesystem root (superroot)")
+        file_inodes, dir_inodes, _de = pfs.build_tree_from_uroot(outer, header, inodes, uroot, errors)
+        real_dirs = [d for d in dir_inodes if d]
+        files = list(file_inodes.items())
+        # Wrapper image: exactly one nested-image member and no real directories.
+        if len(files) == 1 and not real_dirs and files[0][0].lower().endswith(_NESTED_IMAGE_SUFFIXES):
+            rel, ino = files[0]
+            if rel.lower().endswith((".exfat", ".ffpkg")):
+                raise ValueError(f"this image wraps a {Path(rel).suffix} volume, not a PFS — "
+                                 f"browsing that format is not supported")
+            inode = inodes[ino]
+            if not getattr(inode, "db", None):
+                raise ValueError("inner image member has no data blocks")
+            base = inode.db[0] * header.block_size
+            outer.close()
+            if getattr(inode, "is_compressed", False):
+                return _PfscReader(image_path, pfs, consts, base=base)
+            return _SubRangeReader(image_path, base, int(inode.logical_size))
+        # Not a wrapper: this file is the game PFS itself.
+        outer.seek(0)
+        return outer
+    except Exception:
+        try:
+            outer.close()
+        except Exception:
+            pass
+        raise
+
+
+def list_pfs_image(image_path):
+    """Return the directory tree of a .ffpfs/.ffpfsc as a dict (no full decompression)."""
+    pfs, consts = _import_mkpfs()
+    image_path = Path(image_path)
+    errors: list[str] = []
+    reader = _open_inner_pfs(image_path, pfs, consts)
+    with reader as fh:
+        header = pfs.parse_image_header(fh)
+        inodes = pfs.parse_image_inodes(fh, header)
+        uroot, _fpt, _coll, _special = pfs.parse_superroot_and_indexes(fh, header, inodes, errors)
+        if uroot < 0:
+            raise ValueError("could not locate the filesystem root (superroot)")
+        file_inodes, dir_inodes, _dirents = pfs.build_tree_from_uroot(fh, header, inodes, uroot, errors)
+    entries = [{"path": d, "type": "dir"} for d in sorted(k for k in dir_inodes if k)]
+    for f in sorted(file_inodes):
+        try:
+            size = int(inodes[file_inodes[f]].logical_size)
+        except Exception:
+            size = 0
+        entries.append({"path": f, "type": "file", "size": size})
+    return {
+        "root": image_path.name,
+        "entries": entries,
+        "file_count": len(file_inodes),
+        "dir_count": len([k for k in dir_inodes if k]),
+    }
+
+
+def extract_pfs_members(image_path, members, dest_dir) -> int:
+    """Extract the given files / directory subtrees from a .ffpfs/.ffpfsc into dest_dir,
+    decompressing only their blocks. A member naming a directory extracts every file
+    beneath it. Prints '[####] N% extract (path)' progress the GUI can parse."""
+    pfs, consts = _import_mkpfs()
+    image_path = Path(image_path)
+    dest_dir = Path(dest_dir)
+    wanted = {m.strip().strip("/") for m in members if m.strip()}
+    errors: list[str] = []
+    reader = _open_inner_pfs(image_path, pfs, consts)
+    with reader as fh:
+        header = pfs.parse_image_header(fh)
+        inodes = pfs.parse_image_inodes(fh, header)
+        uroot, *_rest = pfs.parse_superroot_and_indexes(fh, header, inodes, errors)
+        file_inodes, _dir, _de = pfs.build_tree_from_uroot(fh, header, inodes, uroot, errors)
+        targets = []
+        for rel, ino in file_inodes.items():
+            reln = rel.strip("/")
+            for m in wanted:
+                if reln == m or reln.startswith(m + "/"):
+                    targets.append((rel, ino))
+                    break
+        targets.sort()
+        if not targets:
+            print("[ERROR] None of the requested items were found in the image.", flush=True)
+            return 1
+        total_bytes = 0
+        for _rel, ino in targets:
+            try:
+                total_bytes += max(0, int(inodes[ino].logical_size))
+            except Exception:
+                pass
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        done = 0
+        last_pct = -1
+        for rel, ino in targets:
+            out = dest_dir / Path(rel)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with out.open("wb") as o:
+                for chunk in pfs.iter_inode_logical_blocks(fh, header, inodes[ino]):
+                    o.write(chunk)
+                    done += len(chunk)
+                    if total_bytes:
+                        pct = min(99, int(done * 100 / total_bytes))
+                        if pct != last_pct:
+                            last_pct = pct
+                            print(f"[####] {pct}% extract ({rel})", flush=True)
+    print("[####] 100% extract", flush=True)
+    print(f"[OK] Extracted {len(targets)} file(s) to {dest_dir}", flush=True)
+    return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,8 +1246,45 @@ def main() -> None:
     parser.add_argument("--fake-sign-first", action="store_true",
                         help="Before packing a game FOLDER, fake-sign its executables in "
                              "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
+    parser.add_argument("--list-image", type=str, default=None, metavar="IMG",
+                        help="PFS BROWSE: print the directory tree of a .ffpfs/.ffpfsc as JSON "
+                             "(only metadata blocks are decompressed), then exit.")
+    parser.add_argument("--extract-from", type=str, default=None, metavar="IMG",
+                        help="PFS BROWSE: extract selected members from a .ffpfs/.ffpfsc "
+                             "(decompresses only their blocks). Needs --dest and --members-file.")
+    parser.add_argument("--dest", type=str, default=None, metavar="DIR",
+                        help="Destination folder for --extract-from.")
+    parser.add_argument("--members-file", type=str, default=None, metavar="FILE",
+                        help="Newline-separated relative paths (files or directories) to "
+                             "extract, for --extract-from.")
 
     args = parser.parse_args()
+
+    # ── PFS BROWSE MODE (list / extract; standalone, no temp, no mkpfs pack) ─────
+    if args.list_image:
+        try:
+            result = list_pfs_image(Path(args.list_image).resolve())
+        except Exception as e:
+            print(f"PFSBROWSE_ERROR: {e}", flush=True)
+            sys.exit(1)
+        print("PFSBROWSE_JSON: " + json.dumps(result), flush=True)
+        return
+    if args.extract_from:
+        if not args.dest or not args.members_file:
+            print("[ERROR] --extract-from requires --dest and --members-file.", flush=True)
+            sys.exit(1)
+        try:
+            members = Path(args.members_file).read_text(encoding="utf-8").splitlines()
+        except Exception as e:
+            print(f"[ERROR] Could not read members file: {e}", flush=True)
+            sys.exit(1)
+        try:
+            rc = extract_pfs_members(Path(args.extract_from).resolve(), members,
+                                     Path(args.dest).resolve())
+        except Exception as e:
+            print(f"[ERROR] Extraction failed: {e}", flush=True)
+            sys.exit(1)
+        sys.exit(rc or 0)
 
     # ── FAKE-SIGN MODE (standalone) ──────────────────────────────────────────────
     # Pure folder operation: needs no game_folder positional, no mkpfs, no temp dirs.

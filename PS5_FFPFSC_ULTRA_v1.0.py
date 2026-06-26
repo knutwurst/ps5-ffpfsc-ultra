@@ -11,6 +11,7 @@ import hashlib
 import zipfile
 import threading
 import subprocess
+import tempfile
 import signal
 import shutil
 import multiprocessing
@@ -65,7 +66,7 @@ def _run_packaged_cli_mode() -> None:
 _prepare_multiprocessing_runtime()
 _run_packaged_cli_mode()
 
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
 try:
@@ -93,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.79"
+APP_VERSION = "1.0.80"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4783,6 +4784,248 @@ class ArchivePasswordPrompt(ctk.CTkToplevel):
         self.destroy()
 
 
+class PfsBrowserDialog(ctk.CTkToplevel):
+    """Browse a packed (.ffpfs) or compressed (.ffpfsc) image: list its contents and
+    pull out individual files or whole folders, WITHOUT unpacking the whole image. The
+    backend reads only the blocks it needs (--list-image / --extract-from). Read-only."""
+
+    def __init__(self, app, image_path=None):
+        super().__init__(app.root)
+        self.app = app
+        self.image_path = None
+        self._entries = []          # full [{path, type, size}]
+        self._iid_path = {}         # tree item id -> rel path
+        self._proc = None           # running extract subprocess (for cancel)
+        self._q = queue.Queue()
+        self.title("Browse PFS image")
+        self.geometry("780x580")
+        self.configure(fg_color=BLACK)
+        self.resizable(True, True)
+        self.transient(app.root); self.lift(); self.focus_force()
+        self.after(50, self.grab_set)
+
+        ctk.CTkLabel(self, text="🔎  Browse PFS image",
+                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=18, pady=(14, 2))
+        ctk.CTkLabel(self, text="Open a .ffpfs or .ffpfsc, see what's inside, and extract "
+                                "individual files or folders. The image is never fully unpacked.",
+                      text_color=MUTED, wraplength=720, justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+
+        srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=18, pady=4)
+        sin = ctk.CTkFrame(srow, fg_color=PANEL); sin.pack(fill="x", padx=10, pady=8)
+        self.src_var = tk.StringVar(value=str(image_path or ""))
+        ctk.CTkEntry(sin, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(sin, text="Open image…", width=110, fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
+                       command=self._pick).pack(side="left", padx=(6, 0))
+
+        frow = ctk.CTkFrame(self, fg_color="transparent"); frow.pack(fill="x", padx=18, pady=(2, 0))
+        ctk.CTkLabel(frow, text="Filter:", text_color=MUTED).pack(side="left")
+        self.filter_var = tk.StringVar()
+        ctk.CTkEntry(frow, textvariable=self.filter_var, fg_color=CARD2, text_color=WHITE, width=240,
+                      placeholder_text="name contains…").pack(side="left", padx=(6, 0))
+        self.filter_var.trace_add("write", lambda *_: self._render())
+        self.count_var = tk.StringVar(value="")
+        ctk.CTkLabel(frow, textvariable=self.count_var, text_color=MUTED).pack(side="right")
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("default")
+        except Exception:
+            pass
+        style.configure("PFS.Treeview", background="#151515", fieldbackground="#151515",
+                         foreground="#f8fafc", rowheight=22, borderwidth=0)
+        style.configure("PFS.Treeview.Heading", background="#1a1a1a", foreground="#a1a1aa", borderwidth=0)
+        style.map("PFS.Treeview", background=[("selected", "#22c55e")], foreground=[("selected", "#061006")])
+        tframe = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); tframe.pack(fill="both", expand=True, padx=18, pady=6)
+        self.tree = ttk.Treeview(tframe, columns=("size", "type"), style="PFS.Treeview", selectmode="extended")
+        self.tree.heading("#0", text="Name"); self.tree.heading("size", text="Size"); self.tree.heading("type", text="Type")
+        self.tree.column("#0", width=470, anchor="w")
+        self.tree.column("size", width=110, anchor="e")
+        self.tree.column("type", width=70, anchor="w")
+        vsb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        vsb.pack(side="right", fill="y", pady=6)
+
+        bottom = ctk.CTkFrame(self, fg_color=BLACK); bottom.pack(fill="x", padx=18, pady=(2, 4))
+        self.status_var = tk.StringVar(value="No image loaded.")
+        ctk.CTkLabel(bottom, textvariable=self.status_var, text_color=MUTED).pack(side="left")
+        self.progress = ctk.CTkProgressBar(bottom, width=180); self.progress.set(0)
+
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=18, pady=(0, 14))
+        self.extract_sel_btn = ctk.CTkButton(btns, text="⬇  Extract selected…", fg_color=GREEN, hover_color=GREEN2,
+                       text_color="#061006", font=ctk.CTkFont(size=13, weight="bold"),
+                       command=lambda: self._extract(False), state="disabled")
+        self.extract_sel_btn.pack(side="right", padx=(8, 0))
+        self.extract_all_btn = ctk.CTkButton(btns, text="⬇  Extract all…", fg_color=CARD2, text_color=WHITE,
+                       hover_color=GREEN2, command=lambda: self._extract(True), state="disabled")
+        self.extract_all_btn.pack(side="right")
+        self.close_btn = ctk.CTkButton(btns, text="Close", fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._cancel_or_close)
+        self.close_btn.pack(side="left")
+
+        self.after(120, self._poll)
+        if image_path:
+            self.after(150, self._load)
+
+    def _pick(self):
+        p = filedialog.askopenfilename(parent=self, title="Select a .ffpfs / .ffpfsc image",
+                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p); self._load()
+
+    def _load(self):
+        raw = (self.src_var.get() or "").strip()
+        if not raw or not Path(raw).is_file():
+            messagebox.showerror("Not found", "Pick a .ffpfs / .ffpfsc file first.", parent=self); return
+        self.image_path = Path(raw)
+        self.status_var.set("Reading image…")
+        self.extract_sel_btn.configure(state="disabled"); self.extract_all_btn.configure(state="disabled")
+        cmd = self.app._backend_cmd("--list-image", str(self.image_path))
+        def _worker():
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                self._q.put(("list_out", (r.stdout or "") + "\n" + (r.stderr or "")))
+            except Exception as e:
+                self._q.put(("list_err", str(e)))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "list_out":
+                    self._on_list(payload)
+                elif kind == "list_err":
+                    self.status_var.set(f"Failed: {payload}")
+                elif kind == "ext_line":
+                    self._on_ext_line(payload)
+                elif kind == "ext_done":
+                    self._on_ext_done(payload)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(120, self._poll)
+
+    def _on_list(self, text):
+        line = next((l for l in text.splitlines() if l.startswith("PFSBROWSE_JSON:")), None)
+        if not line:
+            err = next((l for l in text.splitlines() if l.startswith("PFSBROWSE_ERROR:")), None)
+            self.status_var.set(err.split("PFSBROWSE_ERROR:", 1)[1].strip() if err
+                                else "Could not read this image.")
+            return
+        try:
+            data = json.loads(line.split("PFSBROWSE_JSON:", 1)[1])
+        except Exception as e:
+            self.status_var.set(f"Bad listing: {e}"); return
+        self._entries = data.get("entries", [])
+        self._render()
+        self.status_var.set(f"{data.get('file_count', 0)} files, {data.get('dir_count', 0)} folders.")
+        self.extract_sel_btn.configure(state="normal"); self.extract_all_btn.configure(state="normal")
+
+    def _render(self):
+        flt = (self.filter_var.get() or "").strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        self._iid_path = {}
+        node = {"": ""}
+        entries = self._entries
+        if flt:
+            keep = set()
+            for e in entries:
+                if flt in e["path"].lower():
+                    parts = e["path"].split("/")
+                    for i in range(len(parts)):
+                        keep.add("/".join(parts[:i + 1]))
+            entries = [e for e in entries if e["path"] in keep]
+        for e in sorted((e for e in entries if e["type"] == "dir"),
+                        key=lambda e: (e["path"].count("/"), e["path"])):
+            path = e["path"]
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            iid = self.tree.insert(node.get(parent, ""), "end", text="📁 " + path.rsplit("/", 1)[-1],
+                                   values=("", "dir"), open=bool(flt))
+            node[path] = iid
+            self._iid_path[iid] = path
+        for e in sorted((e for e in entries if e["type"] == "file"), key=lambda e: e["path"]):
+            path = e["path"]
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            iid = self.tree.insert(node.get(parent, ""), "end", text="📄 " + path.rsplit("/", 1)[-1],
+                                   values=(format_size(e.get("size", 0)), "file"))
+            self._iid_path[iid] = path
+        self.count_var.set(f"{len(self._iid_path)} shown")
+
+    def _extract(self, extract_all):
+        if not self.image_path:
+            return
+        if extract_all:
+            members = [e["path"] for e in self._entries if "/" not in e["path"]]
+        else:
+            members = [self._iid_path[i] for i in self.tree.selection() if i in self._iid_path]
+            if not members:
+                messagebox.showinfo("Nothing selected", "Select files or folders in the tree first.", parent=self)
+                return
+        dest = filedialog.askdirectory(parent=self, title="Extract to folder")
+        if not dest:
+            return
+        try:
+            fd, mfpath = tempfile.mkstemp(prefix="ffpfsc_members_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(members))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not stage the selection: {e}", parent=self); return
+        cmd = self.app._backend_cmd("--extract-from", str(self.image_path), "--dest", dest, "--members-file", mfpath)
+        self.status_var.set("Extracting…"); self.progress.set(0)
+        self.progress.pack(side="right", padx=(8, 0))
+        self.extract_sel_btn.configure(state="disabled"); self.extract_all_btn.configure(state="disabled")
+
+        def _worker():
+            try:
+                self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                               text=True, bufsize=1)
+                for line in self._proc.stdout:
+                    self._q.put(("ext_line", line.rstrip()))
+                rc = self._proc.wait()
+                self._q.put(("ext_done", rc))
+            except Exception as e:
+                self._q.put(("ext_done", f"err:{e}"))
+            finally:
+                self._proc = None
+                try:
+                    os.unlink(mfpath)
+                except Exception:
+                    pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_ext_line(self, line):
+        m = re.search(r"\[#{2,}\]\s*(\d{1,3})%", line)
+        if m:
+            self.progress.set(min(1.0, int(m.group(1)) / 100.0))
+            self.status_var.set(f"Extracting… {m.group(1)}%")
+        elif line.startswith("[ERROR]"):
+            self.status_var.set(line)
+
+    def _on_ext_done(self, rc):
+        try:
+            self.progress.pack_forget()
+        except Exception:
+            pass
+        self.extract_sel_btn.configure(state="normal"); self.extract_all_btn.configure(state="normal")
+        if rc == 0:
+            self.status_var.set("Extracted ✓")
+        else:
+            self.status_var.set(f"Extraction failed ({rc}).")
+
+    def _cancel_or_close(self):
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self.status_var.set("Cancelled.")
+            return
+        self.destroy()
+
+
 # ─── Main Application ──────────────────────────────────────────────────────────
 
 class App:
@@ -5213,6 +5456,7 @@ class App:
         self._button(jobbar, "🔄  Convert", self.open_converter,                 width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🩹  Patch",   self._open_patch_dialog,             width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "🔎  Browse",  self.open_pfs_browser,               width=118).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image to add a Pack job",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
@@ -5777,6 +6021,18 @@ class App:
 
     def open_converter(self):
         ConverterDialog(self)
+
+    def _backend_cmd(self, *args) -> list:
+        """Build a backend invocation for arbitrary args (list/extract image, …),
+        matching how the queue worker calls the backend: frozen re-invokes this exe
+        with --backend-internal; dev runs backend/cli.py under the interpreter."""
+        pycmd = get_backend_python_command() or ["python"]
+        if getattr(sys, "frozen", False):
+            return pycmd + list(args)
+        return pycmd + ["-u", str(backend_base_dir() / "cli.py")] + list(args)
+
+    def open_pfs_browser(self):
+        PfsBrowserDialog(self)
 
     def fake_sign_folder(self):
         """Fake Sign job: pick a decrypted PS5 dump folder and ADD it to the queue as a

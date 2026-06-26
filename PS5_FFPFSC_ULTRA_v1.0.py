@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.81"
+APP_VERSION = "1.0.82"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -124,11 +124,6 @@ RAW_LOG_FILE = APP_DIR / "raw_tool_output.log"
 FINAL_REPORT_FILE = APP_DIR / "last_result_report.txt"
 HISTORY_FILE = APP_DIR / "history.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
-COMPAT_FILE = APP_DIR / "compatibility.json"
-COMMUNITY_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbzUxOxhfNi3cGs2cP1tlX1etWbj62neOuS_mOOnL8ipPaBhNH_weoIJPPiF-wCIBkOH/exec"
-)
 
 TITLE_RE = re.compile(r"\b(PPSA\d{5}|CUSA\d{5})\b", re.I)
 PROGRESS_RE = re.compile(r"\[(?P<bar>[#\-]{4,})\]\s*(?P<pct>\d{1,3})%\s*(?P<label>.*)", re.I)
@@ -1208,33 +1203,6 @@ def is_first_run() -> bool:
     return not SETTINGS_FILE.exists()
 
 
-# ── Compatibility list helpers ─────────────────────────────────────────────────
-
-def load_compat() -> list:
-    ensure_app_dir()
-    try:
-        if COMPAT_FILE.exists():
-            return json.loads(COMPAT_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return []
-
-
-def save_compat(reports: list) -> None:
-    ensure_app_dir()
-    COMPAT_FILE.write_text(json.dumps(reports, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def add_compat_report(report: dict) -> None:
-    reports = load_compat()
-    tid = report.get("title_id", "").strip().upper()
-    if tid:
-        # Replace any existing local entry for the same title — don't accumulate duplicates
-        reports = [r for r in reports if r.get("title_id", "").strip().upper() != tid]
-    reports.insert(0, report)          # newest first
-    save_compat(reports)
-
-
 def get_last_log_lines(n: int = 50) -> str:
     try:
         if RAW_LOG_FILE.exists():
@@ -1929,7 +1897,6 @@ class SettingsWindow(ctk.CTkToplevel):
         ui.pack(fill="x", pady=(4, 12))
         for text, var in [
             ("Show summary popup when done", self.app.summary_popup_var),
-            ("Ask to share compatibility data after packing", self.app.compat_prompt_var),
             ("Play sound on completion",     self.app.sound_complete_var),
             ("Play sound on errors",         self.app.sound_error_var),
             ("Open output folder when done", self.app.open_output_var),
@@ -5084,7 +5051,6 @@ class App:
             self.root.after(200, self._show_first_run_wizard)
 
         # After the UI is fully loaded, remind user to report any untested games
-        self.root.after(4000, self._check_pending_compat_reports)
         # Restore the user's saved section widths once the layout has settled.
         self.root.after(600, self._restore_sashes)
         # Offer to reclaim leftover scratch from a crashed/cancelled previous run.
@@ -5385,7 +5351,6 @@ class App:
         self.keep_pfs_var        = self._persisted_bool(settings, "keep_pfs", False)
         self.open_output_var     = self._persisted_bool(settings, "open_output", False)
         self.summary_popup_var   = self._persisted_bool(settings, "summary_popup", True)
-        self.compat_prompt_var   = self._persisted_bool(settings, "compat_prompt", True)
         self.sound_complete_var  = self._persisted_bool(settings, "sound_complete", True)
         self.sound_error_var     = self._persisted_bool(settings, "sound_error", True)
         self.batch_var = tk.BooleanVar(value=False)        # session state — not persisted
@@ -5764,7 +5729,6 @@ class App:
         self.bottom_tabs.add("Status & Stats")
         self.bottom_tabs.add("Recent Compressions")
         self.bottom_tabs.add("Statistics")
-        self.bottom_tabs.add("Compatibility")
 
         # ── Status & Stats tab — 3 columns side by side ──────────────────────
         ss_tab = self.bottom_tabs.tab("Status & Stats")
@@ -5872,115 +5836,6 @@ class App:
         self._button(stats_tab, "REFRESH STATS", self.refresh_statistics, width=140).grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.refresh_statistics()
 
-        # ── Compatibility tab ─────────────────────────────────────────────────
-        compat_tab = self.bottom_tabs.tab("Compatibility")
-        compat_tab.grid_columnconfigure(0, weight=1)
-        compat_tab.grid_columnconfigure(1, weight=2)
-        compat_tab.grid_rowconfigure(0, weight=1)
-
-        # ── Left: submit form ─────────────────────────────────────────────────
-        form_outer = ctk.CTkScrollableFrame(compat_tab, fg_color=PANEL, border_width=1,
-                                             border_color=BORDER, corner_radius=10)
-        form_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
-        form_outer.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(form_outer, text="SUBMIT COMPATIBILITY REPORT",
-                      text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold")
-                     ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 8))
-
-        # Form fields
-        self._compat_title_var      = tk.StringVar()
-        self._compat_titleid_var    = tk.StringVar()
-        self._compat_origsize_var   = tk.StringVar()
-        self._compat_compsize_var   = tk.StringVar()
-        self._compat_smver_var      = tk.StringVar()
-        self._compat_storage_var    = tk.StringVar(value="Internal PS5 SSD")
-        self._compat_status_var     = tk.StringVar(value="Working")
-
-        field_rows = [
-            ("Game Title",       self._compat_title_var,   False),
-            ("Title ID",         self._compat_titleid_var, False),
-            ("Original Size",    self._compat_origsize_var,False),
-            ("Compressed Size",  self._compat_compsize_var,False),
-            ("ShadowMount Ver.", self._compat_smver_var,   False),
-        ]
-        for ri, (lbl, var, _) in enumerate(field_rows, start=1):
-            ctk.CTkLabel(form_outer, text=lbl + ":", text_color=MUTED,
-                          font=ctk.CTkFont(size=11)).grid(row=ri, column=0, sticky="w", padx=12, pady=2)
-            ctk.CTkEntry(form_outer, textvariable=var, fg_color=CARD,
-                          border_color=BORDER2, text_color=WHITE,
-                          font=ctk.CTkFont(size=11)).grid(row=ri, column=1, sticky="ew", padx=(4, 12), pady=2)
-
-        ctk.CTkLabel(form_outer, text="Storage:", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).grid(row=6, column=0, sticky="w", padx=12, pady=2)
-        ctk.CTkOptionMenu(form_outer, variable=self._compat_storage_var,
-                           values=["Internal PS5 SSD", "USB SSD", "USB HDD", "External HDD"],
-                           fg_color=CARD2, button_color=CARD2, button_hover_color=BORDER2,
-                           text_color=WHITE, font=ctk.CTkFont(size=11)
-                          ).grid(row=6, column=1, sticky="ew", padx=(4, 12), pady=2)
-
-        ctk.CTkLabel(form_outer, text="Status:", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).grid(row=7, column=0, sticky="w", padx=12, pady=2)
-        status_row = ctk.CTkFrame(form_outer, fg_color="transparent")
-        status_row.grid(row=7, column=1, sticky="w", padx=(4, 12), pady=2)
-        for st, col in [("✅ Working", GREEN), ("⚠ Partial", YELLOW), ("❌ Not Working", RED)]:
-            ctk.CTkRadioButton(status_row, text=st, variable=self._compat_status_var,
-                                value=st.split(" ", 1)[1],
-                                fg_color=col, hover_color=col,
-                                text_color=WHITE, font=ctk.CTkFont(size=11)
-                               ).pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(form_outer, text="Performance Notes:", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).grid(row=8, column=0, sticky="nw", padx=12, pady=(6, 2))
-        self._compat_notes_box = ctk.CTkTextbox(form_outer, fg_color=CARD, border_width=1,
-                                                 border_color=BORDER2, text_color=WHITE,
-                                                 font=ctk.CTkFont(size=11), height=60, wrap="word")
-        self._compat_notes_box.grid(row=8, column=1, sticky="ew", padx=(4, 12), pady=(6, 4))
-
-        # ── Share to community checkbox ───────────────────────────────────────
-        self._compat_share_var = tk.BooleanVar(value=True)
-        share_row = ctk.CTkFrame(form_outer, fg_color="transparent")
-        share_row.grid(row=9, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 0))
-        ctk.CTkCheckBox(share_row, text="Share anonymously to community database",
-                        variable=self._compat_share_var,
-                        text_color=MUTED, font=ctk.CTkFont(size=11),
-                        fg_color=GREEN, hover_color=GREEN2,
-                        border_color=BORDER2).pack(side="left")
-        self._compat_share_status = ctk.CTkLabel(share_row, text="", text_color=MUTED,
-                                                  font=ctk.CTkFont(size=10))
-        self._compat_share_status.pack(side="left", padx=(8, 0))
-
-        btn_row = ctk.CTkFrame(form_outer, fg_color="transparent")
-        btn_row.grid(row=10, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 12))
-        btn_row.grid_columnconfigure(0, weight=1)
-        btn_row.grid_columnconfigure(1, weight=1)
-        self._button(btn_row, "✚  Submit Report", self.submit_compat_report,
-                      green=True).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self._button(btn_row, "⟳  Auto-fill from last game", self._compat_autofill
-                     ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-
-        # ── Right: compatibility list ─────────────────────────────────────────
-        list_frame = ctk.CTkFrame(compat_tab, fg_color=PANEL, border_width=1,
-                                   border_color=BORDER, corner_radius=10)
-        list_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
-        list_frame.grid_columnconfigure(0, weight=1)
-        list_frame.grid_rowconfigure(1, weight=1)
-
-        list_head = ctk.CTkFrame(list_frame, fg_color="transparent")
-        list_head.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        list_head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(list_head, text="COMPATIBILITY LIST", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w")
-        hbtn = ctk.CTkFrame(list_head, fg_color="transparent")
-        hbtn.grid(row=0, column=1)
-        self._button(hbtn, "⟳ Refresh", self.refresh_compat_list, width=80).pack(side="left", padx=(0, 4))
-        self._button(hbtn, "CSV Export", self.export_compat_csv,   width=90).pack(side="left")
-
-        self.compat_box = ctk.CTkTextbox(list_frame, fg_color=BLACK, border_width=1, border_color=BORDER,
-                                          text_color=WHITE, font=ctk.CTkFont(family="Consolas", size=11),
-                                          wrap="word", state="disabled")
-        self.compat_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self.refresh_compat_list()
 
         # Footer
         footer = ctk.CTkFrame(main, fg_color=BLACK)
@@ -9057,471 +8912,6 @@ class App:
             self.stats_box.insert("end", line + "\n")
         self.stats_box.configure(state="disabled")
 
-    # ── ShadowMount help ──────────────────────────────────────────────────────
-    def _show_sm_help(self):
-        win = ctk.CTkToplevel(self.root)
-        win.title("ShadowMount Compatibility")
-        win.configure(fg_color=BLACK)
-        win.geometry("480x380")
-        win.resizable(False, False)
-        win.lift(); win.focus_force(); win.grab_set()
-        ctk.CTkLabel(win, text="ℹ  ShadowMount Compatibility",
-                      text_color=YELLOW, font=ctk.CTkFont(size=15, weight="bold")
-                     ).pack(anchor="w", padx=18, pady=(16, 6))
-        ctk.CTkLabel(win,
-                      text=(
-                          "Output .ffpfsc files are designed for use with ShadowMount,\n"
-                          "a PS5 backup manager.\n\n"
-                          "To mount a compressed game:\n"
-                          "  1.  Copy the .ffpfsc file to your PS5 internal storage\n"
-                          "      or an external drive (USB SSD/HDD).\n"
-                          "  1a. If you already have a shortcut for this game on the XMB,\n"
-                          "      delete it first — the old entry causes a param error and\n"
-                          "      the game won't appear after mounting.\n"
-                          "  2.  Open ShadowMount on your PS5 and let it scan.\n"
-                          "      If the game is not detected or the shortcut is not made,\n"
-                          "      re-run ShadowMount.\n"
-                          "  3.  Select the game from the XMB and launch it —\n"
-                          "      it will appear and run like a standard title.\n\n"
-                          "Requirements for full compatibility:\n"
-                          "  • sce_sys/param.json must exist in the original dump\n"
-                          "  • eboot.bin must exist in the original dump\n\n"
-                          "If the game still doesn't appear, verify the dump structure\n"
-                          "and try re-compressing."
-                      ),
-                      text_color=WHITE, font=ctk.CTkFont(size=12),
-                      justify="left", anchor="w", wraplength=440
-                     ).pack(anchor="w", padx=18, pady=(0, 4))
-        ctk.CTkButton(win, text="Close", command=win.destroy,
-                       fg_color=GREEN, hover_color=GREEN2, text_color="#061006"
-                      ).pack(anchor="e", padx=18, pady=(0, 16))
-
-    # ── Compatibility report ───────────────────────────────────────────────────
-    def _prompt_compat_share(self, item, final_size: int = 0):
-        """Pop up after a successful compression asking the user to share compat data."""
-        if item is None:
-            return
-
-        win = ctk.CTkToplevel(self.root)
-        win.title("Share Compatibility Data")
-        win.configure(fg_color=BLACK)
-        win.geometry("480x320")
-        win.resizable(False, False)
-        win.transient(self.root)
-        win.lift()
-        win.focus_force()
-        win.after(50, win.grab_set)
-
-        ctk.CTkLabel(win, text="🎮  Share Compatibility Report?",
-                      font=ctk.CTkFont(size=16, weight="bold"),
-                      text_color=GREEN).pack(anchor="w", padx=20, pady=(18, 4))
-        ctk.CTkLabel(win,
-                      text="Help the community by sharing how well this game compressed.\n"
-                           "No personal data is collected — only game info and result.",
-                      text_color=MUTED, font=ctk.CTkFont(size=12),
-                      justify="left", wraplength=440).pack(anchor="w", padx=20, pady=(0, 12))
-
-        # Summary card
-        card = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=8)
-        card.pack(fill="x", padx=20, pady=(0, 12))
-        rows = [
-            ("Game",             item.name),
-            ("Title ID",         item.title_id),
-            ("Original Size",    format_size(item.size) if item.size else "—"),
-            ("Compressed Size",  format_size(final_size) if final_size else "—"),
-        ]
-        for lbl, val in rows:
-            row = ctk.CTkFrame(card, fg_color="transparent")
-            row.pack(fill="x", padx=14, pady=2)
-            ctk.CTkLabel(row, text=lbl + ":", text_color=MUTED,
-                          font=ctk.CTkFont(size=11), width=130, anchor="w").pack(side="left")
-            ctk.CTkLabel(row, text=val, text_color=WHITE,
-                          font=ctk.CTkFont(size=11), anchor="w").pack(side="left")
-
-        status_var = tk.StringVar(value="Not Tested Yet")
-
-        status_lbl = ctk.CTkLabel(win, text="", text_color=MUTED,
-                                   font=ctk.CTkFont(size=11))
-        status_lbl.pack(anchor="w", padx=20)
-
-        def _send():
-            import datetime
-            report = {
-                "game_title":      item.name,
-                "title_id":        item.title_id,
-                "original_size":   format_size(item.size) if item.size else "",
-                "compressed_size": format_size(final_size) if final_size else "",
-                "storage":         self._compat_storage_var.get(),
-                "shadowmount_ver": self._compat_smver_var.get().strip(),
-                "status":          status_var.get(),
-                "notes":           "",
-                "submitted":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            }
-            add_compat_report(report)
-            self.refresh_compat_list()
-            status_lbl.configure(text="⏳ Sending to community…", text_color=YELLOW)
-            def _post():
-                try:
-                    import urllib.request as _ur, json as _js
-                    payload = _js.dumps(report).encode()
-                    req = _ur.Request(COMMUNITY_URL, data=payload,
-                                      headers={"Content-Type": "application/json"})
-                    with _ur.urlopen(req, timeout=15) as resp:
-                        resp.read()
-                    try:
-                        win.after(0, lambda: status_lbl.configure(
-                            text="✓ Sent! Thank you for contributing.", text_color=("#1a7a40", "#4ade80")))
-                    except Exception:
-                        pass   # dialog already closed
-                    self.log("OK", f"Compat report sent: {item.name} — {report['status']}")
-                    try:
-                        win.after(2000, win.destroy)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    try:
-                        win.after(0, lambda: status_lbl.configure(
-                            text=f"⚠ Send failed: {e}", text_color=RED))
-                    except Exception:
-                        pass
-                    self.log("WARN", f"Community share failed: {e}")
-            threading.Thread(target=_post, daemon=True).start()
-
-        def _skip():
-            win.destroy()
-
-        btn_row = ctk.CTkFrame(win, fg_color="transparent")
-        btn_row.pack(fill="x", padx=20, pady=(8, 16))
-        ctk.CTkButton(btn_row, text="✓  Yes, Share Data", fg_color=GREEN,
-                       text_color="#061006", hover_color=GREEN2,
-                       command=_send).pack(side="left", expand=True, fill="x", padx=(0, 6))
-        ctk.CTkButton(btn_row, text="✗  No Thanks", fg_color=CARD2,
-                       text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
-                       command=_skip).pack(side="left", expand=True, fill="x", padx=(6, 0))
-
-    def _check_pending_compat_reports(self):
-        """On startup: find history entries with no community report and prompt the user."""
-        settings = load_settings()
-        if settings.get("skip_compat_reminder", False):
-            return
-        history  = load_history()
-        reported = {r.get("title_id", "").strip().upper() for r in load_compat()}
-        # Games compressed by this user but never reported
-        seen_tids: set[str] = set()
-        pending = []
-        for h in history:
-            tid = h.get("title_id", "").strip().upper()
-            if tid and tid not in reported and tid not in seen_tids:
-                seen_tids.add(tid)
-                pending.append(h)
-        if not pending:
-            return
-        self._show_pending_compat_dialog(pending)
-
-    def _show_pending_compat_dialog(self, pending: list):
-        """Small non-modal dialog listing compressed-but-unreported games."""
-        win = ctk.CTkToplevel(self.root)
-        win.title("Community Reports — Have You Tested These?")
-        win.configure(fg_color=BLACK)
-        win.geometry("520x420")
-        win.resizable(False, True)
-        win.transient(self.root)
-        win.lift()
-
-        ctk.CTkLabel(win,
-                      text="🎮  Have you tested these compressed games on PS5?",
-                      font=ctk.CTkFont(size=14, weight="bold"),
-                      text_color=GREEN).pack(anchor="w", padx=18, pady=(16, 4))
-        ctk.CTkLabel(win,
-                      text="The community hasn't received a report for the games below.\n"
-                           "If you've tried them with ShadowMount, please share the result — it only takes a second.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11),
-                      justify="left", wraplength=480).pack(anchor="w", padx=18, pady=(0, 8))
-
-        scroll = ctk.CTkScrollableFrame(win, fg_color=PANEL, corner_radius=6)
-        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 8))
-        scroll.grid_columnconfigure(0, weight=1)
-
-        STATUS_OPTS = ["Not Tested Yet", "Working", "Partial", "Not Working"]
-        row_vars: list[tuple[dict, tk.StringVar]] = []
-
-        for i, h in enumerate(pending[:15]):   # cap at 15 so dialog doesn't get huge
-            name  = h.get("name", "Unknown")
-            tid   = h.get("title_id", "")
-            date  = h.get("date", "")[:10]
-
-            row = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=6)
-            row.grid(row=i, column=0, sticky="ew", pady=3, padx=2)
-            row.grid_columnconfigure(0, weight=1)
-
-            ctk.CTkLabel(row,
-                          text=f"{name}  [{tid}]",
-                          text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold"),
-                          anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
-            ctk.CTkLabel(row,
-                          text=f"Compressed {date}",
-                          text_color=MUTED, font=ctk.CTkFont(size=10),
-                          anchor="w").grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
-
-            sv = tk.StringVar(value="Not Tested Yet")
-            ctk.CTkOptionMenu(row, variable=sv, values=STATUS_OPTS,
-                               fg_color=CARD2, button_color=CARD2,
-                               dropdown_fg_color=PANEL,
-                               text_color=WHITE, font=ctk.CTkFont(size=11),
-                               width=160).grid(row=0, column=1, rowspan=2, padx=10, pady=4)
-            row_vars.append((h, sv))
-
-        def _submit_all():
-            import datetime
-            submitted = 0
-            for h, sv in row_vars:
-                status = sv.get()
-                if status == "Not Tested Yet":
-                    continue
-                report = {
-                    "game_title":      h.get("name", "Unknown"),
-                    "title_id":        h.get("title_id", ""),
-                    "original_size":   format_size(h["original"]) if h.get("original") else "",
-                    "compressed_size": format_size(h["final"])    if h.get("final")    else "",
-                    "storage":         self._compat_storage_var.get(),
-                    "shadowmount_ver": self._compat_smver_var.get().strip(),
-                    "status":          status,
-                    "notes":           "",
-                    "submitted":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
-                add_compat_report(report)
-                def _post(r=report):
-                    try:
-                        import urllib.request as _ur, json as _js
-                        payload = _js.dumps(r).encode()
-                        req = _ur.Request(COMMUNITY_URL, data=payload,
-                                          headers={"Content-Type": "application/json"})
-                        with _ur.urlopen(req, timeout=15) as resp:
-                            resp.read()
-                        self.log("OK", f"Compat report sent: {r['game_title']} — {r['status']}")
-                    except Exception as e:
-                        self.log("WARN", f"Community share failed: {e}")
-                threading.Thread(target=_post, daemon=True).start()
-                submitted += 1
-            self.refresh_compat_list()
-            win.destroy()
-            if submitted:
-                self.log("OK", f"Submitted {submitted} community report(s). Thank you!")
-
-        def _dont_ask():
-            s = load_settings()
-            s["skip_compat_reminder"] = True
-            save_settings(s)
-            win.destroy()
-
-        btn_row = ctk.CTkFrame(win, fg_color="transparent")
-        btn_row.pack(fill="x", padx=18, pady=(0, 14))
-        ctk.CTkButton(btn_row, text="✓  Submit Selected",
-                       fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
-                       command=_submit_all).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btn_row, text="Later",
-                       fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0","#2a2a2a"),
-                       command=win.destroy).pack(side="left", expand=True, fill="x", padx=(4, 4))
-        ctk.CTkButton(btn_row, text="Don't Ask Again",
-                       fg_color=CARD2, text_color=MUTED,
-                       hover_color=("#b0b0b0","#2a2a2a"),
-                       command=_dont_ask).pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-    def _compat_autofill(self, item=None, final_size: int = 0):
-        """Fill the compatibility form from a completed compression result."""
-        try:
-            report_text = FINAL_REPORT_FILE.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            report_text = ""
-
-        def _grab(key: str) -> str:
-            for line in report_text.splitlines():
-                if line.lower().startswith(key.lower() + ":"):
-                    return line.split(":", 1)[1].strip()
-            return ""
-
-        # Prefer the passed item, else fall back to queue[0], else parse report
-        src = item or (self.queue[0] if self.queue else None)
-        if src:
-            self._compat_title_var.set(src.name)
-            self._compat_titleid_var.set(src.title_id)
-            self._compat_origsize_var.set(format_size(src.size) if src.size else "")
-        else:
-            self._compat_title_var.set(_grab("Game"))
-            self._compat_titleid_var.set(_grab("Title ID"))
-            self._compat_origsize_var.set(_grab("Original Size"))
-
-        if final_size:
-            self._compat_compsize_var.set(format_size(final_size))
-        else:
-            comp = _grab("Compressed Size") or _grab("Output Size")
-            self._compat_compsize_var.set(comp)
-
-        # Clear notes so user fills in their own experience
-        self._compat_notes_box.delete("1.0", "end")
-
-    def submit_compat_report(self):
-        title   = self._compat_title_var.get().strip()
-        tid     = self._compat_titleid_var.get().strip()
-        orig    = self._compat_origsize_var.get().strip()
-        comp    = self._compat_compsize_var.get().strip()
-        smver   = self._compat_smver_var.get().strip()
-        storage = self._compat_storage_var.get()
-        status  = self._compat_status_var.get()
-        notes   = self._compat_notes_box.get("1.0", "end").strip()
-
-        if not title and not tid:
-            messagebox.showerror("Missing data", "Enter at least a Game Title or Title ID.")
-            return
-
-        import datetime
-        report = {
-            "game_title":       title or tid,
-            "title_id":         tid,
-            "original_size":    orig,
-            "compressed_size":  comp,
-            "storage":          storage,
-            "shadowmount_ver":  smver,
-            "status":           status,
-            "notes":            notes,
-            "submitted":        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-        add_compat_report(report)
-        self.log("OK", f"Compatibility report saved: {title or tid} — {status}")
-        self.refresh_compat_list()
-        self._compat_notes_box.delete("1.0", "end")
-
-        # ── Optionally share to community Google Sheet ────────────────────────
-        if getattr(self, "_compat_share_var", None) and self._compat_share_var.get():
-            self._compat_share_status.configure(text="⏳ Sending…", text_color=YELLOW)
-            def _post():
-                try:
-                    import urllib.request as _ur, json as _js
-                    payload = _js.dumps(report).encode()
-                    req = _ur.Request(COMMUNITY_URL, data=payload,
-                                      headers={"Content-Type": "application/json"})
-                    with _ur.urlopen(req, timeout=15) as resp:
-                        resp.read()
-                    self.root.after(0, lambda: self._compat_share_status.configure(
-                        text="✓ Shared!", text_color=("#1a7a40", "#4ade80")))
-                    self.log("OK", f"Compat report shared to community: {title or tid}")
-                except Exception as e:
-                    self.root.after(0, lambda: self._compat_share_status.configure(
-                        text=f"⚠ Failed: {e}", text_color=RED))
-                    self.log("WARN", f"Community share failed: {e}")
-                self.root.after(6000, lambda: self._compat_share_status.configure(text=""))
-            threading.Thread(target=_post, daemon=True).start()
-
-        messagebox.showinfo("Submitted", f"Report saved for: {title or tid}")
-
-    def refresh_compat_list(self):
-        reports = load_compat()
-        self.compat_box.configure(state="normal")
-        self.compat_box.delete("1.0", "end")
-        if not reports:
-            self.compat_box.insert("end", "No compatibility reports yet.\n\n"
-                                           "Use the form to submit one after testing a game with ShadowMount.")
-            self.compat_box.configure(state="disabled")
-            return
-
-        STATUS_ICON = {"Working": "✅", "Partial": "⚠", "Not Working": "❌"}
-
-        # Group reports by title_id so duplicate submissions for the same game
-        # are shown as a single aggregated card instead of N identical rows.
-        from collections import OrderedDict
-        groups: OrderedDict = OrderedDict()
-        for r in reports:
-            key = r.get("title_id", "").strip().upper() or r.get("game_title", "Unknown")
-            groups.setdefault(key, []).append(r)
-
-        for key, group in groups.items():
-            # Use the most recent (first) entry for name / size / meta
-            latest = group[0]
-            name  = latest.get("game_title", "Unknown")
-            tid   = latest.get("title_id", "")
-            orig  = latest.get("original_size", "")
-            comp  = latest.get("compressed_size", "")
-            sizes = f"{orig} → {comp}" if orig and comp else (orig or comp)
-
-            if len(group) == 1:
-                # Single report — show full detail as before
-                r     = latest
-                icon  = STATUS_ICON.get(r.get("status", ""), "❓")
-                store = r.get("storage", "")
-                smver = r.get("shadowmount_ver", "")
-                notes = r.get("notes", "")
-                date  = r.get("submitted", "")
-                line1 = f"{icon}  {name}"
-                if tid:
-                    line1 += f"  [{tid}]"
-                line2_parts = [p for p in [store, f"SM v{smver}" if smver else "", sizes, date] if p]
-                self.compat_box.insert("end", line1 + "\n")
-                if line2_parts:
-                    self.compat_box.insert("end", f"   {'   '.join(line2_parts)}\n")
-                if notes:
-                    self.compat_box.insert("end", f"   📝 {notes}\n")
-            else:
-                # Multiple reports — show aggregated summary
-                counts = {}
-                for r in group:
-                    s = r.get("status", "Unknown")
-                    counts[s] = counts.get(s, 0) + 1
-
-                # Pick the overall consensus icon (majority status)
-                best = max(counts, key=counts.get)
-                icon = STATUS_ICON.get(best, "❓")
-
-                line1 = f"{icon}  {name}"
-                if tid:
-                    line1 += f"  [{tid}]"
-                line1 += f"  ({len(group)} reports)"
-                self.compat_box.insert("end", line1 + "\n")
-
-                # Status breakdown
-                breakdown = "   ".join(
-                    f"{STATUS_ICON.get(s, '❓')} {s}: {n}"
-                    for s, n in sorted(counts.items(), key=lambda x: -x[1])
-                )
-                self.compat_box.insert("end", f"   {breakdown}\n")
-                if sizes:
-                    self.compat_box.insert("end", f"   {sizes}\n")
-
-                # Show individual notes if any report has them
-                for r in group:
-                    note = r.get("notes", "").strip()
-                    if note:
-                        date = r.get("submitted", "")
-                        self.compat_box.insert("end", f"   📝 {note}" + (f"  ({date})" if date else "") + "\n")
-
-            self.compat_box.insert("end", "\n")
-        self.compat_box.configure(state="disabled")
-
-    def export_compat_csv(self):
-        reports = load_compat()
-        if not reports:
-            messagebox.showinfo("No data", "No compatibility reports to export.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Export Compatibility List",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile="ps5_compat_list.csv",
-        )
-        if not path:
-            return
-        import csv
-        fields = ["game_title","title_id","original_size","compressed_size",
-                  "storage","shadowmount_ver","status","notes","submitted"]
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-                w.writeheader()
-                w.writerows(reports)
-            messagebox.showinfo("Exported", f"Saved {len(reports)} report(s) to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export failed", str(e))
-
     # ── Sound + Summary ───────────────────────────────────────────────────────
     def play_complete_sound(self, success=True):
         try:
@@ -9998,13 +9388,11 @@ class App:
                 self.log("SUCCESS", msg)
                 self.play_complete_sound(True)
 
-                # Auto-fill compatibility form with completed game data
                 _final_sz = getattr(self.worker, "final_size", 0) if self.worker else 0
                 completed_operation = getattr(completed_item, "operation", "pack") if completed_item else "pack"
-                # Compat form + history apply only to jobs that PRODUCE a .ffpfsc (pack,
-                # patch). Unpack and fake-sign create no packed game → skip them.
+                # History applies only to jobs that PRODUCE a .ffpfsc (pack, patch).
+                # Unpack and fake-sign create no packed game → skip them.
                 if completed_operation not in ("unpack", "fake-sign"):
-                    self._compat_autofill(item=completed_item, final_size=_final_sz)
                     # Record history HERE (main thread) — add_history mutates Tk widgets.
                     try:
                         _w = self.worker
@@ -10045,18 +9433,6 @@ class App:
                         if self.summary_popup_var.get():
                             self.show_summary_popup()
 
-                # Prompt user to share compatibility data — only if enabled, and never
-                # stacked on top of the summary popup (wait until no modal is grabbing).
-                if completed_operation not in ("unpack", "fake-sign") and self.compat_prompt_var.get():
-                    def _share_when_free(_i=completed_item, _s=_final_sz):
-                        try:
-                            if self.root.grab_current() is not None:
-                                self.root.after(500, _share_when_free)
-                                return
-                        except Exception:
-                            pass
-                        self._prompt_compat_share(_i, _s)
-                    self.root.after(400, _share_when_free)
             elif self.cancel_requested or self.extract_cancel_event.is_set():
                 # A user cancel surfaces here as a failed result — treat it as a cancel,
                 # not a failure: stop the batch, KEEP the item in the queue (marked

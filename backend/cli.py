@@ -499,15 +499,44 @@ _JUNK_DIR_NAMES = frozenset({
     ".DocumentRevisions-V100", ".AppleDouble",
 })
 
+# Scene-release artifacts that ride along inside a dump and must NOT be packed into
+# the game image: a group folder like _DUPLEX_ / _CODEX_ / _RUNE_ (underscore-wrapped
+# group name, holding the .nfo plus the group's tools/unlockers/sample) and loose
+# scene-metadata files. None are game data — the PS5 ignores them, but they bloat the
+# image and don't belong inside the game. (Our own injected fakelib/ and
+# ampr_emu.index are NOT underscore-wrapped, so they never match.)
+_SCENE_FILE_EXTS = frozenset({".nfo", ".sfv", ".diz", ".par2"})
+
+
+def _is_scene_group_dir(dirpath: str, name: str) -> bool:
+    """True for an underscore-wrapped scene-group folder (_DUPLEX_, _CODEX_, …).
+    Confirmed by an ALL-CAPS group name OR a .nfo sitting inside, so a real (and
+    always lowercase/mixed-case) PS5 game directory can never be mistaken for one."""
+    if len(name) < 3 or name[0] != "_" or name[-1] != "_":
+        return False
+    inner = name[1:-1]
+    if not inner:
+        return False
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9 ._+-]*", inner):
+        return True
+    try:
+        return any(f.lower().endswith(".nfo") for f in os.listdir(os.path.join(dirpath, name)))
+    except OSError:
+        return False
+
 
 def _strip_junk_files(root: Path) -> int:
-    """Recursively remove macOS/Windows metadata junk from *root* so it never
-    lands in the PFS image: AppleDouble sidecars (``._*``), ``.DS_Store``,
-    Spotlight/Trash/fseventsd folders, ``Thumbs.db``/``desktop.ini``, etc. These
-    are OS-generated, never game files. Returns the number of entries removed.
-    (Also why a build can fail with structure-verify on: a stray .DS_Store.)"""
+    """Recursively remove junk from *root* so it never lands in the PFS image:
+    (1) macOS/Windows metadata — AppleDouble sidecars (``._*``), ``.DS_Store``,
+        Spotlight/Trash/fseventsd folders, ``Thumbs.db``/``desktop.ini`` — and
+    (2) scene-release artifacts — a ``_GROUP_`` folder (_DUPLEX_, _CODEX_, …) and
+        loose ``.nfo``/``.sfv``/``.diz``/``.par2`` files.
+    None are game data. Returns the number of entries removed. (A stray .DS_Store
+    also fails structure-verify, so this doubles as a build-safety pass.)"""
     root = Path(root)
     removed = 0
+    scene_dirs: list[str] = []
+    scene_files = 0
     # topdown=False so we can rmtree junk dirs after their contents are handled.
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
         for name in filenames:
@@ -517,10 +546,27 @@ def _strip_junk_files(root: Path) -> int:
                     removed += 1
                 except OSError:
                     pass
+            elif os.path.splitext(name)[1].lower() in _SCENE_FILE_EXTS:
+                try:
+                    os.remove(os.path.join(dirpath, name))
+                    removed += 1
+                    scene_files += 1
+                except OSError:
+                    pass
         for name in list(dirnames):
             if name in _JUNK_DIR_NAMES:
                 shutil.rmtree(os.path.join(dirpath, name), ignore_errors=True)
                 removed += 1
+            elif _is_scene_group_dir(dirpath, name):
+                shutil.rmtree(os.path.join(dirpath, name), ignore_errors=True)
+                removed += 1
+                scene_dirs.append(name)
+    # Scene removals are noteworthy (they sat inside the game) — log them by name.
+    for d in scene_dirs:
+        print(f"[INFO] Removed scene-release folder '{d}/' before packing "
+              f"(not game data — kept out of the image).", flush=True)
+    if scene_files:
+        print(f"[INFO] Removed {scene_files} loose scene file(s) (.nfo/.sfv/…) before packing.", flush=True)
     return removed
 
 

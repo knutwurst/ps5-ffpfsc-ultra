@@ -1762,54 +1762,69 @@ def main() -> None:
                         **pack_kwargs,
                     )
                     continue   # done with this item — no pass 2
-                with tempfile.TemporaryDirectory(dir=user_temp) as temp_dir:
-                    temp_pfs = Path(temp_dir) / f"{title_id}.ffpfs"
+                # Build the inner (pass-1) uncompressed PFS image in a STABLE dir (NOT an
+                # auto-deleted TemporaryDirectory) so an OOM/restart can resume pass 2 from
+                # it WITHOUT rebuilding pass 1 — and so the GUI can free the extracted source
+                # the moment pass 1 is done (pass 2 reads only this image). The GUI keeps the
+                # image across a crash (a retry resumes from it; the startup sweep reaps an
+                # orphan) and removes it on terminal failure/cancel. On a clean pass-2 SUCCESS
+                # we remove it right here; every failure path propagates past this and LEAVES
+                # it for the resume.
+                inner_dir = (Path(user_temp) if user_temp else Path(tempfile.gettempdir())) / "_ffpfsc_inner"
+                inner_dir.mkdir(parents=True, exist_ok=True)
+                temp_pfs = inner_dir / f"{title_id}.ffpfs"
 
-                    pack_folder_uncompressed(
-                        item, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
-                        verify_enabled=args.verify,
-                        temp_folder=Path(temp_dir),
-                        **pack_kwargs,
+                pack_folder_uncompressed(
+                    item, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
+                    verify_enabled=args.verify,
+                    temp_folder=inner_dir,
+                    **pack_kwargs,
+                )
+                # Pass 1 done: tell the GUI so it frees the extracted source now (pass 2 needs
+                # only the inner image) and records the image path for a resume-on-OOM.
+                print(f"[PASS1-DONE] {temp_pfs}", flush=True)
+
+                # Incompressible-image fast path: if the inner image barely shrinks
+                # (already-compressed game assets — common; gain ~0%), pass 2 at
+                # compression-level 0 stores every block raw, which is exactly what the
+                # per-block threshold produces for incompressible data anyway. Same
+                # .ffpfsc, but without spending CPU on millions of futile deflate
+                # attempts over a ~150 GB image.
+                pass2_kwargs = dict(pack_kwargs)
+                if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
+                    print("[INFO] Inner image sampled as incompressible — storing without "
+                          "compression (level 0) to skip wasted CPU; the .ffpfsc is the same "
+                          "size either way.", flush=True)
+                    pass2_kwargs["compression_level"] = 0
+                # Adaptive pass-2 spool: keep the inner image on the SSD the GUI chose and
+                # put the spool there too if it still fits beside it, else spill the spool
+                # onto the output drive — so a big game still compresses off the fast drive
+                # instead of falling entirely to the HDD.
+                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, str(inner_dir), current_ffpfs_path, spill_base=user_spill)
+                try:
+                    _assert_pass2_spool_space(temp_pfs, spool_dir)
+                    compress_file_to_ffpfsc(
+                        temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
+                        temp_folder=spool_dir,
+                        **pass2_kwargs,
                     )
+                finally:
+                    if spool_ctx is not None:
+                        spool_ctx.cleanup()
 
-                    # Incompressible-image fast path: if the inner image barely shrinks
-                    # (already-compressed game assets — common; gain ~0%), pass 2 at
-                    # compression-level 0 stores every block raw, which is exactly what the
-                    # per-block threshold produces for incompressible data anyway. Same
-                    # .ffpfsc, but without spending CPU on millions of futile deflate
-                    # attempts over a ~150 GB image.
-                    pass2_kwargs = dict(pack_kwargs)
-                    if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
-                        print("[INFO] Inner image sampled as incompressible — storing without "
-                              "compression (level 0) to skip wasted CPU; the .ffpfsc is the same "
-                              "size either way.", flush=True)
-                        pass2_kwargs["compression_level"] = 0
-                    # Adaptive pass-2 spool: keep the inner image on temp_dir (the SSD the
-                    # GUI chose) and put the spool there too if it still fits beside it,
-                    # else spill the spool onto the output drive — so a big game still
-                    # compresses off the fast drive instead of falling entirely to the HDD.
-                    spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, temp_dir, current_ffpfs_path, spill_base=user_spill)
+                if args.keep_pfs:
+                    saved = current_ffpfs_path.parent / f"{title_id}.ffpfs"
+                    print(f"[INFO] Saving intermediate PFS image to {saved}...")
+                    # move (not copy): pass 2 already consumed temp_pfs; relocating frees the
+                    # SSD copy instead of leaving it for the success cleanup below to wipe.
                     try:
-                        _assert_pass2_spool_space(temp_pfs, spool_dir)
-                        compress_file_to_ffpfsc(
-                            temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                            temp_folder=spool_dir,
-                            **pass2_kwargs,
-                        )
-                    finally:
-                        if spool_ctx is not None:
-                            spool_ctx.cleanup()
-
-                    if args.keep_pfs:
-                        saved = current_ffpfs_path.parent / f"{title_id}.ffpfs"
-                        print(f"[INFO] Saving intermediate PFS image to {saved}...")
-                        # move (not copy): pass 2 already consumed temp_pfs, and the
-                        # TemporaryDirectory is about to delete it — relocating frees the
-                        # SSD copy instead of leaving it to be wiped.
-                        try:
-                            shutil.move(str(temp_pfs), str(saved))
-                        except Exception as e:
-                            print(f"[WARN] Could not save intermediate PFS image: {e}")
+                        shutil.move(str(temp_pfs), str(saved))
+                    except Exception as e:
+                        print(f"[WARN] Could not save intermediate PFS image: {e}")
+                # Pass 2 succeeded — drop the inner image (and its dir). Only reached on
+                # success: any earlier failure / sys.exit / -9 OOM kill propagates past here
+                # and LEAVES the image so the GUI can resume pass 2 from it on retry.
+                shutil.rmtree(inner_dir, ignore_errors=True)
 
     print("\n[SUCCESS] All operations completed successfully!")
 

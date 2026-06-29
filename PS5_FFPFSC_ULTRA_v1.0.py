@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.83"
+APP_VERSION = "1.0.84"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -3080,15 +3080,20 @@ class GameItem:
         obj.status       = "Pending Extract"
         obj.password     = None          # optional per-archive password override
         obj.source_kind  = "archive"     # unpacks a SECOND copy onto the build drive
-        # Honest extracted size from headers (scene RARs compress ~2:1, so the on-disk
-        # size badly undershoots). Pass saved passwords for header-encrypted sets. Leave
-        # 0 only when truly unreadable so the gate defers to the post-extraction re-check.
+        # Honest extracted size read from the archive headers (no extraction). Trust a
+        # successful read even when it is NOT larger than the on-disk set: a "High-Speed"/
+        # stored scene RAR is ~1:1, and RAR container overhead can make the on-disk volume
+        # set slightly LARGER than the game it holds (measured: STALKER 2 = 148.9 GiB game
+        # vs 150.2 GiB on disk -> the old `hdr > size` guard wrongly discarded a valid read
+        # and forced an estimate + HDD split). Require only a sane floor (>= half the on-disk
+        # size) to reject a bogus partial read; otherwise leave 0 so the gate estimates.
+        # Pass saved passwords for header-encrypted sets.
         try:
             pw = load_settings().get("archive_passwords") or []
         except Exception:
             pw = []
         hdr = ArchiveExtractor.uncompressed_size(first, pw)
-        obj.extracted_size = hdr if hdr and hdr > obj.size else 0
+        obj.extracted_size = hdr if (hdr and hdr >= obj.size * 0.5) else 0
         return obj
 
     @classmethod

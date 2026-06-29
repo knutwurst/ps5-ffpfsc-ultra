@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.84"
+APP_VERSION = "1.0.85"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -354,6 +354,13 @@ def _item_is_single_pass(item) -> bool:
         # Only a PACK of a single image file is single-pass. A patch job also has a
         # .ffpfsc file path + inplace source_kind, but it extracts AND repacks (needs
         # temp) — so it must NOT be treated as single-pass. unpack/fake-sign likewise.
+        # A resume (OOM retry compressing the already-built inner .ffpfs) is a single-pass
+        # compress of an existing image: only the output drive needs space — no new inner
+        # build, no extracted source. _resume_inner is transient (never persisted), so a
+        # restored queue just falls through to the disk-image test below.
+        ri = getattr(item, "_resume_inner", None)
+        if ri and Path(str(ri)).is_file():
+            return True
         return (getattr(item, "operation", "pack") == "pack"
                 and getattr(item, "source_kind", "") == "inplace"
                 and not getattr(item, "archive_path", None)
@@ -1125,8 +1132,19 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     suffix_parts = []
     if tid and tid.lower() not in name.lower():
         suffix_parts.append(f"[{tid}]")
-    src = getattr(item, "path", None)
-    ver = guess_game_version(src) if isinstance(src, Path) else ""
+    # Cache the version on the item the first time we can read it (source intact). An OOM
+    # resume DELETES the source folder, so a live re-read would drop the [v…] tag and the
+    # resume would then write a DIFFERENTLY-named .ffpfsc (orphaning the original instead of
+    # overwriting it). Prefer the cached tag; only (re)compute while the source still exists.
+    ver = (getattr(item, "_ver_tag", "") or "") if item is not None else ""
+    if not ver:
+        src = getattr(item, "path", None)
+        ver = guess_game_version(src) if isinstance(src, Path) else ""
+        if ver and item is not None:
+            try:
+                item._ver_tag = ver
+            except Exception:
+                pass
     if ver:
         # Shortened, 'v'-less version tag (e.g. [01.007]) — matches shorten_ffpfsc_versions.sh.
         suffix_parts.append(f"[{short_version(ver)}]")
@@ -3659,6 +3677,23 @@ class CLIWorker(threading.Thread):
             stage = line[8:].strip()
             if stage in self._weights:
                 self._set_stage(stage, 0, force=True)
+            return
+
+        # ── Pass-1 complete (folder two-pass build) ──────────────────────────
+        # The backend finished the inner uncompressed image and is about to start pass-2
+        # compression. The extracted source is no longer needed (pass 2 reads only the inner
+        # image) and an OOM/restart can now resume pass-2 from it — so record the image path
+        # and free the extracted source NOW to halve peak temp usage.
+        if line.startswith("[PASS1-DONE] "):
+            inner = line[len("[PASS1-DONE] "):].strip()
+            try:
+                self.item._inner_image = inner
+            except Exception:
+                pass
+            try:
+                self.app.root.after(0, lambda it=self.item: self.app._free_source_after_pass1(it))
+            except Exception:
+                pass
             return
 
         # ── Intercept raw Python exception tracebacks from the backend ────────
@@ -7002,6 +7037,71 @@ class App:
             self._reclaim_temp_base_inline(tp)
         self._run_cleanup(_work)
 
+    def _free_source_after_pass1(self, item) -> None:
+        """Mid-build hook (on the backend's [PASS1-DONE] marker): pass 1 has produced the
+        inner image, so the extracted SOURCE is no longer needed (pass 2 reads only the inner
+        image, and an OOM retry resumes from it). Free it NOW to halve peak temp. Only ever
+        deletes a throwaway extract (under _extracted / _ffpfsc_extract); a user's own pack
+        folder yields None from _extract_dir_for_item and is never touched."""
+        if item is None or getattr(item, "_source_freed", False):
+            return
+        own = self._extract_dir_for_item(item)
+        if own is None:
+            return   # user's own folder — never delete
+        item._source_freed = True
+        def _work(d=own):
+            try:
+                if d.exists():
+                    sz = get_folder_size(d)
+                    shutil.rmtree(str(d), ignore_errors=True)
+                    self.log("INFO", f"Freed {format_size(sz)} extracted source after pass 1 "
+                                     f"(no longer needed for compression).")
+                    if d.parent.name == "_ffpfsc_extract":
+                        try:
+                            if not any(d.parent.iterdir()):
+                                d.parent.rmdir()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        self._run_cleanup(_work)
+
+    def _cleanup_inner_image(self, item) -> None:
+        """Remove the persisted pass-1 inner image (kept on the build drive so an OOM retry
+        can resume pass-2 from it without rebuilding). Called on success and on terminal
+        failure/cancel — NEVER between OOM retries (those resume from it). The backend also
+        removes it on a clean pass-2 success; this is the GUI-side reaper for the failure /
+        give-up / cancel paths where the backend left it behind."""
+        if item is None:
+            return
+        inner = getattr(item, "_inner_image", None)
+        if not inner:
+            return
+        try:
+            item._inner_image = None
+        except Exception:
+            pass
+        def _work(p=Path(str(inner))):
+            try:
+                if p.exists():
+                    sz = p.stat().st_size if p.is_file() else get_folder_size(p)
+                    try:
+                        p.unlink()
+                    except Exception:
+                        shutil.rmtree(str(p), ignore_errors=True)
+                    if sz:
+                        self.log("INFO", f"Removed {format_size(sz)} inner image (pass-1 cache).")
+                par = p.parent
+                if par.name == "_ffpfsc_inner":
+                    try:
+                        if not any(par.iterdir()):
+                            par.rmdir()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._run_cleanup(_work)
+
     def _extract_and_queue_archive(self, archive: Path):
         """Extract *archive* (background thread) with live progress, then queue.
         (Currently unreachable — the queue path _extract_queued_item is used instead.)"""
@@ -7845,10 +7945,18 @@ class App:
                 cmd.append("--verbose")
             return cmd, backend, pout.parent, temp
 
+        # OOM-resume: a retry compresses the already-built inner image (pass 1 is skipped;
+        # the extracted source was freed after pass 1). Source the command from that image
+        # so it takes the backend's single-pass .ffpfs -> .ffpfsc route. The output NAME
+        # still comes from the item's metadata (descriptive_ffpfsc_name), so it matches the
+        # original run exactly even though the source folder is gone.
+        _resume = getattr(item, "_resume_inner", None)
+        _resume_ok = bool(_resume) and Path(str(_resume)).is_file()
+        _src = str(_resume) if _resume_ok else str(item.path)
         if getattr(sys, "frozen", False):
-            cmd = pycmd + [str(item.path), str(out)]
+            cmd = pycmd + [_src, str(out)]
         else:
-            cmd = pycmd + ["-u", str(cli_py), str(item.path), str(out)]
+            cmd = pycmd + ["-u", str(cli_py), _src, str(out)]
         if getattr(item, "operation", "pack") == "unpack":
             if out.exists() and out.is_dir():
                 out = out / f"{item.path.stem}_extracted"
@@ -7893,7 +8001,8 @@ class App:
         # extraction / the post-extraction re-gate. Falls back to the user temp folder.
         patch_src = getattr(item, "patch_source", None)
         is_patch_job = (bool(patch_src) and self.auto_integrate_patch_var.get()
-                        and bool(getattr(item, "path", None)) and item.path.is_dir())
+                        and bool(getattr(item, "path", None)) and item.path.is_dir()
+                        and not _resume_ok)   # a resume only re-compresses the inner image
         if getattr(item, "_build_temp", None) is None:
             try:
                 self._resolve_extract_root(item)   # sets item._build_temp via the right factor
@@ -7919,7 +8028,7 @@ class App:
         # Opt-in exFAT workflow: only for a plain folder pack (not patch jobs, not a
         # disk-image source). The backend builds an exFAT image of the folder and
         # compresses that instead of running the folder PFS builder.
-        if (self.build_via_exfat_var.get() and not is_patch_job
+        if (self.build_via_exfat_var.get() and not is_patch_job and not _resume_ok
                 and getattr(item, "operation", "pack") == "pack"
                 and getattr(item, "path", None) and Path(item.path).is_dir()):
             cmd.append("--via-exfat")
@@ -7930,7 +8039,7 @@ class App:
         # _prepare_ampr BEFORE the ampr_emu.index is built, so the index records the
         # final (signed) file sizes/mtimes. Letting the backend re-sign afterwards
         # would invalidate that index.
-        if (self.fake_sign_before_pack_var.get() and not is_patch_job
+        if (self.fake_sign_before_pack_var.get() and not is_patch_job and not _resume_ok
                 and getattr(item, "operation", "pack") == "pack"
                 and not getattr(item, "ampr_emu", False)):
             cmd.append("--fake-sign-first")
@@ -8206,8 +8315,20 @@ class App:
             return False
         item._cpu_retry_override = new_cpu
         item._oom_retries = tries + 1
+        # If pass 1 already built the inner image (the usual case — OOM strikes in pass-2
+        # compression), resume from it: the retry compresses that image with fewer cores,
+        # skipping pass 1 entirely. (No inner image yet = a rare pass-1 OOM → rebuild from
+        # the source, which keep_source below preserves.)
+        inner = getattr(item, "_inner_image", None)
+        if inner and Path(str(inner)).is_file():
+            item._resume_inner = str(inner)
+            self.log("INFO", "Resuming from the already-built inner image — pass 1 is skipped "
+                             "on this retry (compression only).")
         item.status = "Pending"
-        self._cleanup_after_failure(item)   # reclaim the failed run's partial scratch first
+        # Reclaim the failed run's partial scratch (pass-2 spool, mkpfs tmp dirs) but KEEP the
+        # extracted source: a pass-1 retry rebuilds from it, a pass-2 resume already freed it
+        # (the keep is then a no-op). The inner image (_ffpfsc_inner) is preserved for resume.
+        self._cleanup_after_failure(item, keep_source=True)
         self.queue.insert(0, item)
         self.update_queue_box()
         self.log("WARN", f"Out of memory — retrying {item.name} with {new_cpu} CPU core(s) "
@@ -8218,13 +8339,18 @@ class App:
         self.root.after(800, self._batch_auto_start)
         return True
 
-    def _cleanup_after_failure(self, item) -> None:
+    def _cleanup_after_failure(self, item, keep_source: bool = False) -> None:
         """Reclaim a failed/skipped/cancelled run's scratch: the mkpfs tmp* working dirs
         (orphaned inner image + pass-2 spool) AND this item's own extracted-source subdir
         — scoped to the drive the run actually built on (item._build_temp), the user temp
         folder, AND the output drive's _ffpfsc_temp (where a SPLIT run may have spilled its
         pass-2 spool, ffpfsc_spool_*). Counted so the next batch gate waits for the reclaim.
-        Threaded (rmtree of a ~150 GB tree must not freeze the UI)."""
+        Threaded (rmtree of a ~150 GB tree must not freeze the UI).
+
+        *keep_source* (set by an OOM retry): DON'T delete the extracted-source subdir — a
+        pass-1 retry rebuilds the inner image from it, and a pass-2 resume already freed it.
+        Only terminal failures/cancels delete the source. The persisted inner image
+        (_ffpfsc_inner) is never touched here; its lifecycle is _cleanup_inner_image."""
         self._ampr_cleanup(item)   # restore a direct source folder we injected emu files into
         roots, seen = [], set()
         out_str = self.output_var.get().strip()
@@ -8249,26 +8375,28 @@ class App:
             for root in roots:
                 try:
                     for p in root.iterdir():
-                        if p.is_dir() and (_is_app_tmp_dir(p.name) or p.name.startswith("ffpfsc_spool_")):
+                        if p.is_dir() and (_is_app_tmp_dir(p.name) or p.name.startswith("ffpfsc_spool_")
+                                           or (not keep_source and p.name == "_ffpfsc_inner")):
                             sz = get_folder_size(p)
                             shutil.rmtree(str(p), ignore_errors=True)
                             freed += sz
                 except Exception:
                     pass
-            try:
-                own = self._extract_dir_for_item(item)   # temp/_extracted OR output/_ffpfsc_extract
-                if own is not None and own.exists():
-                    sz = get_folder_size(own)
-                    shutil.rmtree(str(own), ignore_errors=True)
-                    freed += sz
-                    if own.parent.name == "_ffpfsc_extract":
-                        try:
-                            if not any(own.parent.iterdir()):
-                                own.parent.rmdir()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            if not keep_source:
+                try:
+                    own = self._extract_dir_for_item(item)   # temp/_extracted OR output/_ffpfsc_extract
+                    if own is not None and own.exists():
+                        sz = get_folder_size(own)
+                        shutil.rmtree(str(own), ignore_errors=True)
+                        freed += sz
+                        if own.parent.name == "_ffpfsc_extract":
+                            try:
+                                if not any(own.parent.iterdir()):
+                                    own.parent.rmdir()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             if freed:
                 self.log("INFO", f"Cleaned {format_size(freed)} of scratch from the failed/skipped run.")
             # Drop throwaway patch dirs + the now-empty temp base, like the success path.
@@ -8283,11 +8411,16 @@ class App:
         drive — and offer to reclaim it. Sizing walks large trees, so it runs in a
         background thread; the confirm prompt + delete are marshalled to the main thread.
         Only this app's own working dirs are ever touched."""
-        NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp")
+        NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner")
 
         def _scan():
             targets, seen = [], set()
-            for base_str in (self.temp_var.get().strip(), self.output_var.get().strip()):
+            bases = [self.temp_var.get().strip(), self.output_var.get().strip()]
+            try:
+                bases += [str(p) for p in self._temp_pool_dirs()]   # extra scratch SSDs too
+            except Exception:
+                pass
+            for base_str in bases:
                 if not base_str:
                     continue
                 base = Path(base_str)
@@ -8356,7 +8489,7 @@ class App:
             # and the patch-prepare extract dirs); never wipe unrelated files a user may
             # keep in their temp folder.
             if not (_is_app_tmp_dir(p.name)
-                    or p.name in ("_extracted", "_patch_game", "_patch_files")):
+                    or p.name in ("_extracted", "_patch_game", "_patch_files", "_ffpfsc_inner")):
                 continue
             try:
                 sz = get_folder_size(p) if p.is_dir() else (p.stat().st_size if p.is_file() else 0)
@@ -9424,6 +9557,7 @@ class App:
                 # extract on the OUTPUT drive, which _auto_clear_temp (temp only) misses.
                 if completed_item is not None:
                     self._cleanup_item_extract(completed_item)
+                    self._cleanup_inner_image(completed_item)   # drop the pass-1 inner cache
                     self._ampr_cleanup(completed_item)   # restore a direct source folder
 
                 # Feature 4: batch auto-advance (the next PENDING item; kept failed/skipped
@@ -9455,6 +9589,7 @@ class App:
                 self.extract_cancel_event.clear()
                 if completed_item is not None:
                     self._cleanup_after_failure(completed_item)
+                    self._cleanup_inner_image(completed_item)   # no resume after a cancel
                     self._retire_failed(completed_item, "Cancelled")
                 self.update_queue_box()
                 self.start_btn.configure(state="normal")
@@ -9474,6 +9609,7 @@ class App:
                 self.play_complete_sound(False)
                 if completed_item is not None:
                     self._cleanup_after_failure(completed_item)
+                    self._cleanup_inner_image(completed_item)   # terminal failure / gave up — no resume
                     # Keep the failed item in the queue (marked Failed, moved to the end) —
                     # only successful items disappear.
                     self._retire_failed(completed_item, "Failed")

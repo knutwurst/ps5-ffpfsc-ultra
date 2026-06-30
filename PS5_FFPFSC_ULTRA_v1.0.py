@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.85"
+APP_VERSION = "1.0.86"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4803,9 +4803,10 @@ class PfsBrowserDialog(ctk.CTkToplevel):
     pull out individual files or whole folders, WITHOUT unpacking the whole image. The
     backend reads only the blocks it needs (--list-image / --extract-from). Read-only."""
 
-    def __init__(self, app, image_path=None):
+    def __init__(self, app, image_path=None, standalone=False):
         super().__init__(app.root)
         self.app = app
+        self.standalone = standalone   # the only window (launched by double-clicking a .ffpfsc)
         self.image_path = None
         self._entries = []          # full [{path, type, size}]
         self._iid_path = {}         # tree item id -> rel path
@@ -4815,8 +4816,13 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         self.geometry("780x580")
         self.configure(fg_color=BLACK)
         self.resizable(True, True)
-        self.transient(app.root); self.lift(); self.focus_force()
-        self.after(50, self.grab_set)
+        # When this IS the only window (browser-only launch), behave as a normal top-level
+        # rather than a modal transient of the hidden main window.
+        if standalone:
+            self.lift(); self.focus_force()
+        else:
+            self.transient(app.root); self.lift(); self.focus_force()
+            self.after(50, self.grab_set)
 
         ctk.CTkLabel(self, text="🔎  Browse PFS image",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
@@ -5288,6 +5294,8 @@ class App:
         self.root.bind("<Configure>", self._on_window_configure, add="+")
 
     def _show_first_run_wizard(self):
+        if getattr(self, "_browser_only", False):
+            return   # launched only to browse a .ffpfsc (double-click) — skip the wizard
         wiz = FirstRunWizard(self.root)
         self.root.wait_window(wiz)
         if wiz.result.get("temp_folder"):
@@ -8411,6 +8419,8 @@ class App:
         drive — and offer to reclaim it. Sizing walks large trees, so it runs in a
         background thread; the confirm prompt + delete are marshalled to the main thread.
         Only this app's own working dirs are ever touched."""
+        if getattr(self, "_browser_only", False):
+            return   # browser-only launch (double-clicked a .ffpfsc) — don't prompt on the hidden window
         NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner")
 
         def _scan():
@@ -9642,10 +9652,94 @@ else:
     _CTkDnD = ctk.CTk
 
 
+def _wire_open_document(root, app):
+    """macOS: open a .ffpfsc / .ffpfs that was double-clicked (or 'Open With') straight
+    into the PFS browser. On a COLD launch (the app was not already running) show ONLY the
+    browser — the main window stays hidden and the app quits when the browser closes. If
+    the app is already running, the browser opens on top of the normal window. No-op off
+    macOS (the OpenDocument AppleEvent is macOS-only); argv_emulation stays off in the spec
+    so the event reaches Tk instead of being swallowed into argv."""
+    if sys.platform != "darwin":
+        return
+    # shown        : the main window has been presented (normal launch). Once true, later
+    #                file-opens land on it instead of starting a browser-only session.
+    # browser_only : a cold double-click session (main window stays hidden).
+    # open         : how many browser-only windows are still open (quit on the LAST close).
+    state = {"shown": False, "browser_only": False, "open": 0}
+
+    def _show_main():
+        state["shown"] = True
+        state["browser_only"] = False
+        app._browser_only = False
+        try: root.deiconify()
+        except Exception: pass
+
+    def _open_browser(path, browser_only):
+        try:
+            dlg = PfsBrowserDialog(app, path, standalone=browser_only)
+        except Exception as e:
+            try: app.log("ERROR", f"Could not open the PFS browser for {path}: {e}")
+            except Exception: pass
+            if browser_only and state["open"] <= 0:
+                _show_main()   # never leave a hidden, un-quittable orphan if construction fails
+            return
+        if browser_only:
+            state["open"] += 1
+            # Quit the whole app when the LAST browser-only window closes — by ANY route:
+            # the red title-bar button (default destroys the toplevel) OR the dialog's own
+            # "Close" button (self.destroy()). Act only on the toplevel's own <Destroy>.
+            def _on_destroy(e, d=dlg):
+                if e.widget is not d:
+                    return
+                state["open"] -= 1
+                if state["open"] <= 0:
+                    try: root.destroy()
+                    except Exception: pass
+            try: dlg.bind("<Destroy>", _on_destroy)
+            except Exception: pass
+
+    def _on_open(*paths):
+        files = [p for p in paths if str(p).lower().endswith((".ffpfsc", ".ffpfs"))]
+        if not files:
+            return
+        # Cold launch = the main window has NOT been shown yet (timing-independent, so a slow
+        # AppleEvent still yields a browser-only session as long as we haven't presented the
+        # main window). Once shown, the browser opens on top of the normal window.
+        if not state["shown"]:
+            state["browser_only"] = True
+            app._browser_only = True
+        bo = state["browser_only"]
+        if not bo:
+            try: root.deiconify()
+            except Exception: pass
+        for f in files:
+            _open_browser(f, browser_only=bo)
+
+    try:
+        root.createcommand("::tk::mac::OpenDocument", _on_open)
+    except Exception:
+        return
+
+    # Start hidden; if no file-open AppleEvent arrives shortly it is a normal launch -> show
+    # the main window. If one DID arrive we are in browser-only mode and stay hidden.
+    try:
+        root.withdraw()
+    except Exception:
+        return
+
+    def _finalize():
+        if state["browser_only"] or state["shown"]:
+            return
+        _show_main()
+
+    root.after(250, _finalize)
+
+
 def main():
     ensure_app_dir()
     root = _CTkDnD()
-    App(root)
+    app = App(root)
+    _wire_open_document(root, app)
     root.mainloop()
 
 

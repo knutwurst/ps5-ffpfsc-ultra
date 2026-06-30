@@ -101,7 +101,9 @@ app = BUNDLE(
     coll,
     name="PS5 FFPFSC ULTRA.app",
     icon=None,
-    bundle_identifier="com.kingdkak.ps5ffpfscpro",
+    # Own identifier (distinct from the old PRO app) so Launch Services associates
+    # .ffpfsc with THIS app, not the legacy PS5 FFPFSC PRO bundle that shared the id.
+    bundle_identifier="com.knutwurst.ps5ffpfscultra",
     info_plist={
         "CFBundleDisplayName": "PS5 FFPFSC ULTRA",
         "CFBundleName": "PS5 FFPFSC ULTRA",
@@ -109,5 +111,15 @@ app = BUNDLE(
         "CFBundleVersion": APP_VERSION,
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
+        # Double-click a .ffpfsc / .ffpfs in Finder -> the app opens the PFS browser for
+        # it (a cold launch shows ONLY the browser; see _wire_open_document in the GUI).
+        "CFBundleDocumentTypes": [
+            {
+                "CFBundleTypeName": "PS5 PFS image",
+                "CFBundleTypeExtensions": ["ffpfsc", "ffpfs"],
+                "CFBundleTypeRole": "Viewer",
+                "LSHandlerRank": "Owner",
+            },
+        ],
     },
 )

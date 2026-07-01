@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.86"
+APP_VERSION = "1.0.87"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -617,48 +617,73 @@ def poke_drive_keepalive(d: Path) -> bool:
         return False
 
 
-def _probe_drive_speed(path: Path) -> str:
-    """Fallback for drives where the OS reports no Solid-State flag (USB-attached
-    SSDs through a bridge that masks the flash bit — diskutil prints 'Info not
-    available'). Writes a small incompressible blob and times it: external SSDs
-    over USB 3.x do 200-1000 MB/s; spinning disks top out near 100-130 MB/s.
+def _name_looks_ssd(name: str) -> bool:
+    """True if a device/volume name explicitly signals solid-state storage."""
+    s = (name or "").lower()
+    return any(t in s for t in ("ssd", "nvme", "solid state", "solid-state", "flash disk"))
 
-    A single 32 MB write + fsync (~0.05 s SSD, ~0.3 s HDD). The temp file is
-    deleted before this returns. Returns 'SSD' / 'HDD' / 'Unknown' — never blocks
-    if the path is non-writable or too tight on free space."""
-    import time, secrets, tempfile
+
+def _probe_drive_speed(path: Path, name_hint: str = "") -> str:
+    """Classify a drive whose OS flash flag is unavailable (USB-attached SSDs through a
+    bridge that masks it — diskutil prints 'Info not available'). Robust against a THROTTLED
+    bus (a passive hub): the PRIMARY signal is fsync WRITE-LATENCY, which is bandwidth-
+    independent — a spinning disk pays a ~5-15 ms seek+rotation on every flushed write while
+    an SSD (even over USB) stays ~sub-2 ms no matter how throttled the bus throughput is.
+    Sequential throughput (best of a few tries, so a transient dip can't demote a real SSD)
+    and an SSD name hint back it up. All temp files are deleted before returning. Returns
+    'SSD' / 'HDD' / 'Unknown'; never blocks on a non-writable or tight volume."""
+    import time, tempfile, statistics
+    hinted = _name_looks_ssd(name_hint)
     try:
         target = path if path.exists() else path.parent
         if not target.is_dir():
             target = target.parent
-        # Require at least 200 MB free so a write-probe never edges a tight volume
-        # closer to ENOSPC mid-test (and never deletes user data via tempfile).
+        # Require ≥200 MB free so a write-probe never edges a tight volume toward ENOSPC.
         try:
             if shutil.disk_usage(str(target)).free < 200 * 1024 * 1024:
-                return "Unknown"
+                return "SSD" if hinted else "Unknown"   # can't probe safely — trust the name
         except Exception:
-            return "Unknown"
-        size = 32 * 1024 * 1024
-        buf = secrets.token_bytes(size)
-        with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_ultrabe_",
-                                          delete=True) as tf:
-            t = time.perf_counter()
-            tf.write(buf)
-            tf.flush()
-            os.fsync(tf.fileno())
-            dt = time.perf_counter() - t
-        mbps = (size / 1_048_576) / max(dt, 1e-6)
-        # 150 MB/s threshold cleanly separates USB-3 SSDs (>200) from external HDDs
-        # (<130); USB-2-bottlenecked SSDs would false-classify as HDD, but a USB-2
-        # drive shouldn't be the user's fast-temp pick anyway, so the worst case is
-        # 'route conservatively'. Returns Unknown in the ambiguous 100-150 MB/s band.
-        if mbps >= 150:
+            return "SSD" if hinted else "Unknown"
+        # 1) fsync write-latency — the reliable discriminator. Median of small flushed writes
+        #    at scattered offsets: SSD ~sub-2 ms, HDD ~5-15 ms (seek+rotation), and a slow bus
+        #    does NOT add seek latency, so a hub-throttled USB SSD is still recognised.
+        lat_ms = []
+        try:
+            with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_probe_", delete=True) as tf:
+                tf.write(os.urandom(8 * 1024 * 1024)); tf.flush(); os.fsync(tf.fileno())
+                blk = os.urandom(4096)   # reused per write — content is irrelevant to latency
+                for i in range(16):
+                    tf.seek((i * 700_001) % (8 * 1024 * 1024 - 4096))
+                    t = time.perf_counter()
+                    tf.write(blk); tf.flush(); os.fsync(tf.fileno())
+                    lat_ms.append((time.perf_counter() - t) * 1000.0)
+        except Exception:
+            pass
+        med = statistics.median(lat_ms) if lat_ms else None
+        # 2) sequential throughput — best of 2 (a real SSD clears the bar on its fastest try).
+        best_mbps = 0.0
+        buf = os.urandom(32 * 1024 * 1024)   # one incompressible payload, reused per try
+        for _ in range(2):
+            try:
+                with tempfile.NamedTemporaryFile(dir=str(target), prefix=".ffpfsc_probe_", delete=True) as tf:
+                    t = time.perf_counter()
+                    tf.write(buf); tf.flush(); os.fsync(tf.fileno())
+                    dt = time.perf_counter() - t
+                best_mbps = max(best_mbps, 32.0 / max(dt, 1e-6))
+            except Exception:
+                pass
+        # Decide by LATENCY, not throughput: low fsync latency = solid-state (no seek),
+        # even for a SLOW link — a USB SSD that only sustains ~40 MB/s still flushes in
+        # ~ms, whereas a spinning disk pays ~5-15 ms of seek+rotation per flush. So a low
+        # throughput must NEVER demote a genuine SSD; only a clearly seek-bound latency
+        # signature is called HDD. (A high throughput is just a bonus positive signal.)
+        if (med is not None and med < 4.0) or best_mbps >= 150 or hinted:
             return "SSD"
-        if mbps < 100:
-            return "HDD"
-        return "Unknown"
+        if med is not None and med > 12.0:
+            return "HDD"        # unmistakably rotational (seek+rotation bound)
+        return "Unknown"        # caller leans SSD for a USB/external no-flash-flag device
     except Exception:
-        return "Unknown"
+        return "SSD" if hinted else "Unknown"
 
 
 def _probe_drive_type(path: Path) -> str:
@@ -704,31 +729,52 @@ def _probe_drive_type(path: Path) -> str:
         try:
             df = subprocess.run(["df", str(target)], capture_output=True, text=True, timeout=6)
             dev = df.stdout.strip().splitlines()[-1].split()[0]   # /dev/diskXsY
-            whole = re.sub(r"s\d+$", "", dev)                     # /dev/diskX (whole disk)
+            whole = re.sub(r"(s\d+)+$", "", dev)                  # /dev/diskX physical disk (strip APFS synth too)
             saw_info_unavailable = False
+            name_hint = ""
+            is_usb_external = False
             for d in ([dev, whole] if whole != dev else [dev]):
                 info = subprocess.run(["diskutil", "info", d], capture_output=True, text=True, timeout=8)
                 for line in info.stdout.splitlines():
-                    if "Solid State" not in line:
-                        continue
-                    # Split at ':' and compare the value exactly — substring matches on
-                    # the full line break when the value is "Info not available" (which
-                    # contains the substring "not" → false-positive for "No").
                     parts = line.split(":", 1)
                     if len(parts) != 2:
                         continue
+                    key = parts[0].strip()
                     val = parts[1].strip()
-                    if val == "Yes":
-                        return "SSD"
-                    if val == "No":
-                        return "HDD"
-                    # "Info not available" — common on USB-attached SSDs (the bridge
-                    # masks the flash bit). Note it and fall through to the speed probe.
-                    saw_info_unavailable = True
+                    if key == "Solid State":
+                        # Compare the value EXACTLY — a substring check false-matches "No"
+                        # inside "Info not available".
+                        if val == "Yes":
+                            return "SSD"
+                        if val == "No":
+                            return "HDD"
+                        # "Info not available" — common on USB-attached SSDs (the bridge
+                        # masks the flash bit). Note it and fall through to the probe.
+                        saw_info_unavailable = True
+                    elif key in ("Device / Media Name", "Volume Name") and val \
+                            and not val.lower().startswith("not applicable"):
+                        name_hint = (name_hint + " " + val).strip()
+                    elif key == "Protocol" and val.upper() == "USB":
+                        is_usb_external = True
+                    elif key == "Device Location" and val == "External":
+                        is_usb_external = True
             if saw_info_unavailable:
-                speed_dt = _probe_drive_speed(target)
+                speed_dt = _probe_drive_speed(target, name_hint=name_hint)
                 if speed_dt != "Unknown":
                     return speed_dt
+                # Ambiguous probe on a USB/external device whose bridge hides the flash flag:
+                # portable SSDs report "Info not available" here (a real external HDD reports
+                # "No"), so treat it as SSD — a slow-but-solid-state drive (e.g. ~40 MB/s over
+                # an old bridge) must stay usable as scratch, not get misrouted as a spinning
+                # disk (which is what triggered the false "not enough space" abort).
+                if is_usb_external:
+                    return "SSD"
+                # Non-USB device that hides its flash flag and probes ambiguous: return a
+                # DEFINITIVE result so get_drive_type CACHES it — "Unknown" is never cached,
+                # so returning it here would re-run the heavy probe on every call. Conservative
+                # HDD (a mislabeled internal SSD just routes a bit cautiously; it never
+                # re-creates the false abort, which was about a USB drive).
+                return "HDD"
         except Exception:
             pass
         return "Unknown"

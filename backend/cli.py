@@ -895,6 +895,13 @@ def pack_folder_uncompressed(
     print(f"[INFO] Packing folder {game_folder.name} to uncompressed PFS image {pfs_path.name}...")
     cmd = mkpfs_cmd_base + [
         "pack", "folder",
+        # MkPFS 1.0.0: `pack folder` now DEFAULTS to wrapping the folder in an exFAT image
+        # and compressing it in one pass; --raw restores the 0.0.8 behaviour pass 1 relies
+        # on — a DIRECT, uncompressed folder -> PFS image (the required inner .ffpfs).
+        "--raw",
+        # MkPFS 1.0.0 auto-builds the AMPR emulation index during packing; the app builds
+        # its own index GUI-side (authoritative — signed before indexing), so suppress it.
+        "--no-ampr-index",
         "--no-compress",
         "--no-adjust-output-file-extension",
         "--version", "PS5",
@@ -1056,6 +1063,11 @@ def compress_file_to_ffpfsc(
     cmd = mkpfs_cmd_base + [
         "pack", "file",
         "--compress",
+        # MkPFS 1.0.0 defaults the compressor to "auto" (isal/zlib-ng when installed); pin
+        # stdlib zlib so the compressed PFSC bytes stay IDENTICAL to 0.0.8's output. A
+        # bundled faster backend would change the DEFLATE bytes and force a fresh on-console
+        # boot test; identical bytes mean the existing 0.0.8 console verification still holds.
+        "--compression-backend", "zlib",
         "--version", "PS5",
         "--inode-bits", "32",
         "--compression-level", str(compression_level),

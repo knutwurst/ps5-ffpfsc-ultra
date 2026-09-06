@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.87"
+APP_VERSION = "1.0.88"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -102,7 +102,7 @@ APP_VERSION = "1.0.87"
 ARCHIVE_EXTRACT_OVERALL_PCT = 25
 BACKEND_NAME = "bizkut/ps5-ffpfs-cli"
 MKPFS_NAME    = "MkPFS"
-MKPFS_VERSION = "0.0.8"
+MKPFS_VERSION = "1.0.0"
 
 if sys.platform == "darwin":
     APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT"

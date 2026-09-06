@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.88"
+APP_VERSION = "1.0.89"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2039,7 +2039,7 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkCheckBox(ds, text="Show drive-space dialog before each pack",
                          variable=self.app.show_space_dialog_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
-        ctk.CTkCheckBox(ds, text="Build via exFAT intermediate (macOS) — PSBrew's most-stable path",
+        ctk.CTkCheckBox(ds, text="Build via exFAT intermediate — PSBrew's most-stable path (cross-platform)",
                          variable=self.app.build_via_exfat_var, fg_color=GREEN,
                          hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
         def _confirm_fake_sign():

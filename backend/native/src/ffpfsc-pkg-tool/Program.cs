@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using LibProsperoPkg;
 using LibProsperoPkg.PKG;
@@ -18,6 +20,7 @@ internal static class Program
     {
         try
         {
+            RedirectMagickNative();                    // must run before ANY Magick.NET call
             if (args.Length == 0) { PrintUsage(); return 2; }
             return args[0].ToLowerInvariant() switch
             {
@@ -695,6 +698,121 @@ internal static class Program
         Console.WriteLine($"summary: {p} passed, {w} warned, {f} failed");
     }
 
+    /// <summary>Mirror *src* into *dst* using hard links for every regular file and real
+    /// subdirectories, so the build sees the tree unchanged without copying gigabytes.
+    /// Hard links (not symlinks) — LibProsperoPkg stats the source path and expects a real
+    /// file layout; some readers get the size right but read partial data through symlinks
+    /// (verified: "ended after 6 of 84 bytes"). Falls back to a copy when hardlinking is
+    /// refused (source across filesystems, or FS without hardlink support).</summary>
+    static void MirrorAsHardLinks(string src, string dst)
+    {
+        foreach (var d in Directory.EnumerateDirectories(src, "*", SearchOption.AllDirectories))
+            Directory.CreateDirectory(Path.Combine(dst, Path.GetRelativePath(src, d)));
+        foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
+        {
+            var target = Path.Combine(dst, Path.GetRelativePath(src, f));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            if (File.Exists(target) || IsSymlink(target)) File.Delete(target);
+            try
+            {
+                var rc = link(Path.GetFullPath(f), target);
+                if (rc != 0) throw new System.ComponentModel.Win32Exception(Marshal.GetLastPInvokeError(), "link() failed");
+            }
+            catch { File.Copy(f, target, overwrite: true); }
+        }
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int link(string source, string target);
+
+    static bool IsSymlink(string p)
+    {
+        try { return File.Exists(p) && new FileInfo(p).LinkTarget != null; } catch { return false; }
+    }
+
+    /// <summary>Direct Magick.NET's DllImport lookups for <c>Magick.Native-Q8-arm64.dll</c>
+    /// at the runtimes/osx-arm64/native/ file the runtime extracts alongside the exe.
+    /// Magick's P/Invoke uses the bare "Magick.Native-Q8-arm64.dll" name (Windows-style),
+    /// which .NET on macOS maps to Magick.Native-Q8-arm64.dll.dylib — but only when the
+    /// file lives on the default probing path. Inside a self-contained single-file exe
+    /// the native asset lands at <c>&lt;exe base&gt;/runtimes/osx-arm64/native/</c>, which
+    /// is not on that path. We resolve it once, ourselves.</summary>
+    static bool _magickRedirected;
+    static void RedirectMagickNative()
+    {
+        if (_magickRedirected) return;
+        _magickRedirected = true;
+        bool trace = Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1";
+        var baseDir = AppContext.BaseDirectory ?? Environment.CurrentDirectory;
+        // Runtime asset paths for a self-contained single-file app: with
+        // IncludeNativeLibrariesForSelfExtract=true the runtime extracts natives to
+        // ~/.net/<AppName>/<hash>/runtimes/<RID>/native/ (also under $TMPDIR).
+        // Include the exe dir, the extraction cache, and TMPDIR — resolve every
+        // Magick.Native*.dylib we can find under them.
+        var appName = Assembly.GetEntryAssembly()?.GetName().Name ?? "ffpfsc-pkg-tool";
+        var extRoot = Environment.GetEnvironmentVariable("DOTNET_BUNDLE_EXTRACT_BASE_DIR")
+                      ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".net");
+        var searchRoots = new List<string> { baseDir, Path.Combine(extRoot, appName), Path.GetTempPath() };
+        string[] Candidates()
+        {
+            var acc = new List<string>();
+            foreach (var root in searchRoots)
+            {
+                if (!Directory.Exists(root)) continue;
+                acc.Add(root);
+                try
+                {
+                    foreach (var sub in Directory.EnumerateDirectories(root, "runtimes", SearchOption.AllDirectories))
+                        foreach (var native in Directory.EnumerateDirectories(sub, "native", SearchOption.AllDirectories))
+                            acc.Add(native);
+                }
+                catch { }
+            }
+            return acc.ToArray();
+        }
+        string[] candidates = Candidates();
+        if (trace) Console.Error.WriteLine("[trace] Magick resolver: baseDir=" + baseDir + "  candidates=" + string.Join(":", candidates));
+        // Every Magick assembly has its own DllImport stubs — register the resolver on
+        // ALL of them (Magick.NET, Magick.NET.Core, and any *.NativeInteropGenerator
+        // source-generated assemblies).
+        int hooked = 0;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var n = asm.GetName().Name ?? "";
+            if (!n.StartsWith("Magick", StringComparison.OrdinalIgnoreCase)) continue;
+            try { NativeLibrary.SetDllImportResolver(asm, MagickResolver); hooked++; if (trace) Console.Error.WriteLine("[trace] Magick resolver hooked on: " + n); }
+            catch (Exception ex) { if (trace) Console.Error.WriteLine("[trace] Magick resolver skip " + n + ": " + ex.Message); }
+        }
+        // Hook every assembly loaded later, too — Magick.NET has multiple.
+        AppDomain.CurrentDomain.AssemblyLoad += (_, e) =>
+        {
+            var n = e.LoadedAssembly.GetName().Name ?? "";
+            if (n.StartsWith("Magick", StringComparison.OrdinalIgnoreCase))
+                try { NativeLibrary.SetDllImportResolver(e.LoadedAssembly, MagickResolver); if (trace) Console.Error.WriteLine("[trace] Magick resolver hooked on late: " + n); }
+                catch { }
+        };
+        if (trace) Console.Error.WriteLine("[trace] Magick resolver initial hooks: " + hooked);
+
+        IntPtr MagickResolver(string name, Assembly _, DllImportSearchPath? __)
+        {
+            if (!name.StartsWith("Magick.Native", StringComparison.OrdinalIgnoreCase)) return IntPtr.Zero;
+            var probe = Candidates();     // rescan — the runtime extracts natives lazily
+            if (trace) Console.Error.WriteLine("[trace] Magick resolver: probing " + probe.Length + " dirs for " + name);
+            foreach (var dir in probe)
+                foreach (var suffix in new[] { ".dylib", ".dll.dylib", "" })
+                {
+                    var path = Path.Combine(dir, name + suffix);
+                    if (File.Exists(path))
+                    {
+                        try { var h = NativeLibrary.Load(path); if (trace) Console.Error.WriteLine("[trace] Magick resolver: loaded " + path); return h; }
+                        catch (Exception ex) { if (trace) Console.Error.WriteLine("[trace] Magick resolver: dlopen failed " + path + ": " + ex.Message); }
+                    }
+                }
+            if (trace) Console.Error.WriteLine("[trace] Magick resolver: no candidate for " + name);
+            return IntPtr.Zero;
+        }
+    }
+
         static int CmdBuild(string[] args)
     {
         if (args.Length < 3) return Bad("build needs <src-dir> <out-dir>");
@@ -773,8 +891,62 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(opts.ContentId)) return Bad("--content-id required");
         if (string.IsNullOrWhiteSpace(opts.TitleId)) return Bad("--title-id required");
         Directory.CreateDirectory(opts.OutputFolder);
+
+        // Auto-generate the sce_sys/*.dds icon CNT entries the console needs to launch an
+        // app. LibProsperoPkg 1.2.0's builder moves any sce_sys/*.dds into the outer CNT
+        // (see ProsperoPfsLayoutOptions.FilterOuterPackageEntries) but does NOT create
+        // them itself — the a53 GUI does that up front via ProsperoDdsEncoder. We do the
+        // same: for every icon0/pic0/pic1/pic2.png in the source's sce_sys/, produce the
+        // matching .dds via ProsperoDdsEncoder.EncodePngToDds and drop it into a temp
+        // copy of the source folder that becomes the actual build input. The original
+        // library folder is never touched. Requires Magick.NET (bundled).
+        string effectiveSource = opts.SourceFolder!;
+        string? autoDdsStage = null;
+        try
+        {
+            var srcSceSys = Path.Combine(effectiveSource, "sce_sys");
+            var iconNames = new[] { "icon0.png", "pic0.png", "pic1.png", "pic2.png" };
+            var pngsToConvert = Directory.Exists(srcSceSys)
+                ? iconNames.Where(n => File.Exists(Path.Combine(srcSceSys, n))
+                                       && !File.Exists(Path.Combine(srcSceSys, Path.ChangeExtension(n, ".dds")))).ToArray()
+                : Array.Empty<string>();
+            if (pngsToConvert.Length > 0)
+            {
+                autoDdsStage = Path.Combine(
+                    string.IsNullOrEmpty(opts.TemporaryDirectory) ? Path.GetTempPath() : opts.TemporaryDirectory!,
+                    "ffpfsc-dds-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                Directory.CreateDirectory(autoDdsStage);
+                // Mirror the entire source folder with SYMLINKS so the build path is
+                // otherwise unchanged (no gigabyte copy for a real game).
+                MirrorAsHardLinks(effectiveSource, autoDdsStage);
+                var stagedSceSys = Path.Combine(autoDdsStage, "sce_sys");
+                Directory.CreateDirectory(stagedSceSys);
+                foreach (var name in pngsToConvert)
+                {
+                    var png = File.ReadAllBytes(Path.Combine(srcSceSys, name));
+                    var dds = ProsperoDdsEncoder.EncodePngToDds(png, opts.TemporaryDirectory ?? Path.GetTempPath());
+                    var ddsPath = Path.Combine(stagedSceSys, Path.ChangeExtension(name, ".dds"));
+                    if (File.Exists(ddsPath) || IsSymlink(ddsPath)) File.Delete(ddsPath);
+                    File.WriteAllBytes(ddsPath, dds);
+                    Console.Error.WriteLine($"  [icon] generated sce_sys/{Path.ChangeExtension(name, ".dds")} ({dds.Length:N0} B) from {name}");
+                }
+                opts.SourceFolder = autoDdsStage;
+            }
+        }
+        catch (Exception ex)
+        {
+            var chain = ex.GetType().Name + ": " + ex.Message;
+            for (var e = ex.InnerException; e != null; e = e.InnerException)
+                chain += "  <- " + e.GetType().Name + ": " + e.Message;
+            Console.Error.WriteLine("[warn] icon0.dds auto-generation failed (" + chain + ") — the .pkg will lack the DDS CNT entries the console needs to launch the app.");
+            if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
+                Console.Error.WriteLine(ex.ToString());
+        }
+
         Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"})");
-        var result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s));
+        ProsperoBuildResult result;
+        try { result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s)); }
+        finally { if (autoDdsStage != null && Directory.Exists(autoDdsStage)) { try { Directory.Delete(autoDdsStage, recursive: true); } catch { } } }
         Console.WriteLine($"OK — wrote {result.OutputPath} ({new FileInfo(result.OutputPath).Length:N0} B)");
         if (result.Warnings != null)
             foreach (var w in result.Warnings) Console.Error.WriteLine("[warn] " + w);

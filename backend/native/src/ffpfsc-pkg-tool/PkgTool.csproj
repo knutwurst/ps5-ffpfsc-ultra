@@ -9,9 +9,9 @@
     <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
-    <PublishTrimmed>true</PublishTrimmed>
-    <TrimMode>partial</TrimMode>
-    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <!-- Magick.NET's Prospero-facing path is reflection-driven, so trimming
+         would rip out the very types the DDS conversion needs. No trim. -->
+    <PublishTrimmed>false</PublishTrimmed>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <PublishReadyToRun>true</PublishReadyToRun>
     <InvariantGlobalization>true</InvariantGlobalization>
@@ -23,5 +23,16 @@
     <Reference Include="LibProsperoPkg"><HintPath>lib\LibProsperoPkg.dll</HintPath></Reference>
     <Reference Include="BCnEncoder"><HintPath>lib\BCnEncoder.dll</HintPath></Reference>
     <Reference Include="CommunityToolkit.HighPerformance"><HintPath>lib\CommunityToolkit.HighPerformance.dll</HintPath></Reference>
+    <!-- Magick.NET is what converts sce_sys/icon0.png to the sce_sys/icon0.dds
+         CNT entry the console needs to launch the app (verified against a
+         reference package that starts on FW 11.60). LibProsperoPkg fails
+         silently if the assembly is absent — the .pkg builds, installs, but
+         does not launch. Ships as ~30 MB of the tool. -->
+    <Reference Include="Magick.NET-Q8-AnyCPU"><HintPath>lib\Magick.NET-Q8-AnyCPU.dll</HintPath></Reference>
+    <Reference Include="Magick.NET.Core"><HintPath>lib\Magick.NET.Core.dll</HintPath></Reference>
+    <None Include="lib\runtimes\osx-arm64\native\Magick.Native-Q8-arm64.dll.dylib">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>runtimes\osx-arm64\native\Magick.Native-Q8-arm64.dll.dylib</Link>
+    </None>
   </ItemGroup>
 </Project>

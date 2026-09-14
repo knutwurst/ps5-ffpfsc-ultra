@@ -15,6 +15,7 @@ verdict is up to the user's PS5 install test.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -115,6 +116,37 @@ def extract(pkg: Path, out_dir: Path,
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     cmd = "extract-outer" if outer else "extract-inner"
     argv = [str(tool_path()), cmd, str(pkg), str(out_dir), "--passcode", passcode]
+    return _run(argv, on_line=on_line)
+
+
+def list_inner(pkg: Path, *, passcode: str = "0" * 32) -> dict:
+    """
+    Directory tree of a package's inner image — plus the sce_sys metadata the CNT
+    carries — WITHOUT decoding the whole image (the tool reads only the blocks it
+    touches; a 240 MB package lists in ~0.1 s reading ~1.5 MiB).
+
+    Returns the tool's JSON: {"root", "entries": [{"path", "type", "size", "source"}],
+    "file_count", "dir_count", "errors"} — the same shape the PFS browser uses for
+    .ffpfs/.ffpfsc listings. Raises RuntimeError with the tool's last message on failure.
+    """
+    argv = [str(tool_path()), "list-inner", str(pkg), "--passcode", passcode]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip().splitlines()
+        raise RuntimeError(msg[-1] if msg else f"list-inner failed (rc={r.returncode})")
+    return json.loads(r.stdout)
+
+
+def extract_members(pkg: Path, out_dir: Path, members_file: Path,
+                    *, passcode: str = "0" * 32, on_line=None) -> int:
+    """
+    Extract only the members listed in *members_file* (one inner path per line; a
+    directory means its whole subtree) — decoded block-wise, never the whole image.
+    Progress lines '[####] NN% extract (path)' stream through *on_line*.
+    """
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    argv = [str(tool_path()), "extract-inner", str(pkg), str(out_dir),
+            "--members", str(members_file), "--passcode", passcode]
     return _run(argv, on_line=on_line)
 
 

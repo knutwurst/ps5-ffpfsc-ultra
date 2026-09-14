@@ -3,7 +3,35 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.5  (current)
+  v1.1.6  (current)
+────────────────────────────────────────────────────────────────────────
+
+BROWSE A .pkg LIKE A .ffpfsc
+
+  • The PFS browser (🔎 Browse) opens an fPKG too: list its contents and
+    pull out single files or folders — without unpacking the package. The
+    tool got two commands for that, list-inner and extract-inner --members,
+    built on random access into the inner image: outer-PFS AES-XTS decrypt
+    per 64 KiB block → NAPS layout → block-cached inner PFS reader. The
+    library's own DecodePlaintextInnerPfsRange refuses our (encrypted)
+    packages, and its superblock scan would have decoded the whole image
+    (our images are data-first), so both are done from public building
+    blocks with a probe of the last NAPS file. Measured on a 242 MB
+    package: listing 0.12 s reading 1.5 MiB; a 47 MB selection 0.2 s at
+    88 MB RSS, SHA-identical to the full extract. sce_sys metadata from the
+    CNT (param.json, icons, playgo-*) appears in the tree and is selectable
+    like any file. The backend routes --list-image / --extract-from for a
+    .pkg to the tool, answering in the browser's own JSON and progress
+    format — the dialog itself only learned the file type.
+  • Tool fix found on the way: inspect --json / validate --json / extract-inner
+    --json had been broken since the 1.1.1 trimming (reflection JSON is
+    disabled in a trimmed build) — now source-generated.
+  • Harness: 60 → 92 checks (list/select parity, sizes, CNT selection,
+    progress, empty dirs, unknown member, the three --json commands);
+    GUI driver 78 (backend routing for .pkg + the dialog listing).
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.5
 ────────────────────────────────────────────────────────────────────────
 
   • FIX: auto-organize did not rename the .pkg. The backend reports

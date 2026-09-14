@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4406,7 +4406,8 @@ class PackDialog(ctk.CTkToplevel):
         "ffpfs":  "Uncompressed — faster to build and to mount, full size. (Disk images .exfat/.ffpkg "
                   "are always compressed.)",
         "pkg":    "Installable PS5 fake package (fPKG) — from ANY source; the identity comes from the "
-                  "game's own sce_sys/param.json.",
+                  "game's own sce_sys/param.json. ⚠ Installs on any firmware but LAUNCHES only on ≤ 11.40 "
+                  "(Sony patched the fPKG install path in 11.50).",
     }
     _CID_RE = re.compile(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$")
     _TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")

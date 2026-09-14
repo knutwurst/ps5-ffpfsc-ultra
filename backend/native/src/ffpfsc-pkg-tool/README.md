@@ -17,9 +17,11 @@ the end of `Program.cs`. The trimmed publish switches reflection-based System.Te
 and the anonymous types the commands used before crashed on the shipped binary with
 "Reflection-based serialization has been disabled" — the harness now parses all of them.
 - `PkgTool.csproj` — the publish settings: self-contained single file, ReadyToRun,
-  framework trimming (`TrimMode=partial`, so the referenced libraries are left alone),
-  no Magick.NET (LibProsperoPkg references it for icon conversion; none of our code paths
-  ever load it — verified by the test harness — and it was 28 MB of the binary).
+  no trimming (Magick.NET's Prospero-facing path is reflection-driven; trimming pruned
+  the types the DDS conversion needs). Magick.NET is required — LibProsperoPkg calls it
+  to convert `sce_sys/icon0.png` into the `sce_sys/icon0.dds` CNT entry the console needs
+  to launch the app; without the DDS, an fPKG installs but never starts (CE-100096-6 /
+  CE-100022-5). Adds ~30 MB to the binary, unavoidable.
 
 The fPKG logic itself is LibProsperoPkg, which is GPL-3.0-or-later; see
 `../../LICENSE.LibProsperoPkg`, `../../NOTICE.LibProsperoPkg` and `../../NOTICE.fpkg`.
@@ -35,6 +37,16 @@ source is kept in the repo.
    - `lib/LibProsperoPkg.dll` (v1.2.0)
    - `lib/BCnEncoder.dll`
    - `lib/CommunityToolkit.HighPerformance.dll`
+   - `lib/Magick.NET-Q8-AnyCPU.dll`
+   - `lib/Magick.NET.Core.dll`
+   - `lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib`
+   After extracting the native dylib, clear its quarantine flag and ad-hoc-sign it —
+   otherwise Gatekeeper blocks the extracted copy at run time:
+
+   ```bash
+   xattr -c lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib
+   codesign --force --sign - lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib
+   ```
 3. Publish:
 
    ```bash
@@ -100,3 +112,11 @@ below the decode time for the packages measured here; on a 100 GB game it adds r
 Measured on 240 MB of mixed data: a NativeAOT build is 16–18 MB instead of 25 MB but
 10–23 % slower on the Kraken/AES path (the JIT's tiered compilation wins there). For
 100 GB games that is a quarter of an hour, so the JIT build ships.
+
+## Firmware compatibility
+
+fPKG install-and-launch works on jailbroken PS5 firmware **≤ 11.40**. Sony patched the
+fPKG install path with system software 11.50 — a package built by any tool (this one,
+the a53 reference GUI, verified reference packages that launch on older firmwares) will
+install but fail to start with `CE-100096-6` on 11.60. Nothing about how the package is
+built changes that; it is the console's install path itself that changed.

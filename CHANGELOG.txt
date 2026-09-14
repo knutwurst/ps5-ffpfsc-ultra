@@ -3,7 +3,43 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.6  (current)
+  v1.1.7  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG BUILDS THE CONSOLE ACTUALLY LAUNCHES  (on ≤ 11.40)
+
+  • The tool now auto-generates the sce_sys/icon0.dds CNT entry, the
+    piece the PS5 kernel needs to start the app. Before this an fPKG
+    installed but never launched (missing 262 KB DDS icon0 entry ->
+    CE-100096-6). LibProsperoPkg 1.2.0's builder moves any sce_sys/*.dds
+    into the outer CNT (see ProsperoPfsLayoutOptions.FilterOuterPackage-
+    Entries) but does NOT generate the DDS itself; the a53 reference GUI
+    calls ProsperoDdsEncoder.EncodePngToDds up front, and so do we now
+    (the encoder's own API). Magick.NET is back in the bundled build (it
+    is what LibProsperoPkg uses under the hood) and re-signed ad-hoc so
+    Gatekeeper does not block the extracted native dylib. Our own build
+    is now structurally equivalent to the a53 GUI's output (13 CNT
+    entries, identical inner tree, 262,292 B DDS icon, identical DRM /
+    eboot magic; the only bit-level difference is the random per-package
+    seed and content-agnostic playgo chunk count).
+
+  • FIRMWARE REALITY, SAID CLEARLY
+    fPKG install-and-launch works on jailbroken PS5 firmware ≤ 11.40.
+    Sony patched the install path with system software 11.50 — packages
+    built by ANY tool (this one, the a53 GUI, verified reference
+    packages that launch elsewhere) install but fail with CE-100096-6 on
+    11.60. The dialog and README say so, so nobody chases their tail on
+    a modern firmware.
+
+  • ffpfsc-pkg-tool is 51.6 MB again (was 24 MB without Magick.NET) —
+    same speed on the Kraken/AES path. Trimming is off because Magick's
+    Prospero-facing path is reflection-driven and would be pruned.
+    A DllImportResolver installed in Main() walks the single-file
+    extraction cache to load the Magick native dylib regardless of
+    where .NET drops it. PKG_TOOL_TRACE=1 prints the resolver decisions.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.6
 ────────────────────────────────────────────────────────────────────────
 
 BROWSE A .pkg LIKE A .ffpfsc

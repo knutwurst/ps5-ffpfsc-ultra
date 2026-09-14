@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -5614,7 +5614,7 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         self._iid_path = {}         # tree item id -> rel path
         self._proc = None           # running extract subprocess (for cancel)
         self._q = queue.Queue()
-        self.title("Browse PFS image")
+        self.title("Browse PFS image / fPKG")
         self.geometry("780x580")
         self.configure(fg_color=BLACK)
         self.resizable(True, True)
@@ -5626,11 +5626,12 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             self.transient(app.root); self.lift(); self.focus_force()
             self.after(50, self.grab_set)
 
-        ctk.CTkLabel(self, text="🔎  Browse PFS image",
+        ctk.CTkLabel(self, text="🔎  Browse PFS image / fPKG",
                       font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=18, pady=(14, 2))
-        ctk.CTkLabel(self, text="Open a .ffpfs or .ffpfsc, see what's inside, and extract "
-                                "individual files or folders. The image is never fully unpacked.",
+        ctk.CTkLabel(self, text="Open a .ffpfs, .ffpfsc or .pkg (fPKG), see what's inside, and extract "
+                                "individual files or folders. The image is never fully unpacked — a .pkg "
+                                "is read block by block through its encryption.",
                       text_color=MUTED, wraplength=720, justify="left").pack(anchor="w", padx=18, pady=(0, 8))
 
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=18, pady=4)
@@ -5692,15 +5693,17 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             self.after(150, self._load)
 
     def _pick(self):
-        p = filedialog.askopenfilename(parent=self, title="Select a .ffpfs / .ffpfsc image",
-                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
+        p = filedialog.askopenfilename(parent=self, title="Select a .ffpfs / .ffpfsc image or a .pkg (fPKG)",
+                                       filetypes=[("PFS images / fPKG", "*.ffpfsc *.ffpfs *.pkg"),
+                                                  ("PFS images", "*.ffpfsc *.ffpfs"),
+                                                  ("PS5 packages", "*.pkg"), ("All files", "*.*")])
         if p:
             self.src_var.set(p); self._load()
 
     def _load(self):
         raw = (self.src_var.get() or "").strip()
         if not raw or not Path(raw).is_file():
-            messagebox.showerror("Not found", "Pick a .ffpfs / .ffpfsc file first.", parent=self); return
+            messagebox.showerror("Not found", "Pick a .ffpfs / .ffpfsc / .pkg file first.", parent=self); return
         self.image_path = Path(raw)
         self.status_var.set("Reading image…")
         self.extract_sel_btn.configure(state="disabled"); self.extract_all_btn.configure(state="disabled")

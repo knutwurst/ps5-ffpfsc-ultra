@@ -129,11 +129,33 @@ try:
     dlg3c = m.PackDialog(app, item=rep); root.update(); dlg3c.set_format("pkg"); root.update(); dlg3c._add(); root.update()
     q = app.queue[idx]
     ok("dialog.edit.back-to-pkg", q.operation == "fpkg-build" and q.fpkg_content_id == "UP9000-PPSA99099_00-PROSPERO00000000", f"{q.operation} errors={errors}")
-    # 6) validation rejects a bad content id (uses our patched showerror)
+    # 6) validation rejects a bad content id (uses our patched showerror) — and reveals the identity rows
     dlg4 = m.PackDialog(app, source=HBT, fmt="pkg"); root.update()
+    ok("dialog.compact-by-default", not dlg4._adv_shown and not dlg4._ident_forced and dlg4.irow.winfo_manager() == ""
+       and dlg4.crow.winfo_manager() == "", f"adv={dlg4._adv_shown} forced={dlg4._ident_forced}")
+    # the summary reflects the REMEMBERED compression choice (test 3 picked kraken/fast for this app)
+    ok("dialog.summary", "identity from param.json (PPSA99099)" in dlg4.sum_var.get()
+       and f"codec layer {app.fpkg_defaults['inner']}" in dlg4.sum_var.get()
+       and ("Kraken fast" if app.fpkg_defaults["level"] < 0 else "Kraken normal") in dlg4.sum_var.get(), dlg4.sum_var.get())
+    ok("dialog.backend-row-hidden", not dlg4._backend_shown and dlg4.back_var.get() == "builtin", f"dll={app.pubtools_dll_var.get()!r}")
     dlg4.out_var.set(str(OUT)); dlg4.cid_var.set("garbage"); n2 = len(app.queue); dlg4._add(); root.update()
     ok("dialog.validation.bad-cid", len(app.queue) == n2 and any("Content ID" in e for e in errors), str(errors[-1:]))
+    ok("dialog.validation.reveals-identity", dlg4._ident_forced and dlg4.irow.winfo_manager() == "pack", f"forced={dlg4._ident_forced}")
     dlg4.destroy()
+    # 6a) a game folder WITHOUT param.json opens the identity rows by itself and marks them required
+    NOP = S / "hbt_noparam"
+    if NOP.exists(): shutil.rmtree(NOP)
+    shutil.copytree(HBT, NOP); (NOP / "sce_sys" / "param.json").unlink()
+    dlg4b = m.PackDialog(app, source=NOP, fmt="pkg"); root.update(); dlg4b.update_idletasks()
+    ok("dialog.noparam.identity-forced", dlg4b._ident_forced and dlg4b.irow.winfo_manager() == "pack"
+       and "REQUIRED" in dlg4b.ident_head.get() and "REQUIRED" in dlg4b.sum_var.get() and dlg4b.crow.winfo_manager() == "",
+       f"forced={dlg4b._ident_forced} head={dlg4b.ident_head.get()[:40]}")
+    ok("dialog.noparam.fits", 0 < dlg4b.winfo_reqheight() <= dlg4b._height, f"req={dlg4b.winfo_reqheight()} h={dlg4b._height}")
+    dlg4b.out_var.set(str(OUT)); n2b = len(app.queue); dlg4b._add(); root.update()
+    ok("dialog.noparam.requires-identity", len(app.queue) == n2b and any("Identity needed" in e for e in errors), str(errors[-1:]))
+    dlg4b.src_var.set(str(HBT)); root.update()
+    ok("dialog.noparam.unforced-on-good-source", not dlg4b._ident_forced and dlg4b.irow.winfo_manager() == "", f"forced={dlg4b._ident_forced}")
+    dlg4b.destroy()
     # 6b) a .ffpfsc is refused for the .ffpfsc / .ffpfs formats (already packed) …
     dlg5 = m.PackDialog(app, source=FF, fmt="ffpfsc"); root.update()
     ok("dialog.ffpfsc.hint", "already packed" in dlg5.src_hint.get().lower(), dlg5.src_hint.get())
@@ -198,11 +220,18 @@ try:
     close_toplevels()
     # 12) one door: the separate Build-fPKG dialog is gone
     ok("one-door.no-FpkgBuildDialog", not hasattr(m, "FpkgBuildDialog"), "")
-    # 13) dialog sizing: the requested height fits the geometry in both modes
+    # 13) dialog sizing: the window follows its content in every state (compact / Edit… / pack)
     dlg7 = m.PackDialog(app, fmt="pkg"); root.update(); dlg7.update_idletasks()
-    req_pkg = dlg7.winfo_reqheight(); ok("dialog.pkg.fits", 0 < req_pkg <= 820, f"req={req_pkg} geom={dlg7.geometry()}")
+    req_c = dlg7.winfo_reqheight(); h_c = dlg7._height
+    ok("dialog.pkg.compact.fits", 0 < req_c <= h_c and h_c < 620, f"req={req_c} h={h_c}")
+    dlg7.set_advanced(True); root.update(); dlg7.update_idletasks()
+    req_a = dlg7.winfo_reqheight(); h_a = dlg7._height
+    ok("dialog.pkg.advanced.fits", 0 < req_a <= h_a and h_a > h_c and dlg7.irow.winfo_manager() == "pack" and dlg7.crow.winfo_manager() == "pack"
+       and "Hide" in dlg7._edit_btn.cget("text"), f"req={req_a} h={h_a}")
+    dlg7.set_advanced(False); root.update()
+    ok("dialog.pkg.hide-again", dlg7.irow.winfo_manager() == "" and dlg7._height == h_c, f"h={dlg7._height}")
     dlg7.set_format("ffpfsc"); root.update(); dlg7.update_idletasks()
-    req_pack = dlg7.winfo_reqheight(); ok("dialog.pack.fits", 0 < req_pack <= 440, f"req={req_pack} geom={dlg7.geometry()}")
+    req_pack = dlg7.winfo_reqheight(); ok("dialog.pack.fits", 0 < req_pack <= dlg7._height <= 460, f"req={req_pack} h={dlg7._height}")
     dlg7.destroy()
     # 14) settings var present
     ok("settings.pubtools_var", hasattr(app, "pubtools_dll_var"), "")

@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.0.89"
+APP_VERSION = "1.1.1"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2099,6 +2099,32 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
                       command=_browse_ampr).pack(side="left")
 
+        # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
+        ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Path to your own libScePubTools.dll (Sony SDK, not bundled). Only used when a "
+                              "Build-fPKG job selects the 'publishingtools' Kraken backend. Leave empty to "
+                              "use the built-in managed Kraken encoder, which needs no external file.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14)
+        _pt_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _pt_row.pack(fill="x", padx=14, pady=(4, 4))
+        _pt_entry = ctk.CTkEntry(_pt_row, textvariable=self.app.pubtools_dll_var,
+                                 placeholder_text="…/libScePubTools.dll")
+        _pt_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_pt(*_):
+            save_settings({"pubtools_dll": self.app.pubtools_dll_var.get().strip()})
+        def _browse_pt():
+            from tkinter import filedialog
+            c = filedialog.askopenfilename(title="Select libScePubTools.dll",
+                                           filetypes=[("DLL", "*.dll"), ("All files", "*.*")])
+            if c:
+                self.app.pubtools_dll_var.set(c)
+                _save_pt()
+        _pt_entry.bind("<FocusOut>", lambda e: _save_pt())
+        ctk.CTkButton(_pt_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
+                      command=_browse_pt).pack(side="left")
+
         # ── Extra temp drives (pool) ─────────────────────────────────────────
         ctk.CTkLabel(ds, text="Extra temp drives (pool, one path per line):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
@@ -3260,6 +3286,73 @@ class GameItem:
         obj.patch_inplace   = bool(inplace)
         return obj
 
+    @classmethod
+    def from_fpkg_extract(cls, pkg_file: Path, *, output_path=None) -> "GameItem":
+        """Job that extracts a PS5 fake package (.pkg) into a /app0-style folder."""
+        obj              = cls.__new__(cls)
+        obj.path         = pkg_file
+        obj.archive_path = None
+        obj.operation    = "fpkg-extract"
+        obj.name         = pkg_file.stem
+        # A PS5 package is named after its content id (UP9000-PPSA12345_00-…): lift the
+        # title id straight out of the file name; fall back to the generic parser.
+        _m = re.search(r"[A-Z]{4}[0-9]{5}", pkg_file.stem.upper())
+        if _m:
+            obj.title_id = _m.group(0)
+        else:
+            try:
+                _t = parse_title_id(pkg_file)
+                obj.title_id = _t if (_t and _t != "Unknown") else "📦"
+            except Exception:
+                obj.title_id = "📦"
+        obj.size         = pkg_file.stat().st_size if pkg_file.exists() else 0
+        obj.files        = 1
+        obj.artwork      = None
+        obj.status       = "Queued"
+        obj.source_kind    = "inplace"
+        obj.extracted_size = obj.size
+        obj.output_path    = output_path
+        return obj
+
+    @classmethod
+    def from_fpkg_build(cls, source: Path, *, output_path=None,
+                        content_id: str = "",
+                        title_id: str = "",
+                        title: str = "",
+                        version: str = "01.000.000",
+                        inner_mode: str = "none",
+                        kraken_backend: str = "builtin",
+                        pubtools_dll: str = "",
+                        level: int = 7) -> "GameItem":
+        """Job that builds a PS5 fake package (.pkg) from a prepared /app0 folder OR a
+        packed image (.ffpfsc/.ffpfs/.exfat/.ffpkg — the backend unwraps it first)."""
+        obj              = cls.__new__(cls)
+        obj.path         = source
+        obj.archive_path = None
+        obj.operation    = "fpkg-build"
+        obj.name         = source.stem if source.is_file() else source.name
+        obj.title_id     = title_id or (parse_title_id(source) or "📦")
+        try:
+            obj.size = source.stat().st_size if source.is_file() else get_folder_size(source)
+        except Exception:
+            obj.size = 0
+        obj.files        = 0
+        obj.artwork      = None
+        obj.status       = "Queued"
+        obj.source_kind    = "inplace"
+        obj.extracted_size = obj.size
+        obj.output_path    = output_path
+        obj.fpkg_level     = int(level)
+        # fPKG parameters (persisted with the queue item so re-adds keep them)
+        obj.fpkg_content_id     = content_id
+        obj.fpkg_title_id       = title_id
+        obj.fpkg_title          = title
+        obj.fpkg_version        = version
+        obj.fpkg_inner_mode     = inner_mode
+        obj.fpkg_kraken_backend = kraken_backend
+        obj.fpkg_pubtools_dll   = pubtools_dll
+        return obj
+
 
 # ─── CLI Worker ────────────────────────────────────────────────────────────────
 
@@ -3294,6 +3387,28 @@ class CLIWorker(threading.Thread):
         "Complete":            (100, 100),
     }
 
+    # fPKG BUILD (LibProsperoPkg): source scan → [optional image unwrap] → inner
+    # pfs_image.dat with Kraken (the long part) → NAPS + outer-PFS AES-XTS → CNT/FIH
+    # finalize → auto-validate. Bands keep the fixed breadcrumb order forward-only;
+    # the backend emits "[PHASE] <Stage>" markers + progress bars for each band.
+    FPKG_BUILD_WEIGHTS = {
+        "Scanning Files":      (0,    2),
+        "Extracting":          (2,   30),   # only when the source is a .ffpfsc/.exfat image
+        "Reading Game":        (30,  33),
+        "Creating Temp PFS":   (33,  72),   # inner image incl. Kraken
+        "Compressing":         (72,  84),   # NAPS tables + outer-PFS AES-XTS
+        "Writing Final Image": (84,  94),   # CNT + FIH finalize
+        "Verifying Output":    (94,  98),   # validate checklist
+        "Cleaning Up":         (98, 100),
+        "Complete":            (100, 100),
+    }
+    FPKG_EXTRACT_WEIGHTS = {
+        "Scanning Files":      (0,    3),
+        "Extracting":          (3,   96),
+        "Cleaning Up":         (96, 100),
+        "Complete":            (100, 100),
+    }
+
     def __init__(self, app, item, cmd, cwd, output_dir, temp_dir):
         super().__init__(daemon=True)
         self.app = app
@@ -3314,7 +3429,15 @@ class CLIWorker(threading.Thread):
         # so it needs the forward-only patch weights and honours the backend's explicit
         # [PHASE] markers to advance past "Extracting". Detected by the --patch flag.
         self._is_patch = "--patch" in (cmd or [])
-        self._weights = self.PATCH_WEIGHTS if self._is_patch else self.WEIGHTS
+        self._is_fpkg_build   = "--fpkg-build"   in (cmd or [])
+        self._is_fpkg_extract = "--fpkg-extract" in (cmd or [])
+        self._is_fpkg = self._is_fpkg_build or self._is_fpkg_extract
+        if self._is_fpkg_build:
+            self._weights = self.FPKG_BUILD_WEIGHTS
+        elif self._is_fpkg_extract:
+            self._weights = self.FPKG_EXTRACT_WEIGHTS
+        else:
+            self._weights = self.PATCH_WEIGHTS if self._is_patch else self.WEIGHTS
         # Snapshot the copy-extras toggle on the MAIN thread (CLIWorker is constructed
         # there); Tk variables are not safe to read from the worker thread.
         try:
@@ -3379,7 +3502,8 @@ class CLIWorker(threading.Thread):
         self.app.log("INFO", f"Backend: {BACKEND_NAME}")
         self.app.log("INFO", f"MkPFS: {MKPFS_NAME} v{MKPFS_VERSION}")
         _op_label = {"unpack": "Unpack", "patch": "Integrate patch",
-                     "fake-sign": "Fake sign"}.get(self.operation, "Pack")
+                     "fake-sign": "Fake sign", "fpkg-extract": "Extract fPKG",
+                     "fpkg-build": "Build fPKG"}.get(self.operation, "Pack")
         self.app.log("INFO", f"Operation: {_op_label}")
         self.app.log("INFO", f"Game: {self.item.title_id} | {self.item.name}")
         self.app.log("INFO", f"Original: {format_size(self.item.size)} | Files: {self.item.files}")
@@ -3495,8 +3619,8 @@ class CLIWorker(threading.Thread):
                 # Flag an out-of-memory kill so the main thread can auto-retry with fewer
                 # cores: either a printed MemoryError, or a SIGKILL (-9 / 137) during a
                 # pack — the OS memory-pressure kill leaves mkpfs no chance to print one.
-                if self.operation != "unpack" and (getattr(self, "_mem_error_shown", False)
-                                                    or code in (-9, 137)):
+                if (self.operation not in ("unpack", "fpkg-extract", "fpkg-build")
+                        and (getattr(self, "_mem_error_shown", False) or code in (-9, 137))):
                     self.oom_killed = True
                 self.app.finish(False, msg, self.last_cmd_str)
                 return
@@ -3517,21 +3641,27 @@ class CLIWorker(threading.Thread):
 
             if not self._find_output():
                 self._write_report(False)
-                expected = "extracted output folder" if self.operation == "unpack" else "new .ffpfsc output"
+                expected = {"unpack": "extracted output folder",
+                            "fpkg-extract": "extracted /app0 folder",
+                            "fpkg-build": "new .pkg output"}.get(self.operation, "new .ffpfsc output")
                 self.app.finish(False, f"Backend exited but no {expected} was created.", self.last_cmd_str)
                 return
 
-            # Bundle: copy the extra files (DLCs etc.) next to the new .ffpfsc.
-            self._copy_bundle_siblings()
-
-            # ShadowMount compatibility checks
-            if self.operation != "unpack":
+            # Bundle: copy the extra files (DLCs etc.) next to the new .ffpfsc / .pkg.
+            if self.operation not in ("unpack", "fpkg-extract"):
+                self._copy_bundle_siblings()
+            # ShadowMount compatibility checks (a .pkg is installed, not mounted —
+            # the fPKG path has its own validate checklist in the backend log).
+            if not self._is_fpkg and self.operation != "unpack":
                 for w in self._validate_shadowmount():
                     self.app.log("WARN", w)
             self._write_report(True)
             # NOTE: history is recorded on the MAIN thread in the done_q handler
             # (add_history mutates Tk widgets, which are not thread-safe).
-            success_msg = "Extraction completed successfully." if self.operation == "unpack" else "Compression completed successfully."
+            success_msg = {"unpack": "Extraction completed successfully.",
+                           "fpkg-extract": "fPKG extracted successfully.",
+                           "fpkg-build": "fPKG built and validated — see the checklist above."
+                           }.get(self.operation, "Compression completed successfully.")
             self.app.finish(True, success_msg, self.last_cmd_str)
         except Exception as e:
             try:
@@ -3829,11 +3959,13 @@ class CLIWorker(threading.Thread):
 
         if "Compression complete:" in line:
             self.output_path = line.split("Compression complete:", 1)[-1].strip()
+        if "fPKG complete:" in line:
+            self.output_path = line.split("fPKG complete:", 1)[-1].strip()
         if "Extraction complete:" in line:
             # Only an UNPACK job ends at extraction. In PATCH MODE the backend
             # extracts then repacks, so latching "Extracting"=100 here would freeze
             # the bar for the whole repack — the [PHASE] markers drive it instead.
-            if self.operation == "unpack":
+            if self.operation in ("unpack", "fpkg-extract"):
                 self._set_stage("Extracting", 100, "Extraction complete.")
             maybe_path = line.split("Extraction complete:", 1)[-1].strip()
             if maybe_path:
@@ -3845,7 +3977,11 @@ class CLIWorker(threading.Thread):
         if prog:
             pct = max(0, min(100, int(prog.group("pct"))))
             label = prog.group("label").strip()
-            stage = self._stage_from_label(label, line)
+            # fPKG jobs: the backend drives the stage with explicit [PHASE] markers and
+            # its bar labels are free text — lock the bar to the current phase instead of
+            # guessing from keywords (a label like "extract inner PFS" is not mkpfs's extract).
+            stage = (self.phase if (self._is_fpkg and self.phase in self._weights)
+                     else self._stage_from_label(label, line))
 
             sp = re.search(r"@\s*([0-9.]+\s*(?:GB|MB)/s)", label, re.I)
             if sp:
@@ -3952,7 +4088,7 @@ class CLIWorker(threading.Thread):
         if self.output_path:
             p = Path(self.output_path.strip('"'))
             try:
-                if self.operation == "unpack" and p.exists() and p.is_dir():
+                if self.operation in ("unpack", "fpkg-extract") and p.exists() and p.is_dir():
                     self.final_size = get_folder_size(p)
                     return True
                 if p.exists() and p.is_file() and p.stat().st_size > 0 and p.stat().st_mtime >= self.start_time - 2:
@@ -3960,6 +4096,28 @@ class CLIWorker(threading.Thread):
                     return True
             except OSError:
                 pass
+
+        if self.operation == "fpkg-extract":
+            # The backend writes straight into the job's output folder.
+            if self.output_dir.exists() and self.output_dir.is_dir() and any(self.output_dir.iterdir()):
+                self.output_path = str(self.output_dir)
+                self.final_size = get_folder_size(self.output_dir)
+                return True
+            return False
+
+        if self.operation == "fpkg-build":
+            try:
+                cands = [q for q in self.output_dir.glob("*.pkg")
+                         if q.is_file() and q.stat().st_size > 0 and q.stat().st_mtime >= self.start_time - 2]
+            except OSError:
+                cands = []
+            if cands:
+                best = max(cands, key=lambda q: q.stat().st_mtime)
+                self.output_path = str(best)
+                self.final_size = best.stat().st_size
+                return True
+            self.output_path = ""; self.final_size = 0
+            return False
 
         if self.operation == "unpack":
             expected = self.output_dir / f"{self.item.path.stem}_extracted"
@@ -4175,190 +4333,515 @@ def _kill_process_tree(proc) -> None:
 
 
 class PackDialog(ctk.CTkToplevel):
-    """Collect a pack source (game folder, archive, disk image, or .ffpfs) + output +
-    format, and ADD a pack job to the queue. A .ffpfsc is already packed → use Convert.
+    """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
 
-    Edit mode (item=existing GameItem): the dialog opens pre-filled with that item's
-    source/output/format; saving mutates it in place (or, if the source changed, swaps
-    the GameItem at the same queue index)."""
+    Three formats: '.ffpfsc' (compressed), '.ffpfs' (uncompressed) and '.pkg' — an
+    installable fPKG. Picking '.pkg' unfolds the fPKG block (identity + compression)
+    below the format row, and ANY pack source then becomes an fPKG job: a game folder, a
+    parent folder (scanned), an archive, a disk image, a .ffpfs — and a .ffpfsc, which the
+    other two formats refuse because it is already packed.
 
-    def __init__(self, app, item=None):
+    Identity for fPKG: sce_sys/param.json of the resolved source is the source of truth
+    at build time (folder, unwrapped image and extracted archive alike). The fields here
+    are pre-filled from param.json when the source is a game folder and are otherwise
+    optional fallbacks — an archive or image needs no identity typed up front.
+
+    Edit mode (item=existing GameItem): opens pre-filled with that item's source / output
+    / format (+ fPKG parameters for an fPKG job). Saving mutates it in place, or swaps a
+    fresh GameItem in at the same queue index when the source or the job kind changes
+    (pack ↔ fPKG)."""
+
+    FORMATS = ("ffpfsc", "ffpfs", "pkg")
+    _FMT_LABEL = {"ffpfsc": "📦  .ffpfsc", "ffpfs": "⚡  .ffpfs", "pkg": "🎮  .pkg (fPKG)"}
+    _FMT_HINT = {
+        "ffpfsc": "Compressed — smaller; mounted by ShadowMountPlus / MicroMount.",
+        "ffpfs":  "Uncompressed — faster to build and to mount, full size. (Disk images .exfat/.ffpkg "
+                  "are always compressed.)",
+        "pkg":    "Installable PS5 fake package (fPKG) — from ANY source; the identity comes from the "
+                  "game's own sce_sys/param.json.",
+    }
+    _CID_RE = re.compile(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$")
+    _TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
+    _VER_RE = re.compile(r"^\d{2}\.\d{2,3}(\.\d{3})?$")
+    _INNER   = ("none", "zlib", "kraken")
+    _BACKEND = ("builtin", "publishingtools")
+    # Kraken speed. The built-in encoder has exactly two regimes (measured on 40 MB of
+    # mixed data: levels 0..9 give byte-identical output, -4..-1 the faster/weaker preset),
+    # so the UI offers the honest two-way choice instead of a 0-9 slider.
+    _SPEED = ("normal", "fast")
+    _SPEED_LEVEL = {"normal": 7, "fast": -4}
+    _GEOMETRY = {"pack": "700x440", "pkg": "700x820"}   # measured requested heights: 410 / 796
+    _IMAGE_SUFFIXES   = (".ffpfsc", ".ffpfs", ".exfat", ".ffpkg")
+    _ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z")
+    _IDENT_AUTO = ("Auto — read from the game's sce_sys/param.json at build time. Leave empty; anything "
+                   "typed here only fills what param.json lacks.")
+    _IDENT_AUTO_MULTI = "Auto, per game — each game's own param.json decides. Leave empty."
+
+    def __init__(self, app, item=None, source: Path | None = None, fmt: str | None = None):
         super().__init__(app.root)
         self.app = app
         self.edit_item = item
-        self.title("Pack — edit job" if item else "Pack — add job to queue")
-        self.geometry("620x410")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
-        # Pre-fill from the existing item when editing; else from the remembered defaults.
+
+        # ── initial values: from the item being edited, else the remembered defaults ──
         if item is not None:
+            is_fpkg  = getattr(item, "operation", "pack") == "fpkg-build"
             init_src = str(getattr(item, "archive_path", None) or getattr(item, "path", "") or "")
             init_out = str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip()
-            init_fmt = getattr(item, "output_compressed", None)
-            if init_fmt is None:
-                init_fmt = bool(app.output_compressed_var.get())
+            if is_fpkg:
+                init_fmt = "pkg"
+            else:
+                oc = getattr(item, "output_compressed", None)
+                if oc is None:
+                    oc = app.output_format_var.get() != "ffpfs"
+                init_fmt = "ffpfsc" if oc else "ffpfs"
+            fp = app._fpkg_params_of(item) if is_fpkg else dict(app.fpkg_defaults)
         else:
-            init_src = ""
+            init_src = str(source) if source else ""
             init_out = (app.output_var.get() or "").strip()
-            init_fmt = bool(app.output_compressed_var.get())
-        self.src_var = tk.StringVar(value=init_src)
-        self.out_var = tk.StringVar(value=init_out)
-        self.fmt_compressed = tk.BooleanVar(value=bool(init_fmt))
-        self.fmt_hint = tk.StringVar()
+            init_fmt = fmt or app.output_format_var.get()
+            fp = dict(app.fpkg_defaults)
+        if init_fmt not in self.FORMATS:
+            init_fmt = "ffpfsc"
+        self.fmt_key = init_fmt
+        self.title("Pack — edit job" if item else "Pack — add job to queue")
 
-        header_text = "📦  Pack — edit job" if item else "📦  Pack — add job"
-        ctk.CTkLabel(self, text=header_text,
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        self.src_var   = tk.StringVar(value=init_src)
+        self.out_var   = tk.StringVar(value=init_out)
+        self.fmt_var   = tk.StringVar(value=self._FMT_LABEL[init_fmt])
+        self.fmt_hint  = tk.StringVar()
+        self.out_label = tk.StringVar()
+        self.src_hint  = tk.StringVar()
+        # fPKG block. The version field shows EMPTY for the builder default — empty means
+        # "auto", which is what it is.
+        ver0 = str(fp.get("version") or "")
+        if ver0 == "01.000.000":
+            ver0 = ""
+        self.cid_var   = tk.StringVar(value=fp.get("content_id", "") or "")
+        self.tid_var   = tk.StringVar(value=fp.get("title_id", "") or "")
+        self.title_var = tk.StringVar(value=fp.get("title", "") or "")
+        self.ver_var   = tk.StringVar(value=ver0)
+        self.inner_var = tk.StringVar(value=fp.get("inner") if fp.get("inner") in self._INNER else "none")
+        self.back_var  = tk.StringVar(value=fp.get("backend") if fp.get("backend") in self._BACKEND else "builtin")
+        try:
+            lvl = int(fp.get("level", 7))
+        except Exception:
+            lvl = 7
+        self.speed_var = tk.StringVar(value="fast" if lvl < 0 else "normal")
+        self.back_hint = tk.StringVar()
+        self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
+        self._auto_ident: dict = {}      # identity pre-filled from a folder's param.json (dropped when the source changes)
+        self._panel_shown = False
+
+        head = "📦  Pack — edit job" if item else "📦  Pack — add job"
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        sub = ("Change this job's source, output folder, or format. The job stays at its "
-               "current queue position." if item else
-               "Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs — "
-               "to its own output folder and format. Adds a job to the queue.")
-        ctk.CTkLabel(self, text=sub,
-                      text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+        sub = ("Change this job's source, output folder, format or fPKG parameters. The job stays at "
+               "its current queue position." if item else
+               "Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs into its own output "
+               "folder and format — or build an installable .pkg (fPKG) from any of them, a .ffpfsc "
+               "included. Adds a job to the queue.")
+        ctk.CTkLabel(self, text=sub, text_color=MUTED, wraplength=660, justify="left"
+                      ).pack(anchor="w", padx=20, pady=(0, 10))
 
+        # ── Source ──
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(srow, text="Source  (folder OR file — archive, .exfat/.ffpkg, .ffpfs are all fine):",
+        ctk.CTkLabel(srow, text="Source  (folder OR file — archive, .exfat/.ffpkg, .ffpfs; a .ffpfsc for the .pkg format):",
                       text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
-        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
+        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        # Tk can't pick a file AND a folder in one native dialog, so two buttons —
-        # but no archive-vs-image triage: ONE broad file filter covers them all, and
-        # the kind is auto-detected from the path at save time.
+        # Tk can't pick a file AND a folder in one native dialog, so two buttons — but no
+        # archive-vs-image triage: ONE broad file filter covers them all, and the kind is
+        # auto-detected from the path at save time.
         ctk.CTkButton(sinner, text="📄  File…", width=76, fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
                        command=self._pick_file).pack(side="left", padx=(6, 0))
         ctk.CTkButton(sinner, text="📁  Folder…", width=88, fg_color=CARD2, hover_color=GREEN2,
                        text_color=WHITE, command=self._pick_folder).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(srow, textvariable=self.src_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
 
+        # ── Output ──
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(orow, text="Output folder  (this job's .ffpfsc lands here):", text_color=WHITE,
+        ctk.CTkLabel(orow, textvariable=self.out_label, text_color=WHITE,
                       font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
-                      placeholder_text="choose where this job's output goes").pack(side="left", fill="x", expand=True)
+        ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_out).pack(side="left", padx=(6, 0))
 
+        # ── Format ──
         frow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); frow.pack(fill="x", padx=20, pady=4)
-        finner = ctk.CTkFrame(frow, fg_color=PANEL); finner.pack(fill="x", padx=10, pady=8)
+        finner = ctk.CTkFrame(frow, fg_color=PANEL); finner.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkLabel(finner, text="Format:", text_color=WHITE,
                       font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 10))
-        ctk.CTkSwitch(finner, text="", width=46, variable=self.fmt_compressed,
-                       onvalue=True, offvalue=False, progress_color=GREEN,
-                       command=self._on_fmt).pack(side="left")
-        ctk.CTkLabel(finner, textvariable=self.fmt_hint, text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(8, 0))
-        self._on_fmt()
+        self._fmt_seg = ctk.CTkSegmentedButton(finner, values=[self._FMT_LABEL[k] for k in self.FORMATS],
+                                                variable=self.fmt_var, selected_color=GREEN,
+                                                selected_hover_color=GREEN2, command=self._on_fmt_selected)
+        self._fmt_seg.pack(side="left")
+        ctk.CTkLabel(frow, textvariable=self.fmt_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
-        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        # ── fPKG block (shown for the .pkg format only; packed before the button row) ──
+        self.fpkg_panel = ctk.CTkFrame(self, fg_color="transparent")
+        irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); irow.pack(fill="x", pady=4)
+        ctk.CTkLabel(irow, text="Package identity  (fallback only — the game's sce_sys/param.json decides at build time):",
+                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
+        grid = ctk.CTkFrame(irow, fg_color=PANEL); grid.pack(fill="x", padx=10, pady=(0, 2))
+        grid.grid_columnconfigure(1, weight=1); grid.grid_columnconfigure(3, weight=1)
+        def _cell(r, c, label, var):
+            ctk.CTkLabel(grid, text=label, text_color=MUTED, anchor="w", width=84).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=3)
+            ctk.CTkEntry(grid, textvariable=var, fg_color=CARD2, text_color=WHITE).grid(row=r, column=c + 1, sticky="ew", padx=(0, 14), pady=3)
+        _cell(0, 0, "Content ID", self.cid_var)
+        _cell(0, 2, "Title ID",   self.tid_var)
+        _cell(1, 0, "Title",      self.title_var)
+        _cell(1, 2, "Version",    self.ver_var)
+        ctk.CTkLabel(irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
+
+        crow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); crow.pack(fill="x", pady=4)
+        ctk.CTkLabel(crow, text="Compression  (fPKG-only; independent of the mkpfs tuning bar):",
+                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
+        r1 = ctk.CTkFrame(crow, fg_color=PANEL); r1.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(r1, text="Inner codec:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        ctk.CTkSegmentedButton(r1, values=list(self._INNER), variable=self.inner_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                command=lambda *_: self._refresh_hints()).pack(side="left")
+        ctk.CTkLabel(r1, text="  extra layer over the inner image (none = default)",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        r2 = ctk.CTkFrame(crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(r2, text="Kraken backend:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        ctk.CTkSegmentedButton(r2, values=list(self._BACKEND), variable=self.back_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                command=lambda *_: self._refresh_hints()).pack(side="left")
+        ctk.CTkLabel(crow, textvariable=self.back_hint, text_color=MUTED,
+                      font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
+        r3 = ctk.CTkFrame(crow, fg_color=PANEL); r3.pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkLabel(r3, text="Kraken speed:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        ctk.CTkSegmentedButton(r3, values=list(self._SPEED), variable=self.speed_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
+        ctk.CTkLabel(r3, text="  normal = best ratio (default)  ·  fast = quicker, a little larger (Kraken preset −4)",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(crow, text="Every fPKG packs each file with Kraken, whatever the codec layer — that is the "
+                                 "native package layout. Nothing from the tuning bar applies here: its Level makes "
+                                 "no difference to this encoder (only the fast preset does), the outer-PFS pass runs "
+                                 "on one worker (LibProsperoPkg 1.2.0 races above that) and the format fixes its own "
+                                 "64 KiB / 256 KiB blocks. The temp drive from Settings stages the inner image and "
+                                 "the unwrap / extraction of the source.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      ).pack(anchor="w", padx=10, pady=(4, 8))
+
+        # ── Buttons ──
+        self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
         save_text = "💾  Save changes" if item else "➕  Add to queue"
-        ctk.CTkButton(btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
+        ctk.CTkButton(self._btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
                        text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
                        command=self._add).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
+        ctk.CTkButton(self._btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
 
+        self._apply_format()
+        self._refresh_hints()
+        self.src_var.trace_add("write", lambda *_: self._on_source_changed())
+        if init_src:
+            self._on_source_changed()
+        if item is not None and self.fmt_key == "pkg":
+            # Editing an fPKG job: treat the identity it carries as belonging to ITS source,
+            # so picking a different source drops it (and re-reads the new param.json)
+            # instead of carrying a stale content id over.
+            self._auto_ident = {k: v for k, v in (("content_id", self.cid_var.get().strip()),
+                                                  ("title_id", self.tid_var.get().strip()),
+                                                  ("title", self.title_var.get().strip()),
+                                                  ("version", self.ver_var.get().strip())) if v}
+
+    # ── format ───────────────────────────────────────────────────────────────
+    def set_format(self, key: str) -> None:
+        """Select a format programmatically (what clicking the segmented button does)."""
+        if key not in self.FORMATS:
+            return
+        self.fmt_var.set(self._FMT_LABEL[key])
+        self._on_fmt_selected(self._FMT_LABEL[key])
+
+    def _on_fmt_selected(self, value: str) -> None:
+        for k, label in self._FMT_LABEL.items():
+            if label == value:
+                self.fmt_key = k
+                break
+        self._apply_format()
+        self._on_source_changed()
+
+    def _apply_format(self) -> None:
+        key = self.fmt_key
+        self.fmt_hint.set(self._FMT_HINT[key])
+        if key == "pkg":
+            self.out_label.set("Output folder  (this job's .pkg lands here, named <content-id>-A<app>-V<ver>.pkg):")
+            if not self._panel_shown:
+                self.fpkg_panel.pack(fill="x", padx=20, before=self._btns)
+                self._panel_shown = True
+            self.geometry(self._GEOMETRY["pkg"])
+        else:
+            self.out_label.set(f"Output folder  (this job's .{key} lands here):")
+            if self._panel_shown:
+                self.fpkg_panel.pack_forget()
+                self._panel_shown = False
+            self.geometry(self._GEOMETRY["pack"])
+
+    # ── pickers ──────────────────────────────────────────────────────────────
     def _pick_file(self):
-        """Pick any supported SOURCE FILE — one broad filter (archive / disk image /
-        .ffpfs), no archive-vs-image triage; the kind is auto-detected from the path
-        when the job runs. Tk's native askopenfilename is reliable (the JXA NSOpenPanel
-        route didn't open for the user)."""
+        """Pick any supported SOURCE FILE — one broad filter (archive / disk image / PFS
+        image), no triage; the kind is auto-detected from the path when the job runs. Tk's
+        native askopenfilename is reliable (the JXA NSOpenPanel route didn't open for the user)."""
         init = (self.src_var.get() or "").strip()
         p = filedialog.askopenfilename(
             parent=self,
-            title="Pick a source file (archive, disk image .exfat/.ffpkg, or .ffpfs)",
-            initialdir=(init if os.path.isdir(init)
-                        else (os.path.dirname(init) if init else "")),
-            filetypes=[("Supported sources", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs"),
+            title="Pick a source file (archive, disk image .exfat/.ffpkg, .ffpfs, or a .ffpfsc for .pkg)",
+            initialdir=(init if os.path.isdir(init) else (os.path.dirname(init) if init else "")),
+            filetypes=[("Supported sources", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs *.ffpfsc"),
                        ("All files", "*.*")],
         )
         if p:
             self.src_var.set(p)
 
     def _pick_folder(self):
-        """Pick a SOURCE FOLDER — a game folder, or a folder holding a game/archive
-        (the folder name is mirrored to the output)."""
+        """Pick a SOURCE FOLDER — a game folder, or a folder holding games / archives (the
+        folder name is mirrored to the output for bundles)."""
         init = (self.src_var.get() or "").strip()
         p = filedialog.askdirectory(
-            parent=self,
-            title="Pick a source folder",
-            initialdir=(init if os.path.isdir(init)
-                        else (os.path.dirname(init) if init else "")),
+            parent=self, title="Pick a source folder",
+            initialdir=(init if os.path.isdir(init) else (os.path.dirname(init) if init else "")),
         )
         if p:
             self.src_var.set(p)
 
     def _pick_out(self):
-        p = filedialog.askdirectory(title="Select the output folder for this job")
+        p = filedialog.askdirectory(parent=self, title="Select the output folder for this job")
         if p:
             self.out_var.set(p)
 
-    def _on_fmt(self):
-        self.fmt_hint.set("📦 Compressed (.ffpfsc, smaller)" if self.fmt_compressed.get()
-                          else "⚡ Uncompressed (.ffpfs, faster)")
+    # ── hints + identity pre-fill ────────────────────────────────────────────
+    def _on_source_changed(self):
+        raw = (self.src_var.get() or "").strip()
+        p = Path(raw) if raw else None
+        # Identity values that came from a PREVIOUS source's param.json must not stick to
+        # the next source — drop them (values the user typed themselves are kept).
+        if self._auto_ident:
+            for var, key in ((self.cid_var, "content_id"), (self.tid_var, "title_id"),
+                             (self.title_var, "title"), (self.ver_var, "version")):
+                if var.get().strip() == self._auto_ident.get(key, ""):
+                    var.set("")
+            self._auto_ident = {}
+        if not p or not p.exists():
+            self.src_hint.set("")
+            self.ident_note.set(self._IDENT_AUTO)
+            return
+        suf = p.suffix.lower() if p.is_file() else ""
+        if self.fmt_key != "pkg":
+            if suf == ".ffpfsc":
+                self.src_hint.set("⚠ A .ffpfsc is already packed — choose the .pkg format to build an fPKG from it, "
+                                  "or use Convert to unpack it.")
+            elif suf == ".pkg":
+                self.src_hint.set("⚠ A .pkg is a PS5 fake package — use fPKG⇢ to extract it.")
+            else:
+                self.src_hint.set("")
+            return
+        # .pkg format
+        if p.is_dir():
+            pj = p / "sce_sys" / "param.json"
+            if pj.is_file():
+                self._prefill_from_param_json(pj)
+            elif is_game_folder(p):
+                self.src_hint.set("Game folder · no sce_sys/param.json — fill in the identity below; the builder "
+                                  "generates param.json from it.")
+                self.ident_note.set("Required here: this folder has no param.json to read from.")
+            else:
+                self.src_hint.set("Folder · scanned for game folders / archives / images when added — each game "
+                                  "becomes its own .pkg job.")
+                self.ident_note.set(self._IDENT_AUTO_MULTI)
+            if is_game_folder(p) and not (p / "eboot.bin").is_file():
+                self.src_hint.set(self.src_hint.get() + "  ⚠ no eboot.bin — the package will not launch.")
+        elif suf in self._ARCHIVE_SUFFIXES:
+            self.src_hint.set("Archive · extracted when its turn comes, then built into a .pkg.")
+            self.ident_note.set(self._IDENT_AUTO)
+        elif suf in self._IMAGE_SUFFIXES:
+            self.src_hint.set(f"Image ({suf}) · unwrapped on the temp drive first, then built into a .pkg.")
+            self.ident_note.set(self._IDENT_AUTO)
+        elif suf == ".pkg":
+            self.src_hint.set("⚠ Already a .pkg — use fPKG⇢ to extract it.")
+        else:
+            self.src_hint.set("⚠ Not a game folder, archive or .ffpfsc/.ffpfs/.exfat/.ffpkg image.")
 
+    def _prefill_from_param_json(self, pj: Path) -> None:
+        try:
+            d = json.loads(pj.read_text(encoding="utf-8-sig", errors="replace"))
+        except Exception as e:
+            self.src_hint.set(f"Game folder · could not read param.json ({e}); the identity below is used as typed.")
+            self.ident_note.set("param.json unreadable — fill in the identity by hand.")
+            return
+        if not isinstance(d, dict):
+            d = {}
+        cid = str(d.get("contentId") or "").strip()
+        tid = str(d.get("titleId") or "").strip()
+        # Sony layout: localizedParameters = {"defaultLanguage": "en-US", "en-US": {"titleName": …}, …}
+        title = ""
+        try:
+            lp = d.get("localizedParameters") or {}
+            if isinstance(lp, dict):
+                lang = lp.get("defaultLanguage")
+                block = lp.get(lang) if isinstance(lang, str) else None
+                if isinstance(block, dict):
+                    title = str(block.get("titleName") or "")
+                if not title:
+                    for v in lp.values():
+                        if isinstance(v, dict) and v.get("titleName"):
+                            title = str(v["titleName"]); break
+            if not title:
+                title = str(d.get("titleName") or "")
+        except Exception:
+            title = ""
+        ver = str(d.get("contentVersion") or d.get("masterVersion") or "").strip()
+        auto = {}
+        for var, key, val in ((self.cid_var, "content_id", cid), (self.tid_var, "title_id", tid),
+                              (self.title_var, "title", title), (self.ver_var, "version", ver)):
+            if val and not var.get().strip():      # never overwrite what the user typed
+                var.set(val); auto[key] = val
+        self._auto_ident = auto
+        self.src_hint.set(f"Game folder · identity read from sce_sys/param.json ({tid or '?'}).")
+        self.ident_note.set("Read from this folder's param.json. param.json still decides at build time — a "
+                            "differing value here is only used for what it lacks.")
+
+    def _refresh_hints(self, *_):
+        dll = (self.app.pubtools_dll_var.get() or "").strip()
+        if self.back_var.get() == "publishingtools":
+            if dll and Path(dll).is_file():
+                self.back_hint.set(f"Uses your Sony libScePubTools.dll: {dll}  (Windows-only DLL — on macOS the "
+                                   f"library refuses it and falls back to the built-in encoder).")
+            else:
+                self.back_hint.set("⚠ No Publishing Tools DLL set (Settings → Folders). The build will fall back to "
+                                   "the built-in encoder.")
+        else:
+            self.back_hint.set("Built-in managed Kraken encoder — needs no external file. Console-install is what "
+                               "proves the output; the build log ends with a 17-point validate checklist.")
+
+    # ── validation ───────────────────────────────────────────────────────────
+    def _collect_fpkg_params(self) -> dict | None:
+        """Validate the fPKG block and return a params dict (see App._fpkg_params_of), or
+        None after showing the problem. Identity fields are optional fallbacks, except for
+        a game folder without a param.json (the builder generates one from them)."""
+        cid = self.cid_var.get().strip().upper()
+        tid = self.tid_var.get().strip().upper()
+        ver = self.ver_var.get().strip()
+        title = self.title_var.get().strip()
+        if cid and not self._CID_RE.match(cid):
+            messagebox.showerror("Content ID", "Content ID must look like  UP9000-PPSA12345_00-GAMENAME00000000\n"
+                                 "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case alphanumerics) "
+                                 "— or leave it empty to use the game's param.json.", parent=self)
+            return None
+        if tid and not self._TID_RE.match(tid):
+            messagebox.showerror("Title ID", "Title ID must look like  PPSA12345  (4 letters + 5 digits) — or leave it "
+                                 "empty to use the game's param.json.", parent=self)
+            return None
+        if cid and tid and tid not in cid:
+            messagebox.showerror("Mismatch", f"The title id {tid} does not appear inside the content id {cid}.", parent=self)
+            return None
+        if cid and not tid:
+            tid = cid[7:16]
+        if ver and not self._VER_RE.match(ver):
+            messagebox.showerror("Version", "Version must be NN.NNN.NNN (or NN.NN) — or empty to use param.json.", parent=self)
+            return None
+        src = Path((self.src_var.get() or "").strip())
+        if (src.is_dir() and is_game_folder(src) and not (src / "sce_sys" / "param.json").is_file()
+                and not (cid and tid)):
+            messagebox.showerror("Identity needed", "This game folder has no sce_sys/param.json, so Content ID and "
+                                 "Title ID must be filled in here (the builder generates param.json from them).",
+                                 parent=self)
+            return None
+        inner = self.inner_var.get() if self.inner_var.get() in self._INNER else "none"
+        back  = self.back_var.get() if self.back_var.get() in self._BACKEND else "builtin"
+        level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)
+        dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
+        return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
+                "inner": inner, "backend": back, "level": level, "dll": dll}
+
+    # ── commit ───────────────────────────────────────────────────────────────
     def _add(self):
-        s = self.src_var.get().strip()
+        s = (self.src_var.get() or "").strip()
         if not s:
             messagebox.showerror("Missing", "Please choose a source to pack.", parent=self); return
         src = Path(s)
         if not src.exists():
             messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
-        if src.is_file() and src.suffix.lower() == ".ffpfsc":
-            messagebox.showerror("Use Convert",
-                                 "A .ffpfsc is already packed. Use the Convert job to unpack/convert it.",
+        fmt = self.fmt_key
+        suf = src.suffix.lower() if src.is_file() else ""
+        if suf == ".pkg":
+            messagebox.showerror("Use fPKG⇢",
+                                 "A .pkg is a PS5 fake package. Use the fPKG⇢ job to extract it to a folder.",
                                  parent=self); return
-        outf = self.out_var.get().strip()
+        if fmt != "pkg" and suf == ".ffpfsc":
+            messagebox.showerror("Already packed",
+                                 "A .ffpfsc is already packed. Choose the .pkg format to build an installable fPKG "
+                                 "from it, or use the Convert job to unpack/convert it.",
+                                 parent=self); return
+        if fmt == "pkg" and src.is_file() and suf not in self.app.FPKG_FILE_SOURCES:
+            messagebox.showerror("Wrong type", "For a .pkg the source must be a game folder, an archive "
+                                 "(.zip/.rar/.7z) or a .ffpfsc / .ffpfs / .exfat / .ffpkg image.", parent=self); return
+        outf = (self.out_var.get() or "").strip()
         if not outf:
             messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
-        fmt = bool(self.fmt_compressed.get())
+        params = None
+        if fmt == "pkg":
+            params = self._collect_fpkg_params()
+            if params is None:
+                return
+            # Remember the compression choice as the default for the next .pkg job (and for
+            # dropped sources while .pkg is the remembered format). Identity is never remembered.
+            self.app.fpkg_defaults = {"inner": params["inner"], "backend": params["backend"], "level": params["level"]}
+            save_settings({"fpkg_defaults": self.app.fpkg_defaults})
 
-        # ── Edit mode: mutate the existing item in place; if the source changed, swap
-        #    the GameItem at the same queue index so the job keeps its position. ──
         if self.edit_item is not None:
-            it = self.edit_item
-            try:
-                old_src_p = Path(str(getattr(it, "archive_path", None) or getattr(it, "path", ""))).resolve()
-                new_src_p = src.resolve()
-                same_source = (old_src_p == new_src_p)
-            except Exception:
-                same_source = False
-            if same_source:
-                it.output_path = Path(outf)
-                it.output_compressed = fmt
-                if it.status not in ("Done",):
-                    it.status = "Queued"
-                self.app.update_queue_box(select_item=it)
-                self.app.log("OK", f"Job updated: {it.name}")
-                self.destroy(); return
-            # Source changed → build a fresh GameItem of the right kind and replace.
-            new_item = self.app._build_pack_item_for(src, parent=self)
-            if new_item is None:
-                return  # validation already shown
-            new_item.output_path     = Path(outf)
-            new_item.output_compressed = fmt
-            try:
-                idx = self.app.queue.index(it)
-                self.app.queue[idx] = new_item
-            except ValueError:
-                self.app.queue.append(new_item)
-            self.app.update_queue_box(select_item=new_item)
-            self.app.log("OK", f"Job replaced: {it.name} → {new_item.name}")
-            self.destroy(); return
+            self._save_edit(src, outf, fmt, params)
+            return
 
-        # ── Add mode (original path) ─────────────────────────────────────────
-        # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
-        # image / .ffpfs and queues the right pack item. Setting output_var + the format var
-        # makes this job's output + format the values snapshotted onto the item (per-job),
-        # and the remembered defaults the next submenu pre-fills.
+        # ── Add mode ─────────────────────────────────────────────────────────
         self.app.output_var.set(outf)
-        try:
-            self.app.output_compressed_var.set(fmt)
-        except Exception:
-            pass
+        self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
+        if fmt == "pkg" and src.is_file() and suf in self._IMAGE_SUFFIXES + self._ARCHIVE_SUFFIXES:
+            # A single packed image or archive → a direct fPKG job carrying the identity
+            # typed here as fallback (the shared add path would queue a .ffpfsc as an UNPACK
+            # and could not carry the identity). The backend unwraps an image on the temp
+            # drive itself; an archive is extracted when its turn comes, like a pack.
+            item = self.app._fpkg_item_for(src, params, output_path=outf, parent=self)
+            if item is None:
+                return
+            self.app.queue.append(item)
+            self.app.update_queue_box(select_item=item)
+            kind = "image"
+            if suf in self._ARCHIVE_SUFFIXES:
+                kind = "archive"
+                # Encrypted header with no saved password → ask now, so the drive routing
+                # knows the real extracted size (same as the shared add path does).
+                try:
+                    self.app._resolve_archive_password(item)
+                except Exception:
+                    pass
+                self.app.update_queue_box(select_item=item)
+            self.app.log("OK", f"fPKG build queued ({kind}, {params['inner']}/{params['backend']}, level "
+                               f"{params['level']}): {item.name} -> {outf}.  Press ▶ START to run.")
+            self.destroy()
+            return
+        if fmt == "pkg" and src.is_dir() and is_game_folder(src):
+            # The folder scan yields exactly this one item; hand it the identity shown here
+            # (pre-filled from its param.json, or typed for a folder without one).
+            ident = {k: params[k] for k in ("content_id", "title_id", "title", "version") if params.get(k)}
+            if ident.get("version") == "01.000.000":
+                ident.pop("version")
+            self.app._pending_fpkg_identity = (src, ident) if ident else None
+        # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
+        # image / .ffpfs (and scans a parent folder) and queues the right pack item(s);
+        # update_queue_box then applies the remembered format — for .pkg that turns each
+        # fresh pack item into an fPKG job with the remembered compression parameters.
         self.app.source_var.set(s)
         try:
             self.app.unpack_mode_var.set(False)
@@ -4366,6 +4849,67 @@ class PackDialog(ctk.CTkToplevel):
             pass
         self.destroy()
         self.app.add_source_to_queue()
+
+    def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None) -> None:
+        """Edit mode: mutate in place when the source and the job kind are unchanged;
+        otherwise build a fresh GameItem of the right kind and swap it in at the same
+        queue index so the job keeps its position."""
+        it = self.edit_item
+        was_fpkg = getattr(it, "operation", "pack") == "fpkg-build"
+        try:
+            old_src_p = Path(str(getattr(it, "archive_path", None) or getattr(it, "path", ""))).resolve()
+            same_source = (old_src_p == src.resolve())
+        except Exception:
+            same_source = False
+
+        # Same source: convert / update IN PLACE so bundle tags, archive password, display
+        # name and queue position all survive a pack ↔ fPKG switch.
+        if fmt == "pkg":
+            if same_source:
+                if was_fpkg:
+                    self.app._apply_fpkg_params(it, params)
+                else:
+                    self.app._as_fpkg_job(it, params)
+                it.output_path = Path(outf)
+                if it.status not in ("Done",):
+                    it.status = "Queued"
+                self.app.update_queue_box(select_item=it)
+                self.app.log("OK", f"Job updated: {it.name}" + ("" if was_fpkg else "  (now an fPKG build)"))
+                self.destroy(); return
+            new_item = self.app._fpkg_item_for(src, params, output_path=outf, parent=self)
+            if new_item is None:
+                return
+        else:
+            comp = (fmt == "ffpfsc")
+            if same_source:
+                if was_fpkg:
+                    it.operation = "pack"
+                    for _a in ("fpkg_content_id", "fpkg_title_id", "fpkg_title", "fpkg_version",
+                               "fpkg_inner_mode", "fpkg_kraken_backend", "fpkg_pubtools_dll", "fpkg_level"):
+                        if _a in vars(it):
+                            delattr(it, _a)
+                it.output_path = Path(outf)
+                it.output_compressed = comp
+                if it.status not in ("Done",):
+                    it.status = "Queued"
+                self.app.update_queue_box(select_item=it)
+                self.app.log("OK", f"Job updated: {it.name}" + (f"  (now a pack → .{fmt})" if was_fpkg else ""))
+                self.destroy(); return
+            new_item = self.app._build_pack_item_for(src, parent=self)
+            if new_item is None:
+                return  # validation already shown
+            new_item.output_path = Path(outf)
+            new_item.output_compressed = comp
+        try:
+            idx = self.app.queue.index(it)
+            self.app.queue[idx] = new_item
+        except ValueError:
+            self.app.queue.append(new_item)
+        self.app.update_queue_box(select_item=new_item)
+        self.app.log("OK", f"Job replaced: {it.name} → {new_item.name}"
+                           + ("  (now an fPKG build)" if fmt == "pkg" and not was_fpkg else "")
+                           + (f"  (now a pack → .{fmt})" if fmt != "pkg" and was_fpkg else ""))
+        self.destroy()
 
 
 class PatchDialog(ctk.CTkToplevel):
@@ -4526,7 +5070,7 @@ class ConverterDialog(ctk.CTkToplevel):
         super().__init__(app.root)
         self.app = app
         self.title("Image Converter")
-        self.geometry("680x440")
+        self.geometry("880x460")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
@@ -4538,7 +5082,7 @@ class ConverterDialog(ctk.CTkToplevel):
                       ).pack(anchor="w", padx=24, pady=(18, 2))
         ctk.CTkLabel(self, text="Pick an image, then choose a step along the chain. The conversion is "
                                 "added to the queue — press ▶ START to run it.",
-                      text_color=MUTED, wraplength=632, justify="left").pack(anchor="w", padx=24, pady=(0, 14))
+                      text_color=MUTED, wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(0, 14))
 
         # Source row + a detected-type badge.
         row = ctk.CTkFrame(self, fg_color=BLACK); row.pack(fill="x", padx=24, pady=(0, 6))
@@ -4557,7 +5101,7 @@ class ConverterDialog(ctk.CTkToplevel):
         self.badge.pack(side="left")
         self.type_var = tk.StringVar(value="No file selected.")
         ctk.CTkLabel(badge_row, textvariable=self.type_var, text_color=MUTED,
-                      wraplength=540, justify="left").pack(side="left", padx=(10, 0))
+                      wraplength=740, justify="left").pack(side="left", padx=(10, 0))
 
         # The conversion chain — nodes with transition buttons between them.
         self.pipe = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
@@ -4565,7 +5109,7 @@ class ConverterDialog(ctk.CTkToplevel):
 
         self.note_var = tk.StringVar(value="")
         ctk.CTkLabel(self, textvariable=self.note_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=11), wraplength=632, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
+                      font=ctk.CTkFont(size=11), wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
 
         ctk.CTkButton(self, text="Close", fg_color=CARD2, text_color=WHITE,
                        hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy
@@ -4633,16 +5177,22 @@ class ConverterDialog(ctk.CTkToplevel):
             self._node(".ffpfs")
             self._transition("Unpack", "folder", "→ game files")
             self._node("Folder")
+            self._transition("Build fPKG", "fpkg", "→ installable .pkg (one click)")
+            self._node("fPKG")
             self.note_var.set("Decompress gives the uncompressed .ffpfs (faster to mount, full size). "
-                              "Unpack extracts the game files into a folder.")
+                              "Unpack extracts the game files into a folder. Build fPKG unwraps the image "
+                              "on the temp drive and packages it as an installable .pkg in one job.")
         elif p.suffix.lower() == ".ffpfs":
             self.badge.configure(text=".ffpfs", fg_color=CARD2)
             self.type_var.set(f"“{p.name}” — uncompressed image.")
             self._node(".ffpfs", current=True)
             self._transition("Unpack", "folder", "→ game files")
             self._node("Folder")
+            self._transition("Build fPKG", "fpkg", "→ installable .pkg (one click)")
+            self._node("fPKG")
             self.note_var.set("To COMPRESS this .ffpfs into a .ffpfsc instead, add it as a source in the "
-                              "main window and use the Output control (Compressed).")
+                              "main window and use the Output control (Compressed). Build fPKG makes an "
+                              "installable .pkg from it in one job.")
         else:
             self.badge.configure(text="?", fg_color=CARD2)
             self.type_var.set("Not a .ffpfsc / .ffpfs image.")
@@ -4669,8 +5219,11 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         self.edit_item = item
         op = getattr(item, "operation", "pack")
         title = {"unpack": "Convert — edit job",
-                 "fake-sign": "Fake Sign — edit job"}.get(op, "Edit job")
-        self.title(title); self.geometry("620x260")
+                 "fake-sign": "Fake Sign — edit job",
+                 "fpkg-extract": "Extract fPKG — edit job"}.get(op, "Edit job")
+        self.title(title)
+        # Two-row variants (source + output) need the extra height for the button row.
+        self.geometry("620x340" if op in ("unpack", "fpkg-extract") else "620x260")
         self.configure(fg_color=BLACK); self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
@@ -4678,6 +5231,11 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         if op == "unpack":
             head = "🔄  Convert — edit job"
             sub  = "Change this conversion's source image or output folder. The job stays at its current queue position."
+            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
+            self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
+        elif op == "fpkg-extract":
+            head = "📥  Extract fPKG — edit job"
+            sub  = "Change the .pkg this job extracts or the folder it extracts into. The job stays at its current queue position."
             self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
             self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
         else:   # fake-sign
@@ -4694,21 +5252,23 @@ class JobEditMiniDialog(ctk.CTkToplevel):
 
         # Source row
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
-        src_label = ("Source image (.ffpfsc / .ffpfs):" if op == "unpack"
-                     else "Folder (to fake-sign in place):")
+        src_label = {"unpack": "Source image (.ffpfsc / .ffpfs):",
+                     "fpkg-extract": "Source package (.pkg):"}.get(op, "Folder (to fake-sign in place):")
         ctk.CTkLabel(srow, text=src_label, text_color=WHITE,
                       font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE
                       ).pack(side="left", fill="x", expand=True)
-        if op == "unpack":
+        if op in ("unpack", "fpkg-extract"):
             ctk.CTkButton(sinner, text="File", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                           command=self._pick_image).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="Folder", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_folder).pack(side="left", padx=(6, 0))
+                           command=(self._pick_pkg if op == "fpkg-extract" else self._pick_image)
+                           ).pack(side="left", padx=(6, 0))
+        if op != "fpkg-extract":
+            ctk.CTkButton(sinner, text="Folder", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                           command=self._pick_folder).pack(side="left", padx=(6, 0))
 
-        # Output row (unpack only)
-        if op == "unpack":
+        # Output row (unpack / fpkg-extract)
+        if op in ("unpack", "fpkg-extract"):
             orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
             ctk.CTkLabel(orow, text="Output folder  (where extracted files land):", text_color=WHITE,
                           font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
@@ -4728,6 +5288,12 @@ class JobEditMiniDialog(ctk.CTkToplevel):
     def _pick_image(self):
         p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
                                        filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_pkg(self):
+        p = filedialog.askopenfilename(title="Select a PS5 fake package (.pkg)",
+                                       filetypes=[("PS5 package", "*.pkg"), ("All files", "*.*")])
         if p:
             self.src_var.set(p)
 
@@ -4760,6 +5326,22 @@ class JobEditMiniDialog(ctk.CTkToplevel):
                 it.title_id = parse_title_id(src) or "📤"
             except Exception:
                 it.title_id = "📤"
+            try:
+                it.size = src.stat().st_size
+                it.extracted_size = it.size
+            except Exception:
+                pass
+            outf = (self.out_var.get() or "").strip() if self.out_var else ""
+            it.output_path = Path(outf) if outf else None
+        elif op == "fpkg-extract":
+            if not (src.is_file() and src.suffix.lower() == ".pkg"):
+                messagebox.showerror("Wrong type", "Extract fPKG needs a .pkg file.", parent=self); return
+            it.path = src
+            it.name = src.stem
+            try:
+                it.title_id = parse_title_id(src) or "📦"
+            except Exception:
+                it.title_id = "📦"
             try:
                 it.size = src.stat().st_size
                 it.extracted_size = it.size
@@ -5462,10 +6044,45 @@ class App:
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
         # AMPR/APR emu folder (PlayGo titles): holds libSceAmpr.sprx + libScePlayGo.sprx.
         self.ampr_var = tk.StringVar(value=settings.get("ampr_folder", ""))
-        # The Output FORMAT (.ffpfsc vs .ffpfs) is chosen PER JOB in the Pack submenu now —
-        # a global switch was misleading (you couldn't tell which job it applied to).
-        # output_compressed_var persists the last choice as the default the submenu pre-fills.
-        ctk.CTkLabel(self._toolbar, text="Build jobs into .ffpfsc / .ffpfs — format is set per job",
+        # Optional Sony Publishing Tools DLL for the fPKG 'publishingtools' Kraken backend.
+        # Never bundled — the user points at their own copy. Empty = built-in encoder only.
+        self.pubtools_dll_var = tk.StringVar(value=settings.get("pubtools_dll", ""))
+        # The Output FORMAT is chosen PER JOB in the Pack dialog — three values:
+        # 'ffpfsc' (compressed), 'ffpfs' (uncompressed) and 'pkg' (an installable fPKG).
+        # output_format_var remembers the last choice as the default the dialog pre-fills
+        # AND the format a dropped / browsed source is queued with (the queue snapshot in
+        # update_queue_box applies it to every fresh pack item). output_compressed_var is
+        # the legacy bool the pack pipeline still reads; it is kept in sync from here.
+        _fmt0 = str(settings.get("output_format") or "").strip().lower()
+        if _fmt0 not in ("ffpfsc", "ffpfs", "pkg"):
+            _fmt0 = "ffpfsc" if self.output_compressed_var.get() else "ffpfs"
+        self.output_format_var = tk.StringVar(value=_fmt0)
+        def _sync_format(*_):
+            v = self.output_format_var.get()
+            save_settings({"output_format": v})
+            try:
+                self.output_compressed_var.set(v != "ffpfs")
+            except Exception:
+                pass
+        self.output_format_var.trace_add("write", _sync_format)
+        # Remembered fPKG compression parameters (inner codec / Kraken backend / level) —
+        # what the Pack dialog pre-fills for .pkg and what a dropped source gets when the
+        # remembered format is .pkg. Identity is never remembered: it is per game and read
+        # from sce_sys/param.json at build time.
+        _fd = settings.get("fpkg_defaults") or {}
+        try:
+            _fl = int(_fd.get("level", 7) if _fd.get("level") is not None else 7)
+        except Exception:
+            _fl = 7
+        self.fpkg_defaults: dict = {
+            "inner":   _fd.get("inner") if _fd.get("inner") in ("none", "zlib", "kraken") else "none",
+            "backend": _fd.get("backend") if _fd.get("backend") in ("builtin", "publishingtools") else "builtin",
+            "level":   max(-4, min(9, _fl)),      # Kraken: <0 = fast preset, else normal (the tool's 0..9 are identical)
+        }
+        self._pending_fpkg_identity = None   # (source path, identity dict) handed from the dialog to the scan result
+        # (legacy comment kept for context:) output_compressed_var persists the last choice
+        # as the default the submenu pre-fills.
+        ctk.CTkLabel(self._toolbar, text="Build jobs into .ffpfsc / .ffpfs — or an installable .pkg (fPKG) — format is set per job",
                       text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 0))
         # Tools, grouped on the right. (Job entry points — Pack/Convert/Patch/Sign —
         # live in the 'Add job' bar below.)
@@ -5522,8 +6139,10 @@ class App:
         self._button(jobbar, "🔄  Convert", self.open_converter,                 width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🩹  Patch",   self._open_patch_dialog,             width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "📥  fPKG⇢", self.fpkg_extract_dialog,              width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🔎  Browse",  self.open_pfs_browser,               width=118).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image to add a Pack job",
+        # (Building an fPKG is the Pack dialog's third output format — no separate door.)
+        ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image (Pack, remembered format) or a .pkg file (fPKG⇢)",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
         # Output + format are per job (each submenu); the shared Temp folder lives in
@@ -5708,6 +6327,14 @@ class App:
                       text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold"),
                       anchor="w").grid(row=0, column=0, columnspan=7, sticky="w",
                                        padx=10, pady=(7, 3))
+        # Applicability note — set from update_game_details() for the selected job. Pack
+        # jobs use every control; an fPKG build honours only Level (per job); an fPKG
+        # extract none of them. Empty for pack jobs so the bar looks as before.
+        self.tune_note_var = tk.StringVar(value="")
+        self._tune_note_lbl = ctk.CTkLabel(tune_bar, textvariable=self.tune_note_var, text_color=MUTED,
+                                            font=ctk.CTkFont(size=11), anchor="w", justify="left")
+        self._tune_note_lbl.grid(row=2, column=0, columnspan=7, sticky="w", padx=10, pady=(0, 6))
+        self._tune_note_lbl.grid_remove()
 
         # ── Compression level ──
         ctk.CTkLabel(tune_bar, text="Level (0-9):", text_color=MUTED,
@@ -6015,6 +6642,30 @@ class App:
         self.status_update("Ready", f"Fake-sign queued: {folder.name} — press START.",
                             "Ready", 0, 0, "00:00", "—", "—")
 
+    def fpkg_extract_dialog(self):
+        """fPKG EXTRACT: pick a .pkg file and queue a job that pulls the /app0 tree out
+        of it. Ships the bundled ffpfsc-pkg-tool binary — no external DLL required."""
+        path = filedialog.askopenfilename(
+            title="Select a PS5 fake package (.pkg) to extract",
+            filetypes=[("PS5 package", "*.pkg"), ("All files", "*.*")])
+        if not path:
+            return
+        pkg = Path(path)
+        if not pkg.is_file():
+            messagebox.showerror("Not a file", f"This is not a file:\n{pkg}"); return
+        out = (self.output_var.get() or "").strip()
+        if not out:
+            out = str(pkg.parent / (pkg.stem + " [extracted]"))
+        item = GameItem.from_fpkg_extract(pkg, output_path=out)
+        self.queue.append(item)
+        self.update_queue_box(select_item=item)
+        self.log("OK", f"fPKG extract queued: {pkg.name} -> {out}.  Press ▶ START to run.")
+
+    def fpkg_build_dialog(self, source: Path | None = None):
+        """Open the Pack dialog with the .pkg (fPKG) format pre-selected — the one door
+        for building an installable package from any source. Press START to run."""
+        PackDialog(self, source=source, fmt="pkg")
+
     def _queue_conversion(self, path: Path, action: str):
         """Add a converter job to the queue (the user then presses START — it reuses the
         normal unpack pipeline). action: 'decompress' (.ffpfsc → inner .ffpfs, one level),
@@ -6026,6 +6677,11 @@ class App:
             self.source_var.set(str(path))
             self.unpack_mode_var.set(True)        # the folder-scan unpack path reads this
             self.add_source_to_queue()
+            return
+        if action == "fpkg":
+            # One-click image → installable .pkg: the Pack dialog with .pkg pre-selected
+            # and the image as source (identity is read from its param.json at build time).
+            self.fpkg_build_dialog(source=path)
             return
         item = GameItem.from_pfs_image(path)
         item.unwrap = (action != "decompress")    # decompress = stop at the inner .ffpfs
@@ -6044,11 +6700,21 @@ class App:
             paths = [event.data]
         for raw in paths:
             p = Path(raw.strip("{}").strip())
-            if p.exists():
-                self.source_var.set(str(p))
-                self.add_source_to_queue()   # handles folders AND archives uniformly
-            else:
-                self.log("WARN", f"Dropped path not found: {p}")
+            if not p.exists():
+                self.log("WARN", f"Dropped path not found: {p}"); continue
+            # A dropped .pkg becomes an fPKG-extract job (into a "<name> [extracted]" folder
+            # next to it, unless a global Output is set).
+            if p.is_file() and p.suffix.lower() == ".pkg":
+                out = (self.output_var.get() or "").strip()
+                if not out:
+                    out = str(p.parent / (p.stem + " [extracted]"))
+                item = GameItem.from_fpkg_extract(p, output_path=out)
+                self.queue.append(item)
+                self.update_queue_box(select_item=item)
+                self.log("OK", f"fPKG extract queued from drop: {p.name} -> {out}.")
+                continue
+            self.source_var.set(str(p))
+            self.add_source_to_queue()   # handles folders AND archives uniformly
 
     # ── Folder browse ─────────────────────────────────────────────────────────
     def browse_source_folder(self):
@@ -6070,9 +6736,10 @@ class App:
         path = filedialog.askopenfilename(
             title="Select archive, disk image, or PFS image",
             filetypes=[
-                ("Supported files", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs *.ffpfsc"),
+                ("Supported files", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs *.ffpfsc *.pkg"),
                 ("Disk images",     "*.exfat *.ffpkg"),
                 ("PFS images",      "*.ffpfs *.ffpfsc"),
+                ("PS5 packages",    "*.pkg"),
                 ("Archives",        "*.zip *.rar *.7z"),
                 ("ZIP",             "*.zip"),
                 ("RAR",             "*.rar"),
@@ -6083,6 +6750,16 @@ class App:
         if not path:
             return
         p = Path(path)
+        # A picked .pkg becomes an fPKG-extract queue item straight away.
+        if p.suffix.lower() == ".pkg":
+            out = (self.output_var.get() or "").strip()
+            if not out:
+                out = str(p.parent / (p.stem + " [extracted]"))
+            item = GameItem.from_fpkg_extract(p, output_path=out)
+            self.queue.append(item)
+            self.update_queue_box(select_item=item)
+            self.log("OK", f"fPKG extract queued: {p.name} -> {out}.")
+            return
         self.source_var.set(str(p))
         if p.suffix.lower() == ".ffpfsc":   # .ffpfs is a PACK source now (re-pack), not unpack
             self.unpack_mode_var.set(True)
@@ -6244,9 +6921,13 @@ class App:
         return out
 
     def _copy_item_payload(self, target: GameItem, source: GameItem) -> None:
+        # An fPKG job stays an fPKG job whatever the archive turned out to hold (a game
+        # folder, a disk image, a .ffpfsc — the backend unwraps images itself). Its
+        # fpkg_* parameters live on the target and are untouched here.
+        keep_fpkg = getattr(target, "operation", "pack") == "fpkg-build"
         target.path         = source.path
         target.archive_path = source.archive_path
-        target.operation    = source.operation
+        target.operation    = "fpkg-build" if keep_fpkg else source.operation
         target.name         = source.name
         target.title_id     = source.title_id
         target.size         = source.size
@@ -6259,6 +6940,7 @@ class App:
         target.source_kind    = getattr(source, "source_kind", "inplace")
         target.extracted_size = getattr(source, "extracted_size", source.size)
         # Now that the archive is a real folder, detect whether it's a PlayGo/APR title.
+        # (Only acted on for pack jobs — the fPKG path never injects the emu.)
         try:
             target.ampr_emu = is_apr_game(target.path)
         except Exception:
@@ -6283,12 +6965,14 @@ class App:
         src_str = self._clean_path_str(self.source_var.get())
         if not src_str:
             self.pending_start = False
+            self._pending_fpkg_identity = None
             messagebox.showerror("Nothing selected",
                                   "Enter or browse to a game folder, archive, disk image, or PFS image (.ffpfs/.ffpfsc).")
             return
         src = Path(src_str)
         if not src.exists():
             self.pending_start = False
+            self._pending_fpkg_identity = None
             messagebox.showerror("Path not found",
                                   f"This path does not exist:\n{src}")
             return
@@ -6305,8 +6989,22 @@ class App:
                                 "Ready", 0, 0, "00:00", "—", "—")
             return
 
-        # ── Existing .ffpfsc image — unpack/convert via MkPFS ─────────────────
+        # ── Existing .ffpfsc image — unpack/convert via MkPFS, or, with '.pkg' as the
+        #    remembered format, straight into an fPKG build (the backend unwraps it). ──
         if src.is_file() and src.suffix.lower() == ".ffpfsc":
+            if self.output_format_var.get() == "pkg":
+                item = self._fpkg_item_for(src, dict(self.fpkg_defaults),
+                                           output_path=(self.output_var.get() or "").strip() or None)
+                if item is None:
+                    self.pending_start = False
+                    return
+                self.queue.append(item)
+                self.update_queue_box(select_item=item)
+                self.log("OK", f".ffpfsc image queued as an fPKG build (remembered format .pkg): "
+                               f"{src.name}  [{format_size(item.size)}]")
+                self.status_update("Ready", f".ffpfsc queued for fPKG build: {src.name}",
+                                    "Ready", 0, 0, "00:00", "—", "—")
+                return
             item = GameItem.from_pfs_image(src)
             self.queue.append(item)
             self.update_queue_box(select_item=item)
@@ -6375,6 +7073,7 @@ class App:
                     "Expected: sce_sys/param.json and eboot.bin\n\nAdd anyway?"
                 ):
                     self.pending_start = False
+                    self._pending_fpkg_identity = None
                     return
             self.status_update("Scanning", f"Reading {src.name}…",
                                 "Scanning Files", 0, 0, "00:00", "—", "—")
@@ -6820,6 +7519,8 @@ class App:
         try:
             _pj = getattr(item, "output_compressed", None)
             item._output_compressed = bool(self.output_compressed_var.get() if _pj is None else _pj)
+            # (An fPKG is compressed too — every file is Kraken-packed whatever the codec
+            # layer — so the compressed-output estimate applies to .pkg output as well.)
         except Exception:
             item._output_compressed = True
         temp_base = self.temp_var.get().strip()
@@ -7312,6 +8013,9 @@ class App:
                 payload_items = [self._item_from_payload_path(kind, path) for path in paths]
                 primary = payload_items[0]
                 self._copy_item_payload(item, primary)
+                # (Extra payload items of a multi-game archive queued as an fPKG job are
+                # converted in the _extract_q "ok" handler — on the main thread, since the
+                # conversion reads Tk variables.)
                 # Mark this as an extracted-archive item so the pack worker compresses its
                 # overall progress into the tail after the extraction slice (monotonic
                 # whole-game %). Underscore attr → not persisted in the saved queue.
@@ -7537,11 +8241,11 @@ class App:
 
         op = getattr(item, "operation", "pack")
         try:
-            if op == "pack":
-                PackDialog(self, item=item)
+            if op in ("pack", "fpkg-build"):
+                PackDialog(self, item=item)     # fPKG is the Pack dialog's third format
             elif op == "patch":
                 PatchDialog(self, item=item)
-            elif op in ("unpack", "fake-sign"):
+            elif op in ("unpack", "fake-sign", "fpkg-extract"):
                 JobEditMiniDialog(self, item)
             else:
                 self.log("WARN", f"No editor for job type '{op}'.")
@@ -7574,6 +8278,138 @@ class App:
                              ".exfat/.ffpkg, or .ffpfs.",
                              parent=parent or self.root)
         return None
+
+    # ── fPKG jobs — the Pack dialog's '.pkg' format ─────────────────────────────
+    # A queued fPKG build is a GameItem with operation "fpkg-build" plus fpkg_* fields.
+    # Any classified pack item (folder, archive placeholder, disk image, .ffpfs/.ffpfsc)
+    # can be turned into one; the backend resolves the source (extract / unwrap) and reads
+    # the identity from sce_sys/param.json, so the fields here are fallbacks only.
+    FPKG_FILE_SOURCES = (".zip", ".rar", ".7z", ".exfat", ".ffpkg", ".ffpfs", ".ffpfsc")
+    _TITLE_ID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
+
+    def _fpkg_params_of(self, item) -> dict:
+        """The fPKG parameters carried by *item* (an fpkg-build job), as one dict."""
+        lvl = getattr(item, "fpkg_level", None)
+        try:
+            lvl = int(lvl) if lvl is not None else int(self.compression_level_var.get())
+        except Exception:
+            lvl = int(self.compression_level_var.get())
+        return {
+            "content_id": getattr(item, "fpkg_content_id", "") or "",
+            "title_id":   getattr(item, "fpkg_title_id", "") or "",
+            "title":      getattr(item, "fpkg_title", "") or "",
+            "version":    getattr(item, "fpkg_version", "01.000.000") or "01.000.000",
+            "inner":      getattr(item, "fpkg_inner_mode", "none") or "none",
+            "backend":    getattr(item, "fpkg_kraken_backend", "builtin") or "builtin",
+            "level":      max(-4, min(9, lvl)),     # -4..-1 = Kraken fast preset, 0..9 = normal
+            "dll":        getattr(item, "fpkg_pubtools_dll", "") or "",
+        }
+
+    def _fpkg_compression_of(self, item) -> dict:
+        """Only the compression part of an fPKG job's parameters (inner / backend / level /
+        dll) — what sibling jobs made from the same source share. Identity is never shared:
+        it is per game and read from each game's param.json at build time."""
+        p = self._fpkg_params_of(item)
+        return {k: p[k] for k in ("inner", "backend", "level", "dll")}
+
+    def _apply_fpkg_params(self, item, params: dict) -> None:
+        """Write a params dict (see _fpkg_params_of) onto *item*."""
+        item.fpkg_content_id     = str(params.get("content_id", "") or "").strip().upper()
+        item.fpkg_title_id       = str(params.get("title_id", "") or "").strip().upper()
+        item.fpkg_title          = str(params.get("title", "") or "").strip()
+        item.fpkg_version        = str(params.get("version", "") or "").strip() or "01.000.000"
+        item.fpkg_inner_mode     = params.get("inner") if params.get("inner") in ("none", "zlib", "kraken") else "none"
+        item.fpkg_kraken_backend = params.get("backend") if params.get("backend") in ("builtin", "publishingtools") else "builtin"
+        _lvl = params.get("level")
+        try:
+            item.fpkg_level = max(-4, min(9, int(_lvl) if _lvl is not None else 7))
+        except Exception:
+            item.fpkg_level = 7
+        dll = str(params.get("dll", "") or "").strip()
+        if item.fpkg_kraken_backend == "publishingtools" and not dll:
+            dll = (self.pubtools_dll_var.get() or "").strip()
+        item.fpkg_pubtools_dll = dll if item.fpkg_kraken_backend == "publishingtools" else ""
+        # Show a real title id in the queue row when the source name didn't reveal one.
+        if item.fpkg_title_id and not self._TITLE_ID_RE.match(str(getattr(item, "title_id", "") or "")):
+            item.title_id = item.fpkg_title_id
+
+    def _as_fpkg_job(self, item, params: dict, identity: dict | None = None):
+        """Turn a freshly classified PACK item into an fPKG build job IN PLACE, keeping its
+        size / files / artwork / bundle tags. *identity* (content_id/title_id/title/version)
+        overrides the corresponding keys of *params* when given."""
+        p = dict(params)
+        if identity:
+            p.update({k: v for k, v in identity.items() if v})
+        item.operation = "fpkg-build"
+        item.output_compressed = True          # not meaningful for .pkg; marks the snapshot as taken
+        self._apply_fpkg_params(item, p)
+        # The fPKG builder has no patch overlay: a patch the folder scan detected next to
+        # the game would be silently left out — say so, and drop it so the space gate
+        # doesn't size for a patch job either.
+        ps = getattr(item, "patch_source", None)
+        if ps:
+            try:
+                self.log("WARN", f"{getattr(item, 'display_name', None) or item.name}: the detected patch "
+                                 f"'{Path(str(ps)).name}' is NOT integrated into an fPKG build — the .pkg is built "
+                                 f"from the base game only. Patch it separately.")
+            except Exception:
+                pass
+            item.patch_source = None
+        # Space gate: a compressed .ffpfsc is unwrapped to its full tree before the build.
+        # Measured .ffpfsc/unpacked ratio averages ~0.59 (see COMPRESSED_OUTPUT_RATIO), so
+        # the tree is ~1.7x the image; reserve 2x to keep headroom.
+        try:
+            _p = Path(str(getattr(item, "path", "") or ""))
+            if _p.is_file() and _p.suffix.lower() == ".ffpfsc":
+                item.extracted_size = int((getattr(item, "size", 0) or 0) * 2)
+        except Exception:
+            pass
+        return item
+
+    def _take_pending_fpkg_identity(self, item) -> dict | None:
+        """The identity the Pack dialog pre-filled for ONE game folder, handed to exactly
+        the queue item made from that folder (matched by resolved path), then dropped."""
+        pend = getattr(self, "_pending_fpkg_identity", None)
+        if not pend:
+            return None
+        target, ident = pend
+        try:
+            same = Path(str(getattr(item, "path", "") or "")).resolve() == Path(str(target)).resolve()
+        except Exception:
+            same = False
+        if not same:
+            return None
+        self._pending_fpkg_identity = None
+        return ident
+
+    def _fpkg_item_for(self, src: Path, params: dict, *, output_path=None, parent=None):
+        """A fresh fPKG build job for a single source path: a packed image (.ffpfsc / .ffpfs /
+        .exfat / .ffpkg — unwrapped by the backend), an archive (extracted on its turn) or a
+        folder. Returns None (after an error dialog) for anything else."""
+        src = Path(src)
+        suf = src.suffix.lower() if src.is_file() else ""
+        try:
+            if src.is_file() and suf in (".zip", ".rar", ".7z"):
+                base = GameItem.from_archive(src)
+            elif src.is_file() and suf in (".ffpfsc", ".ffpfs", ".exfat", ".ffpkg"):
+                base = GameItem.from_exfat(src)      # single-file image item; the backend unwraps it
+            elif src.is_dir():
+                base = GameItem(src)
+            else:
+                base = None
+        except Exception as e:
+            messagebox.showerror("Build failed", f"Could not classify the source:\n{e}",
+                                 parent=parent or self.root)
+            return None
+        if base is None:
+            messagebox.showerror("Unsupported source",
+                                 f"Not a valid fPKG source:\n{src}\n\nUse a game folder, an archive, "
+                                 "or a .ffpfsc / .ffpfs / .exfat / .ffpkg image.",
+                                 parent=parent or self.root)
+            return None
+        self._as_fpkg_job(base, params)
+        base.output_path = Path(output_path) if output_path else None
+        return base
 
     # ── Queue management ──────────────────────────────────────────────────────
     def queue_move_up(self):
@@ -7717,13 +8553,25 @@ class App:
         # with (patch/sign set their own; fake-sign has none). Runs right after an item is
         # appended (update_queue_box is called then), capturing the output at add time.
         _gout = (self.output_var.get() or "").strip()
+        try:
+            _fmt = self.output_format_var.get()
+        except Exception:
+            _fmt = "ffpfsc"
         for _it in self.queue:
             _op = getattr(_it, "operation", "pack")
             if _gout and getattr(_it, "output_path", None) is None and _op in ("pack", "unpack"):
                 _it.output_path = Path(_gout)
-            # Format is per-job: snapshot the current default onto a pack item once.
+            # Format is per-job: snapshot the remembered default onto a fresh pack item once.
+            # With '.pkg' remembered the fresh pack item becomes an fPKG build job — this is
+            # how every source the classifier knows (game folder, folder scan with N games,
+            # library bundle, archive, disk image, .ffpfs) turns into a .pkg without a second
+            # code path. Identity is read from each game's param.json at build time; the one
+            # the dialog may have pre-filled for a single game folder rides along.
             if _op == "pack" and getattr(_it, "output_compressed", None) is None:
-                _it.output_compressed = bool(self.output_compressed_var.get())
+                if _fmt == "pkg":
+                    self._as_fpkg_job(_it, dict(self.fpkg_defaults),
+                                      identity=self._take_pending_fpkg_identity(_it))
+                _it.output_compressed = (_fmt != "ffpfs")
         self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
         if select_item is None:
@@ -7753,13 +8601,21 @@ class App:
             prefix = "▶ " if (self._batch_running and i == 0) else f"{i + 1}. "
             opn = getattr(item, "operation", "pack")
             badge = {"unpack": "CONVERT", "patch": "PATCH ",
-                     "fake-sign": "SIGN   "}.get(opn, "PACK   ")
+                     "fake-sign": "SIGN   ",
+                     "fpkg-extract": "fPKG-EX",
+                     "fpkg-build":   "fPKG-BD"}.get(opn, "PACK   ")
             # Per-job detail: jobs that don't have a meaningful source size show their
             # target/mode instead of "0 B".
             if opn == "fake-sign":
                 detail = "in place"
             elif opn == "patch":
                 detail = "overwrite" if getattr(item, "patch_overwrite", False) else "→ [patched]"
+            elif opn == "fpkg-extract":
+                detail = format_size(getattr(item, "size", 0) or 0) + " → /app0"
+            elif opn == "fpkg-build":
+                _b = (getattr(item, "fpkg_kraken_backend", "builtin") or "builtin")
+                _m = (getattr(item, "fpkg_inner_mode", "none") or "none")
+                detail = f"→ .pkg  ({_m}/{_b})"
             else:
                 # Archives store the COMPRESSED set size in .size; show the EXTRACTED size
                 # (what space/placement actually use), tagged with ~ as a header estimate.
@@ -7796,8 +8652,28 @@ class App:
         self._details_item = item   # record before any call that might raise
         self.game_name_var.set(f"Name: {getattr(item, 'display_name', None) or item.name}")
         mode = {"unpack": "Convert", "patch": "Integrate patch",
-                "fake-sign": "Fake sign"}.get(getattr(item, "operation", "pack"), "Pack")
+                "fake-sign": "Fake sign",
+                "fpkg-extract": "Extract fPKG",
+                "fpkg-build":   "Build fPKG"}.get(getattr(item, "operation", "pack"), "Pack")
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")
+        # Tell the user which tuning controls the selected job actually honours.
+        try:
+            _op = getattr(item, "operation", "pack")
+            if _op == "fpkg-build":
+                _lvl = getattr(item, "fpkg_level", None)
+                _spd = "fast" if (_lvl is not None and int(_lvl) < 0) else "normal"
+                self.tune_note_var.set(
+                    f"fPKG build selected: none of these controls apply to it. The job carries its own Kraken speed "
+                    f"({_spd} — edit via double-click); the outer-PFS pass runs on one worker and the format fixes its "
+                    f"own block sizes.")
+                self._tune_note_lbl.grid()
+            elif _op == "fpkg-extract":
+                self.tune_note_var.set("fPKG extract selected: none of these controls apply to it.")
+                self._tune_note_lbl.grid()
+            else:
+                self.tune_note_var.set(""); self._tune_note_lbl.grid_remove()
+        except Exception:
+            pass
         self.source_detail_var.set(f"Source: {item.path}")
         if shows_extracted_size(item):
             self.orig_var.set(f"Original Size: ~{format_size(item.extracted_size)} unpacked  "
@@ -7959,6 +8835,59 @@ class App:
             head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
             cmd = head + ["--fake-sign", str(item.path)]
             return cmd, backend, Path(item.path), temp
+
+        # ── fPKG EXTRACT job (built package -> /app0 folder) ─────────────────
+        if op == "fpkg-extract":
+            head = (pycmd + ["placeholder", str(out)] if getattr(sys, "frozen", False)
+                    else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
+            cmd = head + ["--fpkg-extract", str(item.path)]
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return cmd, backend, out, temp
+
+        # ── fPKG BUILD job (/app0 folder or packed image -> built .pkg) ──────
+        if op == "fpkg-build":
+            # A bundle (game + DLC extras in one folder) mirrors its folder at the
+            # destination for .pkg output too, like a pack does.
+            if sub and out.suffix.lower() != ".pkg":
+                out = out / sanitize_filename(sub)
+            head = (pycmd + ["placeholder", str(out)] if getattr(sys, "frozen", False)
+                    else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
+            cmd = head + [
+                "--fpkg-build", str(item.path),
+                "--fpkg-inner", str(getattr(item, "fpkg_inner_mode", "none") or "none"),
+                "--fpkg-kraken-backend", str(getattr(item, "fpkg_kraken_backend", "builtin") or "builtin"),
+            ]
+            # Identity fields are FALLBACKS: the backend reads sce_sys/param.json of the
+            # resolved source first (folder, unwrapped image, extracted archive alike) and
+            # only uses these for what it lacks. Empty fields are simply not passed.
+            for flag, attr in (("--content-id", "fpkg_content_id"), ("--title-id", "fpkg_title_id"),
+                               ("--fpkg-title", "fpkg_title"), ("--fpkg-version", "fpkg_version")):
+                _v = str(getattr(item, attr, "") or "").strip()
+                if _v and not (attr == "fpkg_version" and _v == "01.000.000"):
+                    cmd += [flag, _v]
+            _dll = getattr(item, "fpkg_pubtools_dll", "") or ""
+            if _dll:
+                cmd += ["--fpkg-pubtools-dll", str(_dll)]
+            # Staging drive for the inner image / CNT / outer image (and the unwrap of an
+            # image source): the placement-chosen build temp, else the app temp.
+            bt = getattr(item, "_build_temp", None)
+            tstr = str(Path(bt)) if bt else str(temp)
+            if tstr:
+                cmd += ["--temp-dir", tstr]
+            # Per-job Kraken speed: 7 = normal, -4 = fast preset (the tool's 0..9 are
+            # identical). Never the tuning-bar level — it means nothing to this encoder.
+            _lvl = getattr(item, "fpkg_level", None)
+            if _lvl is None:
+                _lvl = 7
+            cmd += ["--compression-level", str(int(_lvl))]
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return cmd, backend, out, temp
 
         # ── PATCH job (manual Integrate Patch as a queue item) ───────────────
         if op == "patch":
@@ -8579,9 +9508,9 @@ class App:
         per-kind factor + safety factor feed the check, so a game that fits a drive (the
         big HDD) is routed there and proceeds; only a game that fits NO drive is skipped."""
         op = getattr(item, "operation", "pack")
-        # Unpack writes to the output drive only; fake-sign rewrites in place (no temp,
-        # no new output). Neither needs the pack space gate — let them through.
-        if op in ("unpack", "fake-sign"):
+        # Unpack and fPKG extract write to the output drive only; fake-sign rewrites in
+        # place (no temp, no new output). None of them needs the pack space gate.
+        if op in ("unpack", "fake-sign", "fpkg-extract"):
             return "proceed"
         out_dir = Path(out_dir)
         try:
@@ -8733,7 +9662,8 @@ class App:
         self._mark_no_spotlight(getattr(item, "_build_temp", None))
         # AMPR/APR: inject the emu .sprx + build ampr_emu.index on the resolved game folder
         # (post-extraction for archives) before packing, so they ride into the .ffpfsc.
-        if getattr(item, "ampr_emu", False):
+        # PACK ONLY (see start()).
+        if getattr(item, "ampr_emu", False) and getattr(item, "operation", "pack") == "pack":
             self._prepare_ampr(item)
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
@@ -8906,7 +9836,9 @@ class App:
         self._mark_no_spotlight(getattr(item, "_build_temp", None))
         # AMPR/APR: inject the emu .sprx + build ampr_emu.index on the resolved game folder
         # (post-extraction for archives) before packing, so they ride into the .ffpfsc.
-        if getattr(item, "ampr_emu", False):
+        # PACK ONLY: an fPKG is installed natively, the ShadowMount PlayGo emu has no
+        # business inside the package.
+        if getattr(item, "ampr_emu", False) and getattr(item, "operation", "pack") == "pack":
             self._prepare_ampr(item)
         try:
             cmd, cwd, out_dir, temp_dir = self.build_command(item)
@@ -9250,10 +10182,11 @@ class App:
                 if status == "ok":
                     item = payload
                     self.queue.append(item)
-                    self.update_queue_box(select_item=item)
+                    self.update_queue_box(select_item=item)   # applies the remembered format (may make it an fPKG job)
                     self.status_update("Ready", f"{item.title_id} added to queue.",
                                         "Ready", 0, 0, "00:00", "—", "—")
-                    self.log("OK", f"Added {item.title_id} | {item.name} | {format_size(item.size)}")
+                    _as = "  → fPKG (.pkg)" if getattr(item, "operation", "pack") == "fpkg-build" else ""
+                    self.log("OK", f"Added {item.title_id} | {item.name} | {format_size(item.size)}{_as}")
                     if self.pending_start:
                         self.pending_start = False
                         self.start()
@@ -9405,6 +10338,7 @@ class App:
 
                 elif status == "cancelled":
                     self.pending_start = False
+                    self._pending_fpkg_identity = None
                     self._batch_running = False
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
@@ -9412,6 +10346,7 @@ class App:
 
                 else:  # "error"
                     self.pending_start = False
+                    self._pending_fpkg_identity = None   # the item it was meant for never landed
                     messagebox.showerror("Scan failed", str(payload))
         except queue.Empty:
             pass
@@ -9515,6 +10450,14 @@ class App:
                     item, extra_items = payload
                 else:
                     item, extra_items = payload, []
+                if extra_items and getattr(item, "operation", "pack") == "fpkg-build":
+                    # A multi-game archive queued as an fPKG job: every extra game becomes an
+                    # fPKG job with the same COMPRESSION settings only — identity is per game
+                    # and comes from each game's param.json at build time. Main thread here.
+                    _tpl = self._fpkg_compression_of(item)
+                    for extra in extra_items:
+                        self._as_fpkg_job(extra, _tpl)
+                        extra.output_path = getattr(item, "output_path", None)
                 if extra_items:
                     try:
                         idx = self.queue.index(item)
@@ -9593,7 +10536,7 @@ class App:
                 completed_operation = getattr(completed_item, "operation", "pack") if completed_item else "pack"
                 # History applies only to jobs that PRODUCE a .ffpfsc (pack, patch).
                 # Unpack and fake-sign create no packed game → skip them.
-                if completed_operation not in ("unpack", "fake-sign"):
+                if completed_operation not in ("unpack", "fake-sign", "fpkg-extract"):
                     # Record history HERE (main thread) — add_history mutates Tk widgets.
                     try:
                         _w = self.worker

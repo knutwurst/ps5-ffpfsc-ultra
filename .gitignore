@@ -1,0 +1,32 @@
+# Build output
+/build/
+/dist/
+
+# Native UnRAR extension build artifacts (rebuilt from _unrar.cpp + src/)
+backend/unrar/build/
+backend/unrar/*.egg-info/
+*.so
+*.pyd
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv*/
+*venv/
+
+# App-generated / runtime
+/outputs/
+
+# Third-party release drops used to build the fPKG tool (not part of the program)
+/unzipped/
+
+# fPKG tool build inputs/outputs (the DLLs come from the a53-fpkg release, see the README there)
+backend/native/src/ffpfsc-pkg-tool/lib/
+backend/native/src/ffpfsc-pkg-tool/bin/
+backend/native/src/ffpfsc-pkg-tool/obj/
+backend/native/src/ffpfsc-pkg-tool/out/
+
+# macOS
+.DS_Store

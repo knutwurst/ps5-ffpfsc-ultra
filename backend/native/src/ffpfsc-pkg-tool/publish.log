@@ -1,6 +1,0 @@
-  Wiederherzustellende Projekte werden ermittelt...
-  Alle Projekte sind für die Wiederherstellung auf dem neuesten Stand.
-/Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/Program.cs(544,34): warning CA2022: Ungenaues Lesen mit „System.IO.FileStream.Read(byte[], int, int)“ vermeiden (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2022) [/Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/PkgTool.csproj]
-/Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/Program.cs(651,82): warning CA2022: Ungenaues Lesen mit „System.IO.FileStream.Read(byte[], int, int)“ vermeiden (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2022) [/Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/PkgTool.csproj]
-  PkgTool -> /Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/bin/Release/net9.0/osx-arm64/ffpfsc-pkg-tool.dll
-  PkgTool -> /Users/OKoester/IDEAProjects/ps5-ffpfsc-pro/backend/native/src/ffpfsc-pkg-tool/out/

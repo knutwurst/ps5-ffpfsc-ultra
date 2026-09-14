@@ -1,0 +1,13 @@
+ffpfsc-pkg-tool bundles the following third-party components, unmodified:
+
+  LibProsperoPkg (net9.0)                       — GPL-3.0-or-later
+      (c) SvenGDK / drakmor, sourced from the a53-fpkg 0.5 release
+      (file: LibProsperoPkg.dll, v1.2.0)
+
+  BCnEncoder.NET                                — MIT
+  CommunityToolkit.HighPerformance              — MIT
+
+Because the packaged runtime includes GPL-3-licensed code (LibProsperoPkg),
+ffpfsc-pkg-tool as distributed is a GPL-3-or-later work. The rest of
+ps5-ffpfsc-ultra is unchanged; the GPL scope covers this native binary only.
+The wrapper's own source lives in backend/native/src/ffpfsc-pkg-tool/.

@@ -745,6 +745,82 @@ def _strip_junk_files(root: Path) -> int:
     return removed
 
 
+# ── fPKG identity ────────────────────────────────────────────────────────────
+_FPKG_CID_RE = re.compile(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$")
+_FPKG_TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
+_FPKG_VER_RE = re.compile(r"^\d{2}\.\d{2,3}(\.\d{3})?$")
+
+
+def _fpkg_param_title(d: dict) -> str:
+    """The display title from a param.json dict (Sony layout: localizedParameters →
+    defaultLanguage block → titleName; any language as fallback; legacy top-level)."""
+    try:
+        lp = d.get("localizedParameters") or {}
+        if isinstance(lp, dict):
+            lang = lp.get("defaultLanguage")
+            block = lp.get(lang) if isinstance(lang, str) else None
+            if isinstance(block, dict) and block.get("titleName"):
+                return str(block["titleName"])
+            for v in lp.values():
+                if isinstance(v, dict) and v.get("titleName"):
+                    return str(v["titleName"])
+        return str(d.get("titleName") or "")
+    except Exception:
+        return ""
+
+
+def _resolve_fpkg_identity(build_src: Path, args) -> dict:
+    """Decide the identity an fPKG build is stamped with.
+
+    sce_sys/param.json is the source of truth. The console checks that the package
+    header agrees with it, and so does the validate checklist — so a value the GUI
+    passed (a placeholder guessed from a file name, a stale field) must never win over
+    what the game itself declares. --content-id / --title-id / --fpkg-version /
+    --fpkg-title are fallbacks for fields param.json lacks, and the whole identity for a
+    source without a param.json (the builder then generates one from them).
+
+    Returns {"content_id", "title_id", "version", "title", "source"} where source names
+    where the content id came from ('param.json' or 'arguments'). Fields may be empty —
+    the caller decides whether that is fatal."""
+    pj = Path(build_src) / "sce_sys" / "param.json"
+    d: dict = {}
+    if pj.is_file():
+        try:
+            loaded = json.loads(pj.read_text(encoding="utf-8-sig", errors="replace"))
+            d = loaded if isinstance(loaded, dict) else {}
+        except Exception as e:
+            print(f"[WARN] Could not read {pj}: {e} — using the passed identity.", flush=True)
+
+    def _pick(label: str, passed: str | None, from_pj: str, valid) -> tuple[str, str]:
+        passed = (passed or "").strip()
+        from_pj = (from_pj or "").strip()
+        if from_pj and valid(from_pj):
+            if passed and passed != from_pj:
+                print(f"[WARN] {label} {passed!r} differs from param.json {from_pj!r} — using param.json "
+                      f"(the console checks that the header and param.json agree).", flush=True)
+            return from_pj, "param.json"
+        if from_pj:
+            print(f"[WARN] param.json {label} {from_pj!r} is malformed — using the passed value.", flush=True)
+        return passed, "arguments"
+
+    cid, cid_src = _pick("content id", args.content_id,
+                         str(d.get("contentId") or "").upper(), _FPKG_CID_RE.match)
+    tid, _ = _pick("title id", args.title_id,
+                   str(d.get("titleId") or "").upper(), _FPKG_TID_RE.match)
+    # The argparse default is indistinguishable from an explicit "01.000.000"; treat the
+    # default as "not passed" so it never triggers a mismatch warning.
+    passed_ver = args.fpkg_version if args.fpkg_version != "01.000.000" else ""
+    ver, _ = _pick("version", passed_ver,
+                   str(d.get("contentVersion") or d.get("masterVersion") or ""), _FPKG_VER_RE.match)
+    title = _fpkg_param_title(d) or (args.fpkg_title or "")
+    if cid and not tid:
+        tid = cid[7:16]          # UP9000-PPSA99099_00-… → PPSA99099
+    if cid and tid and tid not in cid:
+        print(f"[WARN] title id {tid} does not appear inside the content id {cid}.", flush=True)
+    return {"content_id": cid, "title_id": tid, "version": ver or "01.000.000",
+            "title": title, "source": cid_src}
+
+
 # Loose scene-metadata file extensions (never game data). These, plus any top-level
 # entry whose name starts with '_', are treated as NON-GAME and pulled out of the dump
 # by _evacuate_non_game_extras so they don't enter the image — but PRESERVED next to the
@@ -1213,6 +1289,52 @@ def main() -> None:
                         help="FAKE-SIGN MODE: recursively fake-sign every executable "
                              "(eboot.bin/.elf/.prx/.sprx) under DIR in place, then exit. "
                              "Already-signed files are skipped (idempotent). No pack/unpack.")
+    parser.add_argument("--fpkg-extract", type=str, default=None, metavar="PKG",
+                        help="fPKG MODE: extract the /app0 inner files from a finalized "
+                             "PS5 fake package (.pkg) into OUTPUT (a folder). No mkpfs "
+                             "pipeline runs; requires the bundled ffpfsc-pkg-tool.")
+    parser.add_argument("--fpkg-build", type=str, default=None, metavar="SRC",
+                        help="fPKG MODE: build a debug PS5 fake package (.pkg) into OUTPUT "
+                             "(a folder). SRC is a prepared /app0 folder OR a packed image "
+                             "(.ffpfsc/.ffpfs/.exfat/.ffpkg — unwrapped to --temp-dir first, "
+                             "the one-click image→fPKG conversion). Uses drakmor's "
+                             "LibProsperoPkg 1.2.0. The identity comes from the source's "
+                             "sce_sys/param.json; --content-id/--title-id/--fpkg-version/"
+                             "--fpkg-title only fill what it lacks. --compression-level sets "
+                             "the Kraken/zlib level, --temp-dir the staging drive.")
+    parser.add_argument("--content-id", type=str, default=None,
+                        help="fPKG build: 36-char content id (e.g. UP9000-PPSA00000_00-...). "
+                             "Fallback only — sce_sys/param.json wins when it has one.")
+    parser.add_argument("--title-id", type=str, default=None,
+                        help="fPKG build: 9-char title id (e.g. PPSA00000). Fallback only.")
+    parser.add_argument("--fpkg-title", type=str, default="",
+                        help="fPKG build: human-readable title used when generating param.json. Fallback only.")
+    parser.add_argument("--fpkg-version", type=str, default="01.000.000",
+                        help="fPKG build: content version NN.NNN.NNN (default 01.000.000). Fallback only.")
+    parser.add_argument("--fpkg-passcode", type=str, default="0"*32,
+                        help="fPKG build/extract: 32-char passcode (default 32 zeroes).")
+    parser.add_argument("--fpkg-inner", type=str, default="none",
+                        choices=("none", "zlib", "kraken"),
+                        help="fPKG build: extra codec layer over the whole inner image (every "
+                             "file is Kraken-packed regardless): 'none' (no extra layer, default), "
+                             "'zlib' (legacy PFSC layer), 'kraken' (block-level Kraken layer).")
+    parser.add_argument("--fpkg-kraken-backend", type=str, default="builtin",
+                        choices=("automatic", "builtin", "publishingtools", "uncompressed"),
+                        help="fPKG build: Kraken encoder policy. Default 'builtin' (pure "
+                             "managed, no external DLL). 'publishingtools' requires the "
+                             "leaked Sony libScePubTools.dll and produces validated output.")
+    parser.add_argument("--fpkg-deterministic", action="store_true",
+                        help="fPKG build: produce byte-reproducible output (fixed seeds "
+                             "and RSA wrapping; the timestamp still comes from --fpkg-version).")
+    parser.add_argument("--fpkg-pubtools-dll", type=str, default=None,
+                        help="fPKG build: path to Sony libScePubTools.dll for the "
+                             "'publishingtools' backend. Overrides the LIBPROSPERO_PUBTOOLS_DLL "
+                             "env variable.")
+    parser.add_argument("--fpkg-validate", type=str, default=None, metavar="PKG",
+                        help="fPKG MODE: run a diagnostic checklist against PKG (magic, "
+                             "header fields, CNT signature wrap, required sce_sys entries, "
+                             "param.json coherence, eboot fake-self magic). Exits with a "
+                             "non-zero status if any check fails.")
     parser.add_argument("--fake-sign-first", action="store_true",
                         help="Before packing a game FOLDER, fake-sign its executables in "
                              "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
@@ -1276,6 +1398,216 @@ def main() -> None:
             sys.exit(1)
         print(f"\n[SUCCESS] Fake-signed {counts.get('signed', 0)} file(s); "
               f"skipped {counts.get('skipped', 0)} non-ELF.", flush=True)
+        return
+
+    # ── fPKG MODE (extract / build / validate via bundled ffpfsc-pkg-tool) ──────
+    if args.fpkg_extract or args.fpkg_build or args.fpkg_validate:
+        try:
+            import fpkg as _fpkg
+        except Exception as e:
+            print(f"[ERROR] fPKG support unavailable ({e}). Rebuild with backend/fpkg.py.", flush=True)
+            sys.exit(1)
+        if not _fpkg.is_available():
+            print("[ERROR] Bundled ffpfsc-pkg-tool binary was not found in backend/native/. "
+                  "Rebuild the app (see README).", flush=True)
+            sys.exit(1)
+        out_dir = Path(args.output).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Scratch for the fPKG builder (inner image, CNT, outer image staging) — the app's
+        # fast temp drive when given, else the system temp. Never the source folder.
+        fpkg_temp = Path(args.temp_dir).resolve() if args.temp_dir else Path(tempfile.gettempdir())
+        fpkg_temp.mkdir(parents=True, exist_ok=True)
+
+        # GUI progress translation. The native tool prints LibProsperoPkg's own log
+        # ("[+00:00:01.234] [stage 3/5] ...", "[inner] data  42% (5/6): ...",
+        # "[finalize] ...: 60% (18 / 29 blocks)"). The GUI's stage tracker understands
+        # "[PHASE] <Stage>" markers and "[####----] NN% <label>" bars, so each tool line is
+        # echoed verbatim AND, where it carries progress, mirrored into those two forms.
+        _fpkg_phase = {"cur": None}
+        _STAGE_PHASE = {1: "Creating Temp PFS", 2: "Compressing", 3: "Compressing",
+                        4: "Writing Final Image", 5: "Writing Final Image"}
+
+        def _bar(pct: int, label: str) -> None:
+            pct = max(0, min(100, int(pct)))
+            filled = pct // 5
+            print(f"[{'#' * filled}{'-' * (20 - filled)}] {pct}% {label}", flush=True)
+
+        def _set_phase(name: str) -> None:
+            if _fpkg_phase["cur"] != name:
+                _fpkg_phase["cur"] = name
+                _phase(name)
+
+        def _gui_line(line: str) -> None:
+            print(line, flush=True)
+            low = line.lower()
+            if "source scan:" in low:
+                _set_phase("Scanning Files"); _bar(100, "source scan"); return
+            if "[inner] preparing" in low or "prepared inner tree" in low or "planning nwonly inner image" in low:
+                _set_phase("Reading Game"); _bar(100 if "prepared" in low else 50, "inner files prepared"); return
+            if "writing afid-ordered inner data" in low:
+                _set_phase("Creating Temp PFS"); _bar(0, "inner image (Kraken) — pfs_image.dat"); return
+            m = re.search(r"\[stage (\d)/5\]", line)
+            if m:
+                st = int(m.group(1))
+                if st == 1:
+                    # stage 1 opens with file preparation (Reading Game) and closes with
+                    # "Inner image complete" (Creating Temp PFS at 100 %) — no back-jump.
+                    if "complete" in low:
+                        _set_phase("Creating Temp PFS"); _bar(100, "inner image (Kraken) — pfs_image.dat")
+                    else:
+                        _set_phase("Reading Game")
+                    return
+                _set_phase(_STAGE_PHASE.get(st, _fpkg_phase["cur"] or "Compressing"))
+            m = re.search(r"\bdata\s+(\d+)%\s*\(", line)
+            if m and _fpkg_phase["cur"] == "Creating Temp PFS":
+                _bar(int(m.group(1)), "inner image (Kraken) — pfs_image.dat"); return
+            m = re.search(r":\s*(\d+)%\s*\((\d+) / (\d+) blocks\)", line)
+            if m:
+                lbl = "finalize (FIH digests)" if "[finalize]" in low else "outer PFS AES-XTS"
+                _bar(int(m.group(1)), lbl); return
+            if "outer pfs complete" in low:
+                _bar(100, "outer PFS AES-XTS"); return
+            if "build finished" in low:
+                _set_phase("Writing Final Image"); _bar(100, "finalized .pkg written"); return
+            if line.startswith("[INFO] Auto-validating"):
+                _set_phase("Verifying Output"); _bar(0, "validate checklist"); return
+            if low.startswith("summary:") and "failed" in low:
+                _bar(100, "validate checklist"); return
+
+        if args.fpkg_extract:
+            src = Path(args.fpkg_extract).resolve()
+            if not src.is_file():
+                print(f"[ERROR] fPKG not found: {src}", flush=True); sys.exit(1)
+            print(f"[INFO] fPKG extract: {src.name} -> {out_dir}", flush=True)
+            _phase("Extracting")
+            _bar(0, "extract inner PFS + CNT metadata")
+            rc = _fpkg.extract(src, out_dir, passcode=args.fpkg_passcode,
+                               on_line=lambda l: print(l, flush=True))
+            if rc != 0:
+                print(f"\n[ERROR] fPKG extract failed (rc={rc}).", flush=True); sys.exit(1)
+            _bar(100, "extract inner PFS + CNT metadata")
+            print(f"[OK] Extraction complete: {out_dir}", flush=True)
+            print("\n[SUCCESS] fPKG extracted.", flush=True)
+            return
+
+        if args.fpkg_build:
+            src = Path(args.fpkg_build).resolve()
+            if not src.exists():
+                print(f"[ERROR] fPKG source not found: {src}", flush=True); sys.exit(1)
+
+            # Source may be a packed image (.ffpfsc/.ffpfs/.exfat/.ffpkg): unwrap it to a
+            # scratch folder first — the ONE-CLICK ".ffpfsc → fPKG" conversion. The scratch
+            # lives on the fPKG temp drive and is removed after the build.
+            staged = None
+            if src.is_file() and src.suffix.lower() in _PFS_IMAGE_SUFFIXES | {".exfat", ".ffpkg"}:
+                _phase("Extracting")
+                staged = Path(tempfile.mkdtemp(prefix="tmp", dir=str(fpkg_temp)))
+                print(f"[INFO] Unwrapping {src.name} -> {staged} before building the fPKG...", flush=True)
+                try:
+                    if src.suffix.lower() in (".exfat", ".ffpkg"):
+                        if not _extract_exfat_to(src, staged):
+                            print("[ERROR] Could not read the exFAT/UFS image on this platform.", flush=True)
+                            sys.exit(1)
+                    else:
+                        mk_cmd, mk_cwd = _locate_mkpfs()
+                        unpack_pfs_image(src, staged, mk_cmd, mk_cwd, overwrite=True)
+                        _fully_unwrap(staged, mk_cmd, mk_cwd)
+                    _strip_junk_files(staged)
+                except SystemExit:
+                    shutil.rmtree(staged, ignore_errors=True); raise
+                except Exception as e:
+                    shutil.rmtree(staged, ignore_errors=True)
+                    print(f"[ERROR] Unwrapping the image failed: {e}", flush=True); sys.exit(1)
+                # A nested game root (e.g. image contains one "PPSA12345" folder) → descend.
+                try:
+                    kids = [k for k in staged.iterdir() if k.is_dir() and not k.name.startswith(".")]
+                    if not (staged / "sce_sys").is_dir() and len(kids) == 1 and (kids[0] / "sce_sys").is_dir():
+                        print(f"[INFO] Game root is {kids[0].name}/ inside the image.", flush=True)
+                        build_src = kids[0]
+                    else:
+                        build_src = staged
+                except Exception:
+                    build_src = staged
+            elif src.is_dir():
+                build_src = src
+            else:
+                print(f"[ERROR] fPKG source must be a game folder or a .ffpfsc/.ffpfs/.exfat/.ffpkg image: {src}",
+                      flush=True); sys.exit(1)
+
+            # Identity: the game's own sce_sys/param.json decides; the passed values only
+            # fill what it lacks. This is what lets ANY source (folder, archive, image)
+            # become a .pkg without the GUI knowing the content id up front.
+            try:
+                ident = _resolve_fpkg_identity(build_src, args)
+            except Exception as e:
+                if staged is not None:
+                    shutil.rmtree(staged, ignore_errors=True)
+                print(f"[ERROR] Could not resolve the fPKG identity: {e}", flush=True); sys.exit(1)
+            _cid, _tid = ident["content_id"], ident["title_id"]
+            _ident_err = None
+            if not _cid or not _tid:
+                _ident_err = ("fPKG build needs a content id and a title id — none found in "
+                              "sce_sys/param.json and none passed (--content-id / --title-id).")
+            elif not _FPKG_CID_RE.match(_cid):
+                _ident_err = (f"Content ID {_cid!r} must look like UP9000-PPSA12345_00-GAMENAME00000000 "
+                              "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case alphanumerics).")
+            elif not _FPKG_TID_RE.match(_tid):
+                _ident_err = f"Title ID {_tid!r} must look like PPSA12345 (4 letters + 5 digits)."
+            if _ident_err:
+                if staged is not None:
+                    shutil.rmtree(staged, ignore_errors=True)
+                print(f"[ERROR] {_ident_err}", flush=True); sys.exit(1)
+            print(f"[INFO] fPKG identity: {_cid}  title id {_tid}  version {ident['version']}"
+                  f"  title {ident['title']!r}   (from {ident['source']})", flush=True)
+
+            print(f"[INFO] fPKG build ({args.fpkg_inner}, {args.fpkg_kraken_backend}, level {args.compression_level}): "
+                  f"{build_src} -> {out_dir}   [temp: {fpkg_temp}]", flush=True)
+            _set_phase("Scanning Files")
+            try:
+                rc = _fpkg.build(build_src, out_dir,
+                                 content_id=_cid,
+                                 title_id=_tid,
+                                 title=ident["title"],
+                                 version=ident["version"],
+                                 passcode=args.fpkg_passcode,
+                                 inner_mode=args.fpkg_inner,
+                                 kraken_backend=args.fpkg_kraken_backend,
+                                 publishing_tools_dll=args.fpkg_pubtools_dll,
+                                 deterministic=bool(args.fpkg_deterministic),
+                                 temp_dir=str(fpkg_temp),
+                                 level=int(args.compression_level),
+                                 on_line=_gui_line)
+            finally:
+                if staged is not None:
+                    shutil.rmtree(staged, ignore_errors=True)
+                    print(f"[INFO] Removed unwrap scratch {staged}", flush=True)
+            if rc != 0:
+                print(f"\n[ERROR] fPKG build failed (rc={rc}).", flush=True); sys.exit(1)
+            print("\n[SUCCESS] fPKG built.", flush=True)
+            built = sorted(out_dir.glob("*.pkg"), key=lambda x: x.stat().st_mtime)
+            if built:
+                print(f"[OK] fPKG complete: {built[-1]}", flush=True)
+            # Run the diagnostic checklist so a bad build is visible right in the log
+            # (not only after a console-install failure).
+            try:
+                if built:
+                    print(f"\n[INFO] Auto-validating: {built[-1].name}", flush=True)
+                    _set_phase("Verifying Output")
+                    _fpkg.validate(built[-1], on_line=_gui_line)
+            except Exception as ve:
+                print(f"[warn] Auto-validate skipped: {ve}", flush=True)
+            return
+
+    # fpkg-validate (a diagnostic — no build/extract)
+    if args.fpkg_validate:
+        src = Path(args.fpkg_validate).resolve()
+        if not src.is_file():
+            print(f"[ERROR] fPKG not found: {src}", flush=True); sys.exit(1)
+        print(f"[INFO] fPKG validate: {src}", flush=True)
+        rc = _fpkg.validate(src, on_line=lambda l: print(l, flush=True))
+        if rc != 0:
+            print(f"\n[FAIL] validation reported failures (rc={rc}).", flush=True); sys.exit(rc)
+        print("\n[SUCCESS] validation OK.", flush=True)
         return
 
     # ── PS5 console compatibility: force a 64 KiB PFS block size ─────────────────

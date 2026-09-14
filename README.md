@@ -52,23 +52,27 @@ A plain packer asks you to prepare a clean folder, then writes a single image to
 - A disk image: `.exfat` or `.ffpkg`.
 - An existing `.ffpfs`, re-wrapped into its compressed `.ffpfsc`.
 - An archive: ZIP, RAR, or 7z. It extracts the archive, finds the game inside, and packs that. Multi-part RAR sets collapse to one job. A 7z extracts through the native `7z` / `7zz` CLI when present (3-10x faster), and falls back to pure-Python `py7zr` otherwise.
+- A finalized PS5 fake package (`.pkg`) — drop it in, or use the **📥 fPKG⇢** job, and the app pulls the whole `/app0` tree out (inner PFS + `sce_sys/param.json`, `icon0.png`, PlayGo files from the CNT container) into a folder you can then pack, patch, or turn back into a `.pkg` with the Pack job's `.pkg` format.
 
 Saved archive passwords are tried automatically, so a recurring scene password is never retyped. When no saved password unlocks an archive's header, the app asks once at add time and remembers the answer, which also lets the router size the job correctly up front.
 
 ## What it produces
 
 - `.ffpfsc`, the compressed container, or `.ffpfs`, the uncompressed image (faster to mount, full size). The format is a per-job switch.
+- `.pkg`, an installable PS5 debug fake package, built with the bundled `ffpfsc-pkg-tool` (a self-contained .NET 9 build of drakmor's LibProsperoPkg 1.2.0, GPL-3). Pick it as the **Format** in the Pack job — any source works (game folder, parent folder, scene archive, disk image, `.ffpfs`, `.ffpfsc`), and the identity (content id, title id, version, title) is read from the game's own `sce_sys/param.json` when the job runs, whatever the source was. Every fPKG packs each file with Kraken — that is the native package layout. On top of that you choose the codec layer over the whole inner image (`none`, the default; `zlib`, the legacy PFSC layer; `kraken`, a block-level Kraken layer), the Kraken backend (`builtin`, managed, no external DLL; or `publishingtools`, opt-in, your own Sony `libScePubTools.dll`), and the Kraken speed — `normal` or `fast` (the encoder has exactly these two regimes; a 0–9 level would be a placebo). Nothing from the tuning bar applies to fPKG builds (single worker by design, format-fixed blocks); the temp drive does. Console-installability of a Mac-built package is the last step you verify yourself on a jailbroken PS5 (kstuff-fpkg / etaHEN install path); the log's validate checklist tells you which invariant failed if the console refuses it.
 - A filename built from the game's real title in `param.json`: `Game Name [PPSA12345] [01.004].ffpfsc`. Names that would break ShadowMountPlus's length limit are shortened on a byte budget, dropping edition fluff ("Remastered", "Complete Edition") before truncating.
 - For a release folder, the folder layout is recreated at the destination with the DLCs and extras sitting next to the finished container.
 
 ## The job queue
 
-Add work through four buttons and run it in one pass:
+Add work through six buttons and run it in one pass:
 
 - **Pack** a folder, image, `.ffpfs`, or archive into a `.ffpfsc` / `.ffpfs`.
 - **Convert** an existing image: decompress a `.ffpfsc` to its inner `.ffpfs`, or unpack either to a folder.
 - **Patch** a game by overlaying a patch (folder or archive) and repacking, into a new copy or over the original.
 - **Sign** a folder's executables (fake-sign) so they boot on a jailbroken console.
+- **📥 fPKG⇢** extract a finalized PS5 `.pkg` into a `/app0`-style folder (inner PFS + CNT metadata merged).
+- **📦 Pack → `.pkg`** build an installable debug `.pkg` from any pack source — a game folder, a scene archive, a `.ffpfsc` / `.ffpfs` / `.exfat` / `.ffpkg` image (unwrapped on the temp drive first; also reachable as the "Build fPKG" step in Convert). The identity comes from the game's `param.json` when the job runs; the dialog's identity fields are fallbacks for a folder that has none. Codec layer `none` / `zlib` / `kraken`, Kraken speed `normal` / `fast`; Kraken backend built-in or, opt-in, your own Sony `libScePubTools.dll` (Settings → Folders). Every build ends with a 17-point validate checklist in the log.
 
 Each job carries its own source, output folder, and format. Double-click a queued row to edit it. A failed or cancelled job stays in the queue marked as such, so the rest of the batch keeps running and a later Start retries it. The status panel shows the active phase, per-file detail, speed, ETA, compression ratio, temp usage, and CPU/RAM, with a live log alongside.
 

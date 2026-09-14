@@ -55,6 +55,7 @@ a = Analysis(
         "mkpfs.game_metadata",
         "make_fself",
         "fake_sign",
+        "fpkg",   # new fPKG build/extract wrapper (invokes backend/native/ffpfsc-pkg-tool)
         "argparse",
         "contextlib",
         "dataclasses",

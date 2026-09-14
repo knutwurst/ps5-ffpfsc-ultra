@@ -3,7 +3,30 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.1  (current)
+  v1.1.2  (current)
+────────────────────────────────────────────────────────────────────────
+
+THE .pkg FORMAT IS ONE LINE NOW
+
+  • The defaults are the best values there are (identity from the game's
+    param.json, no extra codec layer, normal Kraken speed — all measured
+    in 1.1.1), so the Pack dialog no longer presents them as decisions.
+    Picking .pkg shows one summary line — "fPKG: identity from param.json
+    (PPSA…) · codec layer none · Kraken normal" — plus an "Edit…" button.
+    The identity and compression rows appear only on Edit…, or when they
+    are needed: a game folder without sce_sys/param.json opens the
+    identity rows by itself and marks them REQUIRED; an invalid entry
+    opens them so the message points at a visible field. Switching the
+    source to one with a param.json closes them again.
+  • The Kraken backend row is shown only when a Publishing Tools DLL is
+    configured in Settings — without one it did nothing (macOS falls back
+    to the built-in encoder anyway).
+  • The window sizes itself to its content (≈520 px compact, ≈820 px with
+    everything open, 440 px for .ffpfsc/.ffpfs); texts trimmed to what
+    matters. GUI driver: 49 → 59 checks.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.1
 ────────────────────────────────────────────────────────────────────────
 
 fPKG IS THE PACK DIALOG'S THIRD FORMAT — ANY SOURCE → .pkg

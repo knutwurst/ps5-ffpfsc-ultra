@@ -10,9 +10,27 @@ _m = _re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
 APP_VERSION = _m.group(1) if _m else "1.0"
 
 
-datas = [
-    ("backend", "backend"),
-]
+import os as _os
+
+
+def _backend_datas():
+    """backend/ as data files — minus what is not runtime material: the fPKG tool's
+    SOURCE folder with its .NET build inputs/outputs (lib/ bin/ obj/ out/ — ~160 MB that
+    once inflated the bundle from 99 to 263 MB) and Python bytecode caches."""
+    out = []
+    src_tree = _os.path.join("backend", "native", "src")
+    for root, dirs, files in _os.walk("backend"):
+        if root == src_tree or root.startswith(src_tree + _os.sep) or "__pycache__" in root.split(_os.sep):
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.endswith((".pyc", ".pyo")) or f == ".DS_Store":
+                continue
+            out.append((_os.path.join(root, f), root))
+    return out
+
+
+datas = _backend_datas()
 datas += collect_data_files("customtkinter")
 datas += collect_data_files("tkinterdnd2")
 cryptography_datas, cryptography_binaries, cryptography_hiddenimports = collect_all("cryptography")

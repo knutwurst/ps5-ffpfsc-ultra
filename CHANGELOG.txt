@@ -3,7 +3,56 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.3  (current)
+  v1.1.4  (current)
+────────────────────────────────────────────────────────────────────────
+
+AUTO-ORGANIZE — THROW ANYTHING IN, GET A LIBRARY OUT
+
+  • New switch in the Pack dialog (remembered, per job, default ON, also
+    applied to dropped / browsed sources): "Auto-organize". Every pack and
+    fPKG job then lands as
+        <Output>/<Title> [TITLEID] [vXX.YYY.ZZZ]/<Title> [TITLEID] [vXX.YYY].ffpfsc
+    (or .pkg), named from the GAME's own sce_sys/param.json — whatever the
+    archive, folder or image was called. Folder = full version, file =
+    short version, both with the 'v'; ™®© are dropped and "A: B" becomes
+    "A - B". Bundle extras (DLC archives, unlockers, nfo) are copied into
+    that folder as before. The ShadowMount 63-byte cap still applies to the
+    file name (edition suffix trimmed first, tags always kept).
+      - folder source: param.json read directly;
+      - archive: read after extraction, right before packing;
+      - .ffpfs/.ffpfsc: the single member sce_sys/param.json is pulled via the
+        browse path (MkPFS's generic metadata reader cannot follow our nested
+        image layout — it reported "missing exFAT signature");
+      - .exfat/.ffpkg: MkPFS's exFAT metadata reader;
+      - nothing readable → today's naming, one WARN in the log.
+    fPKG: the tool still writes '<content-id>-A…-V….pkg'; the worker renames
+    it to the library name right after the build (assumption, not yet
+    verified on a console: installers read the header, not the file name).
+
+  • BUNDLE OUTPUT NEVER LANDS INSIDE THE SOURCE FOLDER ANY MORE
+    A folder holding one archive mirrored its own name at the destination —
+    and when the destination was the folder's parent, that "mirror" WAS the
+    source folder, so the .ffpfsc / .pkg ended up next to the archive, named
+    after the folder ("convert [PPSA26525] [01.003].ffpfsc"). With
+    auto-organize off, such a job now writes to the chosen output folder;
+    mirroring elsewhere (a library drive) is unchanged.
+
+  • AMPR: GAMES THAT SHIP THEIR OWN EMU FILES ARE RECOGNISED
+    A PlayGo release that already carries fakelib/libSceAmpr.sprx +
+    libScePlayGo.sprx (and usually ampr_emu.index) no longer triggers the
+    "AMPR emu folder not set" prompt: nothing is asked, nothing injected;
+    a shipped index is kept as-is (it belongs to those .sprx), a missing
+    one is built. Only one of the two shipped → the emu folder supplies the
+    other. Fake-sign-before-pack is skipped (WARN) for a DIRECT folder that
+    ships an index — signing would make it stale, and we never rewrite your
+    library.
+
+  • GUI driver: 74 checks (auto-organize names for folder / image / fPKG,
+    pkg rename, title cleanup, mirror guard, dialog checkbox, snapshot,
+    AMPR shipped-files detection).
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.3
 ────────────────────────────────────────────────────────────────────────
 
 PUBLISHING TOOLS BACKEND: WINDOWS ONLY, SAID HONESTLY

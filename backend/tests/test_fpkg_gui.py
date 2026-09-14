@@ -78,7 +78,7 @@ try:
     ok("fpkg-build.size-set", it.size > 0, f"size={it.size}")
     # 1b) a bundle fPKG job mirrors its folder at the destination
     itb = m.GameItem.from_fpkg_build(HBT, output_path=str(OUT), content_id="UP9000-PPSA99099_00-PROSPERO00000000", title_id="PPSA99099")
-    itb.bundle_subfolder = "My Bundle"
+    itb.bundle_subfolder = "My Bundle"; itb.auto_organize = False     # classic bundle mirroring (auto-organize off)
     cmdb, _, outb, _ = app.build_command(itb)
     ok("build_command.fpkg-bundle-subfolder", outb == OUT / "My Bundle" and str(OUT / "My Bundle") in cmdb, str(outb))
     # 2) build_command for fpkg-extract
@@ -242,6 +242,63 @@ try:
     dlg7.destroy()
     # 14) settings var present
     ok("settings.pubtools_var", hasattr(app, "pubtools_dll_var"), "")
+    # 14b) AMPR: a PlayGo game that SHIPS fakelib/*.sprx (+ ampr_emu.index) must not ask for the emu folder
+    APR = S / "apr_game"
+    if APR.exists(): shutil.rmtree(APR)
+    shutil.copytree(HBT, APR); (APR / "sce_sys" / "playgo-chunk.dat").write_bytes(b"\0" * 64)
+    (APR / "fakelib").mkdir(); (APR / "fakelib" / "libSceAmpr.sprx").write_bytes(b"A" * 32); (APR / "fakelib" / "libScePlayGo.sprx").write_bytes(b"P" * 32)
+    (APR / "ampr_emu.index").write_bytes(b"SHIPPED-INDEX")
+    prompts = []
+    app._ensure_ampr_folder = lambda: (prompts.append(1), False)[1]   # a prompt would block the driver
+    _prev_ampr = app.ampr_var.get(); app.ampr_var.set(""); _prev_sign = app.fake_sign_before_pack_var.get(); app.fake_sign_before_pack_var.set(False)
+    ai = m.GameItem(APR)
+    ok("ampr.detected", ai.ampr_emu is True, str(ai.ampr_emu))
+    app._prepare_ampr(ai)
+    ok("ampr.shipped.no-prompt", not prompts and (APR / "ampr_emu.index").read_bytes() == b"SHIPPED-INDEX"
+       and not getattr(ai, "_ampr_injected", None), f"prompts={len(prompts)}")
+    (APR / "ampr_emu.index").unlink(); ai2 = m.GameItem(APR); app._prepare_ampr(ai2)
+    ok("ampr.shipped-sprx.index-built", not prompts and (APR / "ampr_emu.index").is_file() and (APR / "ampr_emu.index").read_bytes()[:8] == b"AMPRIDX3",
+       f"prompts={len(prompts)} exists={(APR / 'ampr_emu.index').is_file()}")
+    shutil.rmtree(APR / "fakelib"); ai3 = m.GameItem(APR); app._prepare_ampr(ai3)
+    ok("ampr.nothing-shipped.prompts", len(prompts) == 1, f"prompts={len(prompts)}")
+    del app._ensure_ampr_folder; app.ampr_var.set(_prev_ampr); app.fake_sign_before_pack_var.set(_prev_sign)
+    # 14c) Auto-organize: names come from the game's own metadata — folder pack, image, fPKG
+    app.auto_organize_var.set(True)
+    gi = m.GameItem(HBT); gi.output_compressed = True; gi.auto_organize = True; gi.output_path = OUT
+    cmdg, _, outg, _ = app.build_command(gi)
+    exp_dir = OUT / "LibProsperoPKG [PPSA99099] [v01.000.000]"
+    outfile = Path(cmdg[cmdg.index(str(HBT)) + 1])
+    ok("organize.pack.folder+file", outg == exp_dir and outfile.parent == exp_dir and outfile.name == "LibProsperoPKG [PPSA99099] [v01.000].ffpfsc", f"{outg} | {outfile.name}")
+    idf = app._game_identity(m.GameItem.from_exfat(FF))
+    ok("organize.identity.from-ffpfsc", bool(idf) and idf.get("title_id") == "PPSA99099" and str(idf.get("version", "")).startswith("01.000") and idf.get("title") == "LibProsperoPKG", str(idf))
+    fi2 = app._fpkg_item_for(FF, dict(app.fpkg_defaults), output_path=str(OUT)); fi2.auto_organize = True
+    cmdf2, _, outf2, _ = app.build_command(fi2)
+    ok("organize.fpkg.folder+name", outf2 == exp_dir and getattr(fi2, "_organized_pkg_name", None) == "LibProsperoPKG [PPSA99099] [v01.000].pkg", f"{outf2} | {getattr(fi2, '_organized_pkg_name', None)}")
+    exp_dir.mkdir(parents=True, exist_ok=True); dummy = exp_dir / "UP9000-PPSA99099_00-PROSPERO00000000-A0100-V0100.pkg"; dummy.write_bytes(b"x")
+    renamed = app._finalize_pkg_name(fi2, dummy)
+    ok("organize.fpkg.renamed", renamed.name == "LibProsperoPKG [PPSA99099] [v01.000].pkg" and renamed.exists() and not dummy.exists(), str(renamed.name))
+    ok("organize.title-cleanup", m.canonical_game_title("DOOM: The Dark Ages™") == "DOOM - The Dark Ages"
+       and m.organized_names({"title": "Alan Wake II Deluxe Edition", "title_id": "PPSA02572", "version": "01.200.007"}, ".ffpfsc")
+       == ("Alan Wake II Deluxe Edition [PPSA02572] [v01.200.007]", "Alan Wake II Deluxe Edition [PPSA02572] [v01.200].ffpfsc"),
+       str(m.organized_names({"title": "Alan Wake II Deluxe Edition", "title_id": "PPSA02572", "version": "01.200.007"}, ".ffpfsc")))
+    # off: a single-archive folder whose parent is the output folder must not mirror into itself; elsewhere it still does
+    conv = OUT / "convert"; conv.mkdir(exist_ok=True); shutil.copy2(ZP, conv / ZP.name)
+    bi2 = m.GameItem.from_bundle(conv, conv / ZP.name, []); bi2.output_compressed = True; bi2.auto_organize = False; bi2.output_path = OUT
+    bi2.path = HBT; bi2.archive_path = None            # as _copy_item_payload leaves it after extraction
+    _, _, outb2, _ = app.build_command(bi2)
+    ok("mirror.not-into-source", outb2 == OUT, str(outb2))
+    bi3 = m.GameItem.from_bundle(conv, conv / ZP.name, []); bi3.output_compressed = True; bi3.auto_organize = False; bi3.output_path = OUT / "lib"
+    bi3.path = HBT; bi3.archive_path = None
+    _, _, outb3, _ = app.build_command(bi3)
+    ok("mirror.elsewhere-kept", outb3 == OUT / "lib" / "convert", str(outb3))
+    # dialog: checkbox present, remembered default, out label reflects it
+    dlg9 = m.PackDialog(app, source=HBT, fmt="ffpfsc"); root.update()
+    ok("dialog.organize.checkbox", hasattr(dlg9, "organize_var") and dlg9.organize_var.get() is True and "auto-organize" in dlg9.out_label.get(), dlg9.out_label.get()[:60])
+    dlg9.destroy()
+    # snapshot: a fresh pack item gets the remembered flag
+    app.auto_organize_var.set(False); si = m.GameItem(HBT); app.queue.append(si); app.update_queue_box()
+    ok("organize.snapshot", si.auto_organize is False, str(getattr(si, "auto_organize", None)))
+    app.queue.remove(si); app.auto_organize_var.set(True)
     # 15) queue save/restore keeps fpkg fields
     app._queue_restored = True; app._save_queue()
     saved = m.load_settings().get("queue") or []

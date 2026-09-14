@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -2100,11 +2100,12 @@ class SettingsWindow(ctk.CTkToplevel):
                       command=_browse_ampr).pack(side="left")
 
         # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
-        ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional):",
+        ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional, Windows only):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="Path to your own libScePubTools.dll (Sony SDK, not bundled). Only used when a "
-                              "Build-fPKG job selects the 'publishingtools' Kraken backend. Leave empty to "
-                              "use the built-in managed Kraken encoder, which needs no external file.",
+        ctk.CTkLabel(ds, text="Path to your own libScePubTools.dll (Sony SDK, not bundled). Only used on Windows "
+                              "when an fPKG job selects the 'publishingtools' Kraken backend — LibProsperoPkg "
+                              "refuses that backend on macOS (the build would fail), so here the built-in "
+                              "managed Kraken encoder is always used.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
                       wraplength=440).pack(anchor="w", padx=14)
         _pt_row = ctk.CTkFrame(ds, fg_color="transparent")
@@ -4443,9 +4444,11 @@ class PackDialog(ctk.CTkToplevel):
         self._adv_shown    = False       # identity + compression rows revealed by "Edit…"
         self._ident_forced = False       # identity rows forced open (game folder without param.json / invalid entry)
         self._height       = self._MIN_HEIGHT
-        # The Publishing Tools backend only does anything with a DLL configured (and even then
-        # not on macOS); without one the row is not shown and 'builtin' is used.
-        self._backend_shown = bool((app.pubtools_dll_var.get() or "").strip())
+        # The Publishing Tools backend needs a configured DLL AND Windows: LibProsperoPkg's
+        # Reduced-Oodle backend refuses any other OS outright ("requires 64-bit Windows" —
+        # verified with the real DLL on this Mac; the build fails, no fallback). So the row
+        # exists only where it can work; everywhere else 'builtin' is used.
+        self._backend_shown = bool((app.pubtools_dll_var.get() or "").strip()) and sys.platform == "win32"
         if not self._backend_shown:
             self.back_var.set("builtin")
 
@@ -4818,12 +4821,14 @@ class PackDialog(ctk.CTkToplevel):
         self._update_summary()
         dll = (self.app.pubtools_dll_var.get() or "").strip()
         if self.back_var.get() == "publishingtools":
-            if dll and Path(dll).is_file():
-                self.back_hint.set(f"Uses your Sony libScePubTools.dll: {dll}  (Windows-only DLL — on macOS the "
-                                   f"library refuses it and falls back to the built-in encoder).")
+            if sys.platform != "win32":
+                self.back_hint.set("⚠ Windows only: LibProsperoPkg's Publishing Tools (Reduced Oodle) backend refuses "
+                                   "to run on this OS — the build fails, it does not fall back. Use builtin.")
+            elif dll and Path(dll).is_file():
+                self.back_hint.set(f"Uses your Sony libScePubTools.dll: {dll}")
             else:
-                self.back_hint.set("⚠ No Publishing Tools DLL set (Settings → Folders). The build will fall back to "
-                                   "the built-in encoder.")
+                self.back_hint.set("⚠ No Publishing Tools DLL set (Settings → Folders) — the build will fail. "
+                                   "Use builtin, or point Settings at your DLL.")
         else:
             self.back_hint.set("Built-in managed Kraken encoder — needs no external file. Console-install is what "
                                "proves the output; the build log ends with a 17-point validate checklist.")
@@ -8427,6 +8432,15 @@ class App:
         except Exception:
             item.fpkg_level = 7
         dll = str(params.get("dll", "") or "").strip()
+        if item.fpkg_kraken_backend == "publishingtools" and sys.platform != "win32":
+            # Cannot work here (LibProsperoPkg: "requires 64-bit Windows", hard failure) —
+            # a restored/old job asking for it is built with the encoder that does work.
+            try:
+                self.log("WARN", f"{getattr(item, 'display_name', None) or item.name}: the Publishing Tools backend "
+                                 f"is Windows-only — building with the built-in Kraken encoder instead.")
+            except Exception:
+                pass
+            item.fpkg_kraken_backend = "builtin"
         if item.fpkg_kraken_backend == "publishingtools" and not dll:
             dll = (self.pubtools_dll_var.get() or "").strip()
         item.fpkg_pubtools_dll = dll if item.fpkg_kraken_backend == "publishingtools" else ""

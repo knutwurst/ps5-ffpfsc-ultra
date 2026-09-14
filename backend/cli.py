@@ -1322,7 +1322,8 @@ def main() -> None:
                         choices=("automatic", "builtin", "publishingtools", "uncompressed"),
                         help="fPKG build: Kraken encoder policy. Default 'builtin' (pure "
                              "managed, no external DLL). 'publishingtools' requires the "
-                             "leaked Sony libScePubTools.dll and produces validated output.")
+                             "leaked Sony libScePubTools.dll AND 64-bit Windows — on any other "
+                             "OS LibProsperoPkg throws and the build fails (no fallback).")
     parser.add_argument("--fpkg-deterministic", action="store_true",
                         help="fPKG build: produce byte-reproducible output (fixed seeds "
                              "and RSA wrapping; the timestamp still comes from --fpkg-version).")

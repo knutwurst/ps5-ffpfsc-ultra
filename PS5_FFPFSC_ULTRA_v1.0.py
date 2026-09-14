@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4133,6 +4133,12 @@ class CLIWorker(threading.Thread):
                     self.final_size = get_folder_size(p)
                     return True
                 if p.exists() and p.is_file() and p.stat().st_size > 0 and p.stat().st_mtime >= self.start_time - 2:
+                    if self.operation == "fpkg-build":
+                        # The backend's "[OK] fPKG complete: <path>" marker lands here — the
+                        # usual path for a build, so the auto-organize rename must happen
+                        # here (the glob fallback below is only reached without the marker).
+                        p = self.app._finalize_pkg_name(self.item, p)
+                        self.output_path = str(p)
                     self.final_size = p.stat().st_size
                     return True
             except OSError:

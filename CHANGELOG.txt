@@ -3,7 +3,19 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.4  (current)
+  v1.1.5  (current)
+────────────────────────────────────────────────────────────────────────
+
+  • FIX: auto-organize did not rename the .pkg. The backend reports
+    "[OK] fPKG complete: <path>", the worker takes that path and its
+    output check returns from that branch — the rename sat in the fallback
+    branch behind it and never ran (the folder placement was right, the
+    file kept the tool's <content-id>-A…-V….pkg name). The rename now
+    happens in the marker branch; a driver check reproduces the real
+    worker path. GUI driver: 75 checks.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.4
 ────────────────────────────────────────────────────────────────────────
 
 AUTO-ORGANIZE — THROW ANYTHING IN, GET A LIBRARY OUT

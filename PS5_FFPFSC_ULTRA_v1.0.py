@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4370,7 +4370,10 @@ class PackDialog(ctk.CTkToplevel):
     # so the UI offers the honest two-way choice instead of a 0-9 slider.
     _SPEED = ("normal", "fast")
     _SPEED_LEVEL = {"normal": 7, "fast": -4}
-    _GEOMETRY = {"pack": "700x440", "pkg": "700x820"}   # measured requested heights: 410 / 796
+    _MIN_HEIGHT = 440          # the window is sized to its content (see _fit); never below this
+    _IDENT_HEAD_FALLBACK = "Package identity  (fallback — the game's sce_sys/param.json decides at build time):"
+    _IDENT_HEAD_REQUIRED = ("Package identity  (REQUIRED — this folder has no sce_sys/param.json; the builder "
+                            "generates one from these fields):")
     _IMAGE_SUFFIXES   = (".ffpfsc", ".ffpfs", ".exfat", ".ffpkg")
     _ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z")
     _IDENT_AUTO = ("Auto — read from the game's sce_sys/param.json at build time. Leave empty; anything "
@@ -4433,8 +4436,18 @@ class PackDialog(ctk.CTkToplevel):
         self.speed_var = tk.StringVar(value="fast" if lvl < 0 else "normal")
         self.back_hint = tk.StringVar()
         self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
+        self.ident_head = tk.StringVar(value=self._IDENT_HEAD_FALLBACK)
+        self.sum_var    = tk.StringVar()
         self._auto_ident: dict = {}      # identity pre-filled from a folder's param.json (dropped when the source changes)
-        self._panel_shown = False
+        self._panel_shown  = False       # the fPKG panel (summary line) is packed
+        self._adv_shown    = False       # identity + compression rows revealed by "Edit…"
+        self._ident_forced = False       # identity rows forced open (game folder without param.json / invalid entry)
+        self._height       = self._MIN_HEIGHT
+        # The Publishing Tools backend only does anything with a DLL configured (and even then
+        # not on macOS); without one the row is not shown and 'builtin' is used.
+        self._backend_shown = bool((app.pubtools_dll_var.get() or "").strip())
+        if not self._backend_shown:
+            self.back_var.set("builtin")
 
         head = "📦  Pack — edit job" if item else "📦  Pack — add job"
         ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
@@ -4486,11 +4499,29 @@ class PackDialog(ctk.CTkToplevel):
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── fPKG block (shown for the .pkg format only; packed before the button row) ──
+        # Compact by default: ONE summary line plus "Edit…". The defaults are the best values
+        # there are (identity from param.json, no extra codec layer, normal Kraken speed —
+        # measured, see CHANGELOG 1.1.1), so the identity and compression rows stay hidden
+        # until asked for — or until they are needed: a game folder without param.json must
+        # have its identity typed, and an invalid entry is shown where it can be fixed.
         self.fpkg_panel = ctk.CTkFrame(self, fg_color="transparent")
-        irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); irow.pack(fill="x", pady=4)
-        ctk.CTkLabel(irow, text="Package identity  (fallback only — the game's sce_sys/param.json decides at build time):",
-                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
-        grid = ctk.CTkFrame(irow, fg_color=PANEL); grid.pack(fill="x", padx=10, pady=(0, 2))
+        srow_sum = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); srow_sum.pack(fill="x", pady=4)
+        sline = ctk.CTkFrame(srow_sum, fg_color=PANEL); sline.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(sline, textvariable=self.sum_var, text_color=WHITE, font=ctk.CTkFont(size=12),
+                      wraplength=500, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
+        self._edit_btn = ctk.CTkButton(sline, text="✎  Edit…", width=92, fg_color=CARD2, hover_color=GREEN2,
+                                       text_color=WHITE, command=self._toggle_advanced)
+        self._edit_btn.pack(side="right", padx=(8, 0))
+        ctk.CTkLabel(srow_sum, text="These defaults give the smallest, most compatible package. Edit only for a game "
+                                    "folder without sce_sys/param.json, or to trade a little size for speed.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        # Identity rows (packed by _layout_fpkg when revealed or required)
+        self.irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
+        ctk.CTkLabel(self.irow, textvariable=self.ident_head, text_color=WHITE, font=ctk.CTkFont(size=11),
+                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(6, 2))
+        grid = ctk.CTkFrame(self.irow, fg_color=PANEL); grid.pack(fill="x", padx=10, pady=(0, 2))
         grid.grid_columnconfigure(1, weight=1); grid.grid_columnconfigure(3, weight=1)
         def _cell(r, c, label, var):
             ctk.CTkLabel(grid, text=label, text_color=MUTED, anchor="w", width=84).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=3)
@@ -4499,40 +4530,42 @@ class PackDialog(ctk.CTkToplevel):
         _cell(0, 2, "Title ID",   self.tid_var)
         _cell(1, 0, "Title",      self.title_var)
         _cell(1, 2, "Version",    self.ver_var)
-        ctk.CTkLabel(irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(self.irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
 
-        crow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); crow.pack(fill="x", pady=4)
-        ctk.CTkLabel(crow, text="Compression  (fPKG-only; independent of the mkpfs tuning bar):",
-                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
-        r1 = ctk.CTkFrame(crow, fg_color=PANEL); r1.pack(fill="x", padx=10, pady=2)
-        ctk.CTkLabel(r1, text="Inner codec:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        # Compression rows (packed by _layout_fpkg when revealed)
+        self.crow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
+        ctk.CTkLabel(self.crow, text="Compression:", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
+        r1 = ctk.CTkFrame(self.crow, fg_color=PANEL); r1.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(r1, text="Codec layer:", text_color=MUTED, width=110, anchor="w").pack(side="left")
         ctk.CTkSegmentedButton(r1, values=list(self._INNER), variable=self.inner_var,
                                 selected_color=GREEN, selected_hover_color=GREEN2,
                                 command=lambda *_: self._refresh_hints()).pack(side="left")
-        ctk.CTkLabel(r1, text="  extra layer over the inner image (none = default)",
+        ctk.CTkLabel(r1, text="  none = default; the extra layer saved nothing in tests",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
-        r2 = ctk.CTkFrame(crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
-        ctk.CTkLabel(r2, text="Kraken backend:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        ctk.CTkSegmentedButton(r2, values=list(self._BACKEND), variable=self.back_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2,
-                                command=lambda *_: self._refresh_hints()).pack(side="left")
-        ctk.CTkLabel(crow, textvariable=self.back_hint, text_color=MUTED,
-                      font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
-        r3 = ctk.CTkFrame(crow, fg_color=PANEL); r3.pack(fill="x", padx=10, pady=(2, 2))
+        if self._backend_shown:
+            r2 = ctk.CTkFrame(self.crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
+            ctk.CTkLabel(r2, text="Kraken backend:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+            ctk.CTkSegmentedButton(r2, values=list(self._BACKEND), variable=self.back_var,
+                                    selected_color=GREEN, selected_hover_color=GREEN2,
+                                    command=lambda *_: self._refresh_hints()).pack(side="left")
+            ctk.CTkLabel(self.crow, textvariable=self.back_hint, text_color=MUTED,
+                          font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
+        r3 = ctk.CTkFrame(self.crow, fg_color=PANEL); r3.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkLabel(r3, text="Kraken speed:", text_color=MUTED, width=110, anchor="w").pack(side="left")
         ctk.CTkSegmentedButton(r3, values=list(self._SPEED), variable=self.speed_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
-        ctk.CTkLabel(r3, text="  normal = best ratio (default)  ·  fast = quicker, a little larger (Kraken preset −4)",
+                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                command=lambda *_: self._refresh_hints()).pack(side="left")
+        ctk.CTkLabel(r3, text="  normal = smallest (default)  ·  fast = quicker, a little larger",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
-        ctk.CTkLabel(crow, text="Every fPKG packs each file with Kraken, whatever the codec layer — that is the "
-                                 "native package layout. Nothing from the tuning bar applies here: its Level makes "
-                                 "no difference to this encoder (only the fast preset does), the outer-PFS pass runs "
-                                 "on one worker (LibProsperoPkg 1.2.0 races above that) and the format fixes its own "
-                                 "64 KiB / 256 KiB blocks. The temp drive from Settings stages the inner image and "
-                                 "the unwrap / extraction of the source.",
+        ctk.CTkLabel(self.crow, text="Every file is Kraken-packed whatever the codec layer. The tuning bar does not "
+                                     "apply to fPKG builds (single-worker outer pass, format-fixed blocks); only its "
+                                     "temp drive is used.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(4, 8))
+        for _v in (self.cid_var, self.tid_var):
+            _v.trace_add("write", lambda *_: self._update_summary())
 
         # ── Buttons ──
         self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
@@ -4581,13 +4614,67 @@ class PackDialog(ctk.CTkToplevel):
             if not self._panel_shown:
                 self.fpkg_panel.pack(fill="x", padx=20, before=self._btns)
                 self._panel_shown = True
-            self.geometry(self._GEOMETRY["pkg"])
+            self._layout_fpkg()
         else:
             self.out_label.set(f"Output folder  (this job's .{key} lands here):")
             if self._panel_shown:
                 self.fpkg_panel.pack_forget()
                 self._panel_shown = False
-            self.geometry(self._GEOMETRY["pack"])
+        self._fit()
+
+    # ── fPKG panel: compact summary ↔ revealed rows ──────────────────────────
+    def set_advanced(self, shown: bool) -> None:
+        """Reveal / hide the identity + compression rows (what the Edit… button does)."""
+        self._adv_shown = bool(shown)
+        self._layout_fpkg()
+        self._fit()
+
+    def _toggle_advanced(self) -> None:
+        self.set_advanced(not self._adv_shown)
+
+    def _reveal_identity(self) -> None:
+        """Force the identity rows open (a required or invalid entry must be visible)."""
+        if not (self._adv_shown or self._ident_forced):
+            self._ident_forced = True
+            self._layout_fpkg()
+            self._fit()
+
+    def _layout_fpkg(self) -> None:
+        """Pack the identity / compression rows for the current state, in order:
+        summary → identity → compression. pack_forget + re-pack keeps the order stable."""
+        show_ident = self._adv_shown or self._ident_forced
+        self.irow.pack_forget(); self.crow.pack_forget()
+        if show_ident:
+            self.irow.pack(fill="x", pady=4)
+        if self._adv_shown:
+            self.crow.pack(fill="x", pady=4)
+        self._edit_btn.configure(text=("▲  Hide" if self._adv_shown else "✎  Edit…"))
+        self._update_summary()
+
+    def _fit(self) -> None:
+        """Size the window to its content — the fPKG rows come and go."""
+        self.update_idletasks()
+        req = self.winfo_reqheight()
+        self._height = max(self._MIN_HEIGHT, int(req) + 16)
+        self.geometry(f"700x{self._height}")
+
+    def _update_summary(self) -> None:
+        """The one line that says what this .pkg job will do."""
+        cid = self.cid_var.get().strip().upper()
+        tid = self.tid_var.get().strip().upper()
+        shown_id = tid or (cid[7:16] if len(cid) >= 16 else cid)
+        auto_cid = str(self._auto_ident.get("content_id", "")).upper()
+        auto_tid = str(self._auto_ident.get("title_id", "")).upper()
+        if not (cid or tid):
+            ident = "identity REQUIRED below" if self._ident_forced else "identity from the game's param.json"
+        elif (cid and cid == auto_cid) or (not cid and tid == auto_tid):
+            ident = f"identity from param.json ({shown_id})"
+        else:
+            ident = f"identity {shown_id} (typed)"
+        parts = [ident, f"codec layer {self.inner_var.get()}", f"Kraken {self.speed_var.get()}"]
+        if self.back_var.get() == "publishingtools":
+            parts.append("Sony DLL backend")
+        self.sum_var.set("fPKG:  " + "  ·  ".join(parts))
 
     # ── pickers ──────────────────────────────────────────────────────────────
     def _pick_file(self):
@@ -4636,6 +4723,7 @@ class PackDialog(ctk.CTkToplevel):
         if not p or not p.exists():
             self.src_hint.set("")
             self.ident_note.set(self._IDENT_AUTO)
+            self._set_ident_forced(False)
             return
         suf = p.suffix.lower() if p.is_file() else ""
         if self.fmt_key != "pkg":
@@ -4672,6 +4760,20 @@ class PackDialog(ctk.CTkToplevel):
             self.src_hint.set("⚠ Already a .pkg — use fPKG⇢ to extract it.")
         else:
             self.src_hint.set("⚠ Not a game folder, archive or .ffpfsc/.ffpfs/.exfat/.ffpkg image.")
+        # A game folder without param.json cannot get its identity from anywhere else:
+        # the identity rows open by themselves and are marked required.
+        self._set_ident_forced(p.is_dir() and is_game_folder(p) and not (p / "sce_sys" / "param.json").is_file())
+
+    def _set_ident_forced(self, forced: bool) -> None:
+        forced = bool(forced)
+        self.ident_head.set(self._IDENT_HEAD_REQUIRED if forced else self._IDENT_HEAD_FALLBACK)
+        if forced != self._ident_forced:
+            self._ident_forced = forced
+            if self._panel_shown:
+                self._layout_fpkg()
+                self._fit()
+        else:
+            self._update_summary()
 
     def _prefill_from_param_json(self, pj: Path) -> None:
         try:
@@ -4713,6 +4815,7 @@ class PackDialog(ctk.CTkToplevel):
                             "differing value here is only used for what it lacks.")
 
     def _refresh_hints(self, *_):
+        self._update_summary()
         dll = (self.app.pubtools_dll_var.get() or "").strip()
         if self.back_var.get() == "publishingtools":
             if dll and Path(dll).is_file():
@@ -4734,30 +4837,28 @@ class PackDialog(ctk.CTkToplevel):
         tid = self.tid_var.get().strip().upper()
         ver = self.ver_var.get().strip()
         title = self.title_var.get().strip()
+        def _bad(title: str, msg: str):
+            self._reveal_identity()          # show the field the message talks about
+            messagebox.showerror(title, msg, parent=self)
+            return None
         if cid and not self._CID_RE.match(cid):
-            messagebox.showerror("Content ID", "Content ID must look like  UP9000-PPSA12345_00-GAMENAME00000000\n"
-                                 "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case alphanumerics) "
-                                 "— or leave it empty to use the game's param.json.", parent=self)
-            return None
+            return _bad("Content ID", "Content ID must look like  UP9000-PPSA12345_00-GAMENAME00000000\n"
+                        "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case alphanumerics) "
+                        "— or leave it empty to use the game's param.json.")
         if tid and not self._TID_RE.match(tid):
-            messagebox.showerror("Title ID", "Title ID must look like  PPSA12345  (4 letters + 5 digits) — or leave it "
-                                 "empty to use the game's param.json.", parent=self)
-            return None
+            return _bad("Title ID", "Title ID must look like  PPSA12345  (4 letters + 5 digits) — or leave it "
+                        "empty to use the game's param.json.")
         if cid and tid and tid not in cid:
-            messagebox.showerror("Mismatch", f"The title id {tid} does not appear inside the content id {cid}.", parent=self)
-            return None
+            return _bad("Mismatch", f"The title id {tid} does not appear inside the content id {cid}.")
         if cid and not tid:
             tid = cid[7:16]
         if ver and not self._VER_RE.match(ver):
-            messagebox.showerror("Version", "Version must be NN.NNN.NNN (or NN.NN) — or empty to use param.json.", parent=self)
-            return None
+            return _bad("Version", "Version must be NN.NNN.NNN (or NN.NN) — or empty to use param.json.")
         src = Path((self.src_var.get() or "").strip())
         if (src.is_dir() and is_game_folder(src) and not (src / "sce_sys" / "param.json").is_file()
                 and not (cid and tid)):
-            messagebox.showerror("Identity needed", "This game folder has no sce_sys/param.json, so Content ID and "
-                                 "Title ID must be filled in here (the builder generates param.json from them).",
-                                 parent=self)
-            return None
+            return _bad("Identity needed", "This game folder has no sce_sys/param.json, so Content ID and "
+                        "Title ID must be filled in here (the builder generates param.json from them).")
         inner = self.inner_var.get() if self.inner_var.get() in self._INNER else "none"
         back  = self.back_var.get() if self.back_var.get() in self._BACKEND else "builtin"
         level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)

@@ -3,7 +3,22 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.2  (current)
+  v1.1.3  (current)
+────────────────────────────────────────────────────────────────────────
+
+PUBLISHING TOOLS BACKEND: WINDOWS ONLY, SAID HONESTLY
+
+  • Tested with the real libScePubTools.dll on macOS: LibProsperoPkg does
+    NOT fall back to the built-in encoder as the dialog and README claimed
+    — it throws "the Reduced Oodle backend requires 64-bit Windows" and
+    the build fails. So: the Kraken backend row now exists only on Windows
+    (with a DLL configured); on macOS 'builtin' is used, a restored job
+    that still asks for publishingtools is switched to builtin with a WARN
+    in the log; hint texts, README, CLI help and fpkg.py say "Windows
+    only, no fallback".
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.2
 ────────────────────────────────────────────────────────────────────────
 
 THE .pkg FORMAT IS ONE LINE NOW

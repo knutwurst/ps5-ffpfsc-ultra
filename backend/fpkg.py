@@ -144,7 +144,10 @@ def build(src_dir: Path, out_dir: Path,
       path), 'zlib' = the legacy whole-inner PFSC layer. Measured on already
       Kraken-packed data the three produce the same size; they differ in structure.
     - kraken_backend 'builtin' uses LibProsperoPkg's own managed encoder (no external DLL).
-      'publishingtools' requires the leaked libScePubTools.dll at the given path.
+      'publishingtools' requires the leaked libScePubTools.dll at the given path AND
+      64-bit Windows: on any other OS LibProsperoPkg throws ("the Reduced Oodle backend
+      requires 64-bit Windows") and the build fails — there is no fallback. Verified
+      with the real DLL on macOS.
     - temp_dir: where LibProsperoPkg stages the inner image / CNT / outer image
       (defaults to $TMPDIR). Pass the app's fast temp drive for big games.
     - level: Kraken preset. Measured: 0..9 give byte-identical output (the encoder's

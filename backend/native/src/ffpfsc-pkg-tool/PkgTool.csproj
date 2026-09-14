@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>PkgTool</RootNamespace>
+    <AssemblyName>ffpfsc-pkg-tool</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>13</LangVersion>
+    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>partial</TrimMode>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="LibProsperoPkg"><HintPath>lib\LibProsperoPkg.dll</HintPath></Reference>
+    <Reference Include="BCnEncoder"><HintPath>lib\BCnEncoder.dll</HintPath></Reference>
+    <Reference Include="CommunityToolkit.HighPerformance"><HintPath>lib\CommunityToolkit.HighPerformance.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

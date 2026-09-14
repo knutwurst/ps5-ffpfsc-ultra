@@ -3,7 +3,287 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.0  (current build)
+  v1.1.1  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG IS THE PACK DIALOG'S THIRD FORMAT — ANY SOURCE → .pkg
+
+  • ONE DOOR
+      The Pack dialog's format switch became a three-way choice:
+      .ffpfsc (compressed) | .ffpfs (uncompressed) | .pkg (fPKG). Picking
+      .pkg unfolds the fPKG block (identity + inner codec / Kraken backend /
+      level) below the format row; the dialog grows to 700x840 and shrinks
+      back when you switch away. The separate "⇢fPKG" button and the
+      Build-fPKG dialog are gone; the Converter's "Build fPKG" step and a
+      double-click on a queued fPKG job open the Pack dialog with .pkg
+      pre-selected.
+
+  • THE INPUT NO LONGER MATTERS
+      With .pkg selected every pack source becomes an fPKG job: a game
+      folder, a parent folder (scanned — each game its own .pkg), a library
+      of bundles (folder mirrored, DLC extras copied next to the .pkg), a
+      third-party archive (extracted on its turn, multi-game archives included),
+      a .exfat/.ffpkg disk image, a .ffpfs — and a .ffpfsc, which the other
+      two formats refuse because it is already packed. The queue snapshot
+      that used to stamp compressed/uncompressed onto a fresh pack item now
+      turns it into an fPKG job when .pkg is the remembered format — so a
+      dropped or browsed source follows the last chosen format, as before.
+
+  • IDENTITY: param.json DECIDES  (fixes a real 1.1.0 defect)
+      The bundled tool stamps the header with --content-id as given and
+      never reconciles it with sce_sys/param.json; the image→fPKG path
+      guessed "UP9000-<TID>_00-PROSPERO00000000", so every real game image
+      produced a package whose header disagreed with its own param.json
+      ("[FAIL] param.contentId ... != CNT header" in validate). Now the
+      backend reads param.json of the resolved source (folder, unwrapped
+      image, extracted archive alike) and takes content id, title id,
+      version and title from there; --content-id & co. are fallbacks for
+      what it lacks and are no longer required. A disagreeing argument is
+      logged as a WARN and ignored. The dialog pre-fills the identity from
+      param.json for a game folder (dropped again when the source changes)
+      and leaves it empty — "auto" — for archives and images.
+
+  • ALSO
+      fPKG jobs skip the AMPR/APR emu injection (a .pkg installs natively);
+      an fPKG job survives archive extraction as an fPKG job (the payload
+      copy used to reset it to pack/unpack); the extra games of a multi-game
+      archive become fPKG jobs sharing the compression settings only (never
+      the first game's identity); a scan-detected patch is dropped with a
+      WARN when a bundle becomes an fPKG job (the builder has no patch
+      overlay); bundle sub-folders apply to .pkg output and bundle extras
+      are copied next to it; identity typed for an archive source rides
+      along as the fallback; editing pack ↔ fPKG on the same source converts
+      in place (bundle tags, archive password and queue position survive);
+      the space gate lets fPKG extract through and sizes a .ffpfsc source
+      at 2x for the unwrap; the remembered fPKG compression (inner/backend/
+      speed) persists as fpkg_defaults, the remembered format as
+      output_format (the old output_compressed bool stays in sync for the
+      pack pipeline).
+
+  • THE fPKG TOOL: 53 MB → 25 MB, SAME SPEED
+      backend/native/ffpfsc-pkg-tool is rebuilt without Magick.NET and with
+      the .NET runtime trimmed. LibProsperoPkg only references ImageMagick
+      for icon conversion; none of our code paths (build in all three
+      codec layers, extract, validate, deterministic build) ever load it —
+      the 57-check harness passes without it, and it was 28 MB of the file.
+      Measured on 240 MB of mixed data the slim JIT build runs at the same
+      throughput as before (34 vs 33 MB/s). NativeAOT variants were tried
+      too (16-18 MB) and rejected: 10-23 % slower on the Kraken/AES path.
+      The wrapper's source (Program.cs, PkgTool.csproj, build README) now
+      lives in backend/native/src/ffpfsc-pkg-tool/ — it existed only in a
+      temp folder before, and GPL-3 wants it next to the binary. The first
+      fPKG attempt's leftovers (prospero.py, libprosperopkg.dylib/.h,
+      patches/) are deleted; nothing used them and they shipped as 7 MB of
+      dead weight in the app.
+
+  • TWO 1.1.0 CLAIMS CORRECTED (measured, not assumed)
+      "Inner codec none = files stored raw" was wrong: the tool Kraken-packs
+      every file in every mode (a compressible 8 MB file came out as 1.2 MB
+      with 'none'; only incompressible data is stored). --mode adds a codec
+      LAYER over the whole inner image; on already-packed data all three
+      layers gave the same package size. Texts in the dialog, README, CLI
+      help and fpkg.py say so now.
+      "Level 0-9" was a placebo: the level reaches the encoder (the log
+      says so), but 0..9 produce byte-identical output; only -4..-1 switch
+      to a faster, slightly weaker preset (40 MB mixed data: about a quarter
+      less time, ~8 % larger). The slider is gone; the dialog offers
+      "Kraken speed: normal | fast" (level 7 / -4). The tuning-bar note for
+      an fPKG job says none of its controls apply.
+
+  • TESTS
+      CLI harness: +1 test, 6 checks (param.json beats a disagreeing
+      --content-id and validate stays green; ids omitted → builds; no
+      param.json and no ids → readable refusal) — 57/57. GUI driver
+      rewritten for the unified dialog: pre-fill, optional identity for
+      images/archives, add via the shared classifier, edit, pack↔fPKG
+      switch, archive placeholder kept as fPKG, remembered-format drop,
+      dialog sizing — 40/40.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.0
+────────────────────────────────────────────────────────────────────────
+
+fPKG IS NOW A FIRST-CLASS PIPELINE (this is why it's 1.1.0)
+
+  • ONE-CLICK  .ffpfsc / .ffpfs / .exfat / .ffpkg  →  fPKG
+      Converter dialog got a "Build fPKG" step next to Decompress/Unpack,
+      and the Build-fPKG dialog accepts an image as source. The backend
+      unwraps the image on the TEMP drive (mkpfs unpack + nested unwrap,
+      exFAT read), builds the .pkg, validates it, removes the scratch.
+        --fpkg-build <image>  --temp-dir <fast drive>  --compression-level N
+
+  • REAL Build-fPKG DIALOG  (was a bare prompt)
+      Same look as Pack: source File…/Folder…, output folder, identity
+      grid (Content ID / Title ID / Title / Version — auto-filled from
+      sce_sys/param.json for a folder, from the file name for an image,
+      validated against the console's id patterns), inner codec
+      none/zlib/kraken, Kraken backend builtin/publishingtools, its own
+      Level slider (maps to LibProsperoPkg Kraken -4..9 / zlib 0..9).
+      Explains why CPU cores + block size from the tuning bar don't apply.
+
+  • TUNING-BAR SEMANTICS MADE HONEST
+      Level → forwarded per job (--compression-level → --level).
+      CPU cores → pinned to 1 for fPKG (LibProsperoPkg 1.2.0 outer-PFS race).
+      Block size → not applicable (format-fixed 64 KiB / 256 KiB).
+      Temp drive → forwarded (--temp-dir → LibProsperoPkg TemporaryDirectory);
+      the placement router's chosen build drive is used, like for packs.
+
+  • WORKER / PROGRESS
+      New stage weight tables for fPKG build and extract; the backend now
+      emits [PHASE] markers + progress bars (source scan → unwrap → inner
+      image % → outer-PFS AES-XTS % → finalize % → validate) so the bar
+      moves instead of sitting on "Scanning 0%". Progress bars are locked
+      to the announced phase for fPKG jobs (no keyword guessing).
+      Output detection knows .pkg (build) and the /app0 folder (extract) —
+      previously a successful build was reported as "no .ffpfsc created".
+      ShadowMount checks, bundle copying and the mkpfs OOM core-step-down
+      no longer run for fPKG jobs. Success messages name the job type.
+
+  • QUEUE / EDITING / SETTINGS
+      Double-click edits fPKG jobs (Build dialog in edit mode; the mini
+      dialog for Extract). Queue badges fPKG-EX / fPKG-BD, details mode.
+      Settings → Folders: optional "fPKG — Publishing Tools DLL" path
+      (your own copy, never bundled) feeding the publishingtools backend.
+      History skips fPKG extracts (no compression to rate); fPKG builds
+      record the real source size so the ratio is meaningful.
+      Pack dialog refuses .pkg / .ffpfsc with a pointer to the right job.
+      Visual pass (window-capture verified): Build-fPKG dialog resized so
+      its Cancel / Add-to-queue row is visible; Extract mini dialog taller
+      for its two rows; Converter widened for the fourth (fPKG) node; a
+      .pkg queue row shows its title id (PPSA…) instead of "Unknown"; the
+      tuning bar shows which controls the selected fPKG job honours; the
+      header caption mentions .pkg. Backend phase order no longer jumps
+      back (Reading Game → Creating Temp PFS → Compressing → Writing).
+
+END-TO-END TESTED
+
+  backend/tests/test_fpkg_pipelines.py — 50 automated tests (~15 s wall,
+  no external dependencies except a 1 MB HomebrewTest sample fetched
+  from SvenGDK's repo on first run). Covers:
+
+    • chain 1  folder → fPKG → folder                round-trip
+    • chain 2  folder → .ffpfsc → folder → fPKG      cross-format
+    • chain 3  fPKG → folder → .ffpfsc               mkpfs accepts our extract
+    • all three inner codecs: none / zlib / kraken
+    • negatives:   no param.json, no eboot.bin, bad content id
+    • validator catches:  a .ffpfsc, a pkg with missing eboot
+    • --fpkg-deterministic:  two builds produce byte-identical output
+    • tool-path resolution:  env override, backend/native, _MEIPASS
+
+  All 38 pass.
+
+DIAGNOSTIC VALIDATOR
+
+  ffpfsc-pkg-tool validate <pkg>            (also --fpkg-validate <pkg> in cli.py)
+
+  17-point checklist that answers "why does the console reject this?":
+    file / FIH magic / CNT header / content-id format / signed-byte /
+    PFS bounds / embedded-CNT bounds / NAPS layout size / CNT signature
+    wrap / required entries (param.json, icon0.png, playgo-chunk.dat) /
+    param.contentId matches header / applicationDrmType / inner-PFS
+    decodes / eboot.bin has the expected fake-self magic.
+
+  The CLI now AUTO-RUNS the validator right after every successful
+  --fpkg-build so a broken package is flagged in the log before it
+  ever leaves the mac.
+
+CNT METADATA MERGE ON EXTRACT
+
+  Fixed: extract-inner used to lose sce_sys/param.json, sce_sys/icon0.png,
+  and the playgo-*.dat entries (they live in the CNT container, not in
+  the inner PFS). Chain 3 (fPKG → mkpfs pack) would then fail because
+  mkpfs requires param.json. The extractor now merges the CNT metadata
+  into sce_sys/ automatically; --no-merge-cnt keeps the old behaviour.
+
+UI: fPKG NOW REACHABLE FROM EVERY ENTRY POINT
+
+  • Two job-bar buttons  📥 fPKG⇢  and  📦 ⇢fPKG   (were already there)
+  • Drag & drop a .pkg              → queues an fPKG-extract job
+  • Browse-archive picker           → .pkg listed under "Supported files"
+  • Queue row badge                 → fPKG-EX / fPKG-BD  (was PACK for both)
+  • Details panel mode              → Extract fPKG / Build fPKG
+  • Job-bar caption                 → mentions .pkg alongside folder/archive
+  • README                          → What it packs / produces + button list
+
+DETERMINISTIC BUILDS
+
+  New --fpkg-deterministic flag in cli.py and the GUI-facing build call
+  wires through to LibProsperoPkg's DeterministicBuild=True. Two builds
+  from the same source now produce byte-identical output (verified in
+  the test harness).
+
+FIXES
+
+  • CLI dispatch fell through: --fpkg-validate without --fpkg-build
+    used to try Path(args.fpkg_build).resolve() and TypeError-crash.
+  • Outer-PFS AES-XTS worker race in LibProsperoPkg 1.2.0
+    (KrakenMaxDegreeOfParallelism=0 → auto → 12 threads → SIGSEGV in
+    ProsperoOuterPfsSignature.BlockSector on ~50%% of builds).
+    Fix locked at our layer: force parallelism = 1 in both build
+    options and the outer pool. 8/8 reproducibility.
+
+────────────────────────────────────────────────────────────────────────
+  v1.0.90  (current)
+────────────────────────────────────────────────────────────────────────
+
+NEW: fPKG BUILD AND EXTRACT (native macOS, no external DLL)
+
+  Two new queue operations sit next to Pack / Convert / Patch / Sign in
+  the "Add job" bar:
+
+    📥  fPKG⇢     Extract an installable PS5 fake package (.pkg) into a
+                   /app0-style folder.
+    📦  ⇢fPKG    Build a debug fPKG from a prepared /app0 folder.
+
+  Runs entirely on macOS. No Wine, no Windows, no external DLL required.
+  Powered by a bundled self-contained .NET 9 CLI (`ffpfsc-pkg-tool`, GPL-3,
+  ~53 MB under backend/native/) that wraps drakmor's LibProsperoPkg 1.2.0
+  from the a53-fpkg 0.5 release.
+
+  BUILD OPTIONS
+
+    Kraken backend      builtin (default, no DLL) / automatic /
+                         publishingtools (requires the leaked Sony
+                         libScePubTools.dll at the given path) /
+                         uncompressed.
+    Inner codec         none (safest, largest) / zlib / kraken.
+    Content ID / Title  filled from sce_sys/param.json if present, else
+                         asked for in the dialog.
+
+  ROUND-TRIP VERIFIED locally on the HomebrewTest sample: build then
+  extract-inner returns every source file byte-identical (fake-sign
+  transforms eboot.bin as expected). On-console install is the user's
+  test and depends on kstuff-fpkg support on his firmware.
+
+  BACKEND CLI
+
+    backend/cli.py picked up matching flags so the app and shell users
+    both hit the same code path:
+
+      --fpkg-extract PKG               (with OUTPUT = target folder)
+      --fpkg-build   SRC-DIR           (with OUTPUT = folder for the .pkg)
+        --content-id, --title-id, --fpkg-title, --fpkg-version
+        --fpkg-inner {none,zlib,kraken}
+        --fpkg-kraken-backend {automatic,builtin,publishingtools,uncompressed}
+        --fpkg-pubtools-dll PATH
+
+  RACE FIX applied at our layer
+
+    LibProsperoPkg 1.2.0's outer-PFS worker crashes with SIGSEGV in
+    ProsperoOuterPfsSignature.BlockSector when its build path runs
+    encryption across multiple threads. Our wrapper forces
+    KrakenMaxDegreeOfParallelism = 1 (also gates the outer-PFS pool)
+    so 8/8 test runs succeed instead of 4/8.
+
+BUNDLED THIRD-PARTY CODE (GPL scope)
+
+  ffpfsc-pkg-tool statically bundles LibProsperoPkg (GPL-3-or-later),
+  BCnEncoder.NET (MIT), CommunityToolkit.HighPerformance (MIT), and
+  Magick.NET-Q8-AnyCPU (Apache-2.0). The rest of ps5-ffpfsc-ultra
+  is unchanged; the GPL scope covers the native fPKG tool only.
+
+────────────────────────────────────────────────────────────────────────
+  v1.0  (initial)
 ────────────────────────────────────────────────────────────────────────
 
 STAGE DISPLAY OVERHAUL

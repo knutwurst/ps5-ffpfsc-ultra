@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1142,22 +1142,31 @@ def _strip_edition_fluff(name: str) -> str:
     return out
 
 
-def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
+def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
+                            name_override: str | None = None,
+                            tid_override: str | None = None,
+                            ver_override: str | None = None,
+                            v_prefix: bool = False) -> str:
     """Build a findable output filename for *item*:
     '<Game Name> [<TITLEID>] [v<version>]<ext>'  (version omitted if unknown).
     Falls back to the title id alone if the name is missing. *ext* is '.ffpfsc'
-    (compressed) or '.ffpfs' (uncompressed)."""
+    (compressed) or '.ffpfs' (uncompressed).
+
+    The *_override* arguments feed the auto-organize layout: the title / id / version read
+    from the game's own metadata instead of the source name; *v_prefix* writes the short
+    version tag as '[v01.200]' (the library convention) instead of '[01.200]'."""
     if not ext.startswith("."):
         ext = "." + ext
     PLACEHOLDERS = {"Unknown", "📦", "💾", "📤", ""}
-    tid = (getattr(item, "title_id", "") or "").strip()
+    tid = (tid_override if tid_override is not None else (getattr(item, "title_id", "") or "")).strip()
     if tid in PLACEHOLDERS:
         tid = ""
     # Prefer the stable friendly name (the bundle/folder name the user saw, or a folder
     # pack's param.json title) over item.name, which collapses to the extracted stem
     # (e.g. "PPSA13427") after an archive/bundle is unpacked. This makes the .ffpfsc
     # named after the GAME, the same as packing a folder directly.
-    name = (getattr(item, "display_name", "") or getattr(item, "name", "") or "").strip()
+    name = (name_override if name_override is not None
+            else (getattr(item, "display_name", "") or getattr(item, "name", "") or "")).strip()
     # The friendly name is often a release/bundle FOLDER that already carries bracketed
     # metadata, e.g. "a retail reference title [PPSA00001] [v01.200.007]". Strip any title-id bracket
     # and any version bracket here so they are re-added once, canonically, below —
@@ -1182,18 +1191,22 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
     # resume DELETES the source folder, so a live re-read would drop the [v…] tag and the
     # resume would then write a DIFFERENTLY-named .ffpfsc (orphaning the original instead of
     # overwriting it). Prefer the cached tag; only (re)compute while the source still exists.
-    ver = (getattr(item, "_ver_tag", "") or "") if item is not None else ""
-    if not ver:
-        src = getattr(item, "path", None)
-        ver = guess_game_version(src) if isinstance(src, Path) else ""
-        if ver and item is not None:
-            try:
-                item._ver_tag = ver
-            except Exception:
-                pass
+    if ver_override is not None:
+        ver = ver_override
+    else:
+        ver = (getattr(item, "_ver_tag", "") or "") if item is not None else ""
+        if not ver:
+            src = getattr(item, "path", None)
+            ver = guess_game_version(src) if isinstance(src, Path) else ""
+            if ver and item is not None:
+                try:
+                    item._ver_tag = ver
+                except Exception:
+                    pass
     if ver:
-        # Shortened, 'v'-less version tag (e.g. [01.007]) — matches shorten_ffpfsc_versions.sh.
-        suffix_parts.append(f"[{short_version(ver)}]")
+        # Shortened version tag (e.g. [01.007]) — matches shorten_ffpfsc_versions.sh;
+        # the auto-organize layout writes it as [v01.007].
+        suffix_parts.append(f"[{'v' if v_prefix else ''}{short_version(ver)}]")
     suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
     # Reserve room (by UTF-8 bytes) for the [version][TITLEID] suffix + extension so those
     # collision-resistant tags survive the filename-length cap instead of being truncated.
@@ -1223,6 +1236,33 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc") -> str:
             pass
     name = trunc.strip() or "output"
     return sanitize_filename(name + suffix) + ext
+
+
+# ── Auto-organize: library names from the game's own metadata ─────────────────
+def canonical_game_title(title: str) -> str:
+    """A game title as it appears in a library name: no ™®©℠℗, 'A: B' → 'A - B'
+    (a bare colon would become 'A- B' through the filename sanitiser), tidy spaces."""
+    t = re.sub(r"[™®©℠℗]", "", title or "")
+    t = re.sub(r"\s*:\s+", " - ", t)
+    t = t.replace(":", "-")
+    t = re.sub(r"\s{2,}", " ", t).strip(" -_.")
+    return t
+
+
+def organized_names(ident: dict, ext: str, item=None) -> tuple[str, str]:
+    """The auto-organize layout for one game — (folder, file):
+         '<Title> [<TITLEID>] [vXX.YYY.ZZZ]'          the per-game folder (full version)
+         '<Title> [<TITLEID>] [vXX.YYY]<ext>'         the file inside it (short version)
+    *ident* carries 'title', 'title_id', 'version' as read from param.json (any may be
+    empty; missing tags are simply left out). The file name goes through the same
+    ShadowMount byte budget / edition-fluff trimming as every other output name."""
+    title = canonical_game_title(ident.get("title") or "")
+    tid = (ident.get("title_id") or "").strip().upper()
+    ver = (ident.get("version") or "").strip().lstrip("vV")
+    base = title or tid or "output"
+    folder = sanitize_filename(" ".join(p for p in (base, f"[{tid}]" if tid else "", f"[v{ver}]" if ver else "") if p))
+    fname = descriptive_ffpfsc_name(item, ext, name_override=base, tid_override=tid, ver_override=ver, v_prefix=True)
+    return folder, fname
 
 
 def find_artwork(path: Path):
@@ -4114,6 +4154,7 @@ class CLIWorker(threading.Thread):
                 cands = []
             if cands:
                 best = max(cands, key=lambda q: q.stat().st_mtime)
+                best = self.app._finalize_pkg_name(self.item, best)   # auto-organize name
                 self.output_path = str(best)
                 self.final_size = best.stat().st_size
                 return True
@@ -4411,6 +4452,10 @@ class PackDialog(ctk.CTkToplevel):
         if init_fmt not in self.FORMATS:
             init_fmt = "ffpfsc"
         self.fmt_key = init_fmt
+        init_org = getattr(item, "auto_organize", None) if item is not None else None
+        if init_org is None:
+            init_org = bool(app.auto_organize_var.get())
+        self.organize_var = tk.BooleanVar(value=bool(init_org))
         self.title("Pack — edit job" if item else "Pack — add job to queue")
 
         self.src_var   = tk.StringVar(value=init_src)
@@ -4484,10 +4529,16 @@ class PackDialog(ctk.CTkToplevel):
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(orow, textvariable=self.out_label, text_color=WHITE,
                       font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
-        oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
+        oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 4))
         ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_out).pack(side="left", padx=(6, 0))
+        # Auto-organize: the one switch that makes any source land as
+        # <Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y].ffpfsc|.pkg, named from the game itself.
+        ctk.CTkCheckBox(orow, text="Auto-organize — folder and file named from the game's own metadata (pattern above)",
+                        variable=self.organize_var, command=self._apply_format,
+                        checkbox_width=18, checkbox_height=18, fg_color=GREEN, hover_color=GREEN2,
+                        text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── Format ──
         frow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); frow.pack(fill="x", padx=20, pady=4)
@@ -4612,14 +4663,20 @@ class PackDialog(ctk.CTkToplevel):
     def _apply_format(self) -> None:
         key = self.fmt_key
         self.fmt_hint.set(self._FMT_HINT[key])
-        if key == "pkg":
+        org = bool(self.organize_var.get())
+        ext = ".pkg" if key == "pkg" else f".{key}"
+        if org:
+            self.out_label.set(f"Output folder  (auto-organize creates ‹Title [TID] [vX.Y.Z]›/‹Title [TID] [vX.Y]›{ext} inside it):")
+        elif key == "pkg":
             self.out_label.set("Output folder  (this job's .pkg lands here, named <content-id>-A<app>-V<ver>.pkg):")
+        else:
+            self.out_label.set(f"Output folder  (this job's .{key} lands here):")
+        if key == "pkg":
             if not self._panel_shown:
                 self.fpkg_panel.pack(fill="x", padx=20, before=self._btns)
                 self._panel_shown = True
             self._layout_fpkg()
         else:
-            self.out_label.set(f"Output folder  (this job's .{key} lands here):")
             if self._panel_shown:
                 self.fpkg_panel.pack_forget()
                 self._panel_shown = False
@@ -4906,13 +4963,15 @@ class PackDialog(ctk.CTkToplevel):
             self.app.fpkg_defaults = {"inner": params["inner"], "backend": params["backend"], "level": params["level"]}
             save_settings({"fpkg_defaults": self.app.fpkg_defaults})
 
+        organize = bool(self.organize_var.get())
         if self.edit_item is not None:
-            self._save_edit(src, outf, fmt, params)
+            self._save_edit(src, outf, fmt, params, organize)
             return
 
         # ── Add mode ─────────────────────────────────────────────────────────
         self.app.output_var.set(outf)
         self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
+        self.app.auto_organize_var.set(organize)   # likewise remembered + snapshotted onto the item(s)
         if fmt == "pkg" and src.is_file() and suf in self._IMAGE_SUFFIXES + self._ARCHIVE_SUFFIXES:
             # A single packed image or archive → a direct fPKG job carrying the identity
             # typed here as fallback (the shared add path would queue a .ffpfsc as an UNPACK
@@ -4921,6 +4980,7 @@ class PackDialog(ctk.CTkToplevel):
             item = self.app._fpkg_item_for(src, params, output_path=outf, parent=self)
             if item is None:
                 return
+            item.auto_organize = organize
             self.app.queue.append(item)
             self.app.update_queue_box(select_item=item)
             kind = "image"
@@ -4956,11 +5016,12 @@ class PackDialog(ctk.CTkToplevel):
         self.destroy()
         self.app.add_source_to_queue()
 
-    def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None) -> None:
+    def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None, organize: bool = True) -> None:
         """Edit mode: mutate in place when the source and the job kind are unchanged;
         otherwise build a fresh GameItem of the right kind and swap it in at the same
         queue index so the job keeps its position."""
         it = self.edit_item
+        it.auto_organize = bool(organize)
         was_fpkg = getattr(it, "operation", "pack") == "fpkg-build"
         try:
             old_src_p = Path(str(getattr(it, "archive_path", None) or getattr(it, "path", ""))).resolve()
@@ -5006,6 +5067,7 @@ class PackDialog(ctk.CTkToplevel):
                 return  # validation already shown
             new_item.output_path = Path(outf)
             new_item.output_compressed = comp
+        new_item.auto_organize = bool(organize)
         try:
             idx = self.app.queue.index(it)
             self.app.queue[idx] = new_item
@@ -6212,6 +6274,11 @@ class App:
         self.build_via_exfat_var = self._persisted_bool(settings, "build_via_exfat", False)
         # Opt-in: fake-sign a game folder's executables in place before packing it.
         self.fake_sign_before_pack_var = self._persisted_bool(settings, "fake_sign_before_pack", False)
+        # Auto-organize (default on): every pack / fPKG job lands in '<Title> [TID] [vX.Y.Z]/'
+        # as '<Title> [TID] [vX.Y].ffpfsc|.pkg', named from the game's own param.json —
+        # whatever the source was called. Per job (snapshotted like the format); this is the
+        # remembered default the Pack dialog pre-fills.
+        self.auto_organize_var = self._persisted_bool(settings, "auto_organize", True)
         # Keep external drives awake DURING A RUN only: a fast tiny flushed write so
         # bus-powered 2.5" USB HDDs (WD Elements) stay spun-up with heads LOADED across the
         # short gaps between games in a batch — so each game doesn't pay a fresh spinup. The
@@ -8526,6 +8593,168 @@ class App:
         base.output_path = Path(output_path) if output_path else None
         return base
 
+    # ── Auto-organize: where a job lands and what it is called ───────────────
+    def _auto_organize_on(self, item) -> bool:
+        v = getattr(item, "auto_organize", None)
+        return bool(self.auto_organize_var.get()) if v is None else bool(v)
+
+    def _game_identity(self, item) -> dict | None:
+        """Title / title id / version of the GAME behind *item*, read from the source itself:
+        a folder's sce_sys/param.json, or the param.json inside a .ffpfs/.ffpfsc/.exfat/
+        .ffpkg image (MkPFS's game_metadata reads just that file — no unpacking). Cached on
+        the item (transient) so an OOM resume, whose source is gone by then, still names the
+        output identically. None when nothing usable is readable — an archive before its
+        extraction, or a source without param.json."""
+        cached = getattr(item, "_identity", None)
+        if cached:
+            return cached
+        p = getattr(item, "path", None)
+        if not p:
+            return None
+        p = Path(str(p))
+        ident = None
+        try:
+            if p.is_dir():
+                has_pj = (p / "sce_sys" / "param.json").is_file()
+                title = guess_game_name(p) if has_pj else ""
+                tid = parse_title_id(p)
+                tid = "" if tid in ("Unknown", "") else tid
+                ver = guess_game_version(p)
+                if title or tid:
+                    ident = {"title": title, "title_id": tid, "version": ver}
+            elif p.is_file() and p.suffix.lower() in (".ffpfs", ".ffpfsc", ".exfat", ".ffpkg"):
+                ident = self._read_image_metadata(p)
+        except Exception as e:
+            self.log("WARN", f"Auto-organize: could not read the game's metadata from {p.name}: {e}")
+            ident = None
+        if ident:
+            # Fill gaps from the source name (a '[PPSA…]' / version in a release name).
+            if not ident.get("title_id"):
+                _t = parse_title_id(p)
+                ident["title_id"] = "" if _t in ("Unknown", "") else _t
+            if not ident.get("version"):
+                _m = re.search(r"\bv?(\d{1,2}\.\d{2,3}(?:\.\d{2,3})?)\b", p.name)
+                ident["version"] = _m.group(1) if _m else ""
+            try:
+                item._identity = ident
+            except Exception:
+                pass
+        return ident
+
+    @staticmethod
+    def _ident_from_param_json(pj: Path) -> dict | None:
+        """{'title','title_id','version'} from a sce_sys/param.json (Sony layout)."""
+        try:
+            d = json.loads(Path(pj).read_text(encoding="utf-8-sig", errors="replace"))
+        except Exception:
+            return None
+        if not isinstance(d, dict):
+            return None
+        title = ""
+        lp = d.get("localizedParameters") or {}
+        if isinstance(lp, dict):
+            lang = lp.get("defaultLanguage")
+            block = lp.get(lang) if isinstance(lang, str) else None
+            if isinstance(block, dict):
+                title = str(block.get("titleName") or "")
+            if not title:
+                for v in lp.values():
+                    if isinstance(v, dict) and v.get("titleName"):
+                        title = str(v["titleName"]); break
+        if not title:
+            title = str(d.get("titleName") or "")
+        tid = str(d.get("titleId") or "").strip().upper()
+        ver = str(d.get("contentVersion") or d.get("masterVersion") or "").strip()
+        if not (title or tid):
+            return None
+        return {"title": title.strip(), "title_id": tid, "version": ver}
+
+    def _read_image_metadata(self, p: Path) -> dict | None:
+        """param.json-derived identity of a packed image, without unpacking it.
+
+        .ffpfs / .ffpfsc: our images nest an inner PFS inside an outer one, which MkPFS's
+        generic metadata reader does not follow (it reports 'missing exFAT signature') —
+        so ask the backend's browse path for the single member sce_sys/param.json, exactly
+        like the PFS browser does (only the touched blocks are decompressed).
+        .exfat / .ffpkg: the vendored MkPFS exFAT reader."""
+        suf = p.suffix.lower()
+        if suf in (".ffpfs", ".ffpfsc"):
+            tmp = Path(tempfile.mkdtemp(prefix="ffpfsc_ident_"))
+            try:
+                mfile = tmp / "members.txt"
+                mfile.write_text("sce_sys/param.json\n", encoding="utf-8")
+                dest = tmp / "out"
+                cmd = self._backend_cmd("--extract-from", str(p), "--dest", str(dest), "--members-file", str(mfile))
+                subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                pj = dest / "sce_sys" / "param.json"
+                return self._ident_from_param_json(pj) if pj.is_file() else None
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        backend = backend_base_dir()
+        if str(backend) not in sys.path:
+            sys.path.insert(0, str(backend))
+        from mkpfs.game_metadata import read_game_metadata   # reads only the metadata file
+        m = read_game_metadata(p)
+        title = (getattr(m, "game_title", "") or "").strip()
+        tid = (getattr(m, "title_id", "") or "").strip()
+        ver = (getattr(m, "version", "") or "").strip()
+        if tid in ("-", "—", "Unknown"):
+            tid = ""
+        if not (title or tid):
+            return None
+        return {"title": title, "title_id": tid.upper(), "version": ver}
+
+    def _organized_layout(self, item, out: Path, ext: str):
+        """(base_dir, file_name) for the auto-organize layout under *out*, or (None, None)
+        when no identity is readable — the caller then keeps today's naming (logged once)."""
+        ident = self._game_identity(item)
+        if not ident:
+            if not getattr(item, "_organize_warned", False):
+                try:
+                    item._organize_warned = True
+                except Exception:
+                    pass
+                self.log("WARN", f"Auto-organize: no param.json readable for {getattr(item, 'display_name', None) or item.name} "
+                                 f"— naming from the source name instead.")
+            return None, None
+        folder, fname = organized_names(ident, ext, item)
+        return out / folder, fname
+
+    def _mirror_base(self, item, out: Path, sub: str) -> Path:
+        """A bundle mirrors its source folder name at the destination — unless that would be
+        the source folder ITSELF (output folder == the source's parent), which would drop
+        the result next to the archive it came from. Then the output folder is used as is."""
+        target = out / sanitize_filename(sub)
+        try:
+            src_dir = getattr(item, "bundle_dir", None)
+            if src_dir and target.resolve() == Path(str(src_dir)).resolve():
+                if not getattr(item, "_mirror_warned", False):
+                    item._mirror_warned = True
+                    self.log("INFO", f"Output folder is the source's parent — not mirroring '{sub}' into the "
+                                     f"source folder itself; writing to {out}.")
+                return out
+        except Exception:
+            pass
+        return target
+
+    def _finalize_pkg_name(self, item, pkg_path: Path) -> Path:
+        """Auto-organize for fPKG: the tool names its output '<content-id>-A…-V….pkg'; give it
+        the library name decided in build_command. Returns the final path."""
+        want = getattr(item, "_organized_pkg_name", None)
+        pkg_path = Path(pkg_path)
+        if not want or pkg_path.name == want:
+            return pkg_path
+        target = pkg_path.with_name(want)
+        try:
+            if target.exists():
+                target.unlink()
+            pkg_path.rename(target)
+            self.log("INFO", f"Auto-organize: renamed {pkg_path.name} → {want}")
+            return target
+        except Exception as e:
+            self.log("WARN", f"Auto-organize: could not rename {pkg_path.name} → {want}: {e}")
+            return pkg_path
+
     # ── Queue management ──────────────────────────────────────────────────────
     def queue_move_up(self):
         idx = self._queue_sel_idx()
@@ -8687,6 +8916,9 @@ class App:
                     self._as_fpkg_job(_it, dict(self.fpkg_defaults),
                                       identity=self._take_pending_fpkg_identity(_it))
                 _it.output_compressed = (_fmt != "ffpfs")
+            # Auto-organize is per job too: snapshot the remembered default once.
+            if _op in ("pack", "fpkg-build") and getattr(_it, "auto_organize", None) is None:
+                _it.auto_organize = bool(self.auto_organize_var.get())
         self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
         if select_item is None:
@@ -8924,11 +9156,24 @@ class App:
         explicit_file = out.suffix.lower() in (".ffpfsc", ".ffpfs")
         sub = getattr(item, "bundle_subfolder", None)
         if op == "pack" and not explicit_file:
-            # Bundle: recreate the source folder under the output dir. Bundle
-            # naming applies even in batch (each item has its own subfolder).
-            base = (out / sanitize_filename(sub)) if sub else out
+            # Where and as what the .ffpfsc lands:
+            #  • auto-organize: '<out>/<Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y].ffpfsc' from
+            #    the game's param.json (falls back to the rules below when unreadable);
+            #  • bundle: recreate the source folder under the output dir — never INTO the
+            #    source folder itself (see _mirror_base);
+            #  • else: straight into the output folder.
+            base = out
+            organized_name = None
+            if self._auto_organize_on(item):
+                _b, organized_name = self._organized_layout(item, out, out_ext)
+                if _b is not None:
+                    base = _b
+                elif sub:
+                    base = self._mirror_base(item, out, sub)
+            elif sub:
+                base = self._mirror_base(item, out, sub)
             try:
-                out = base / descriptive_ffpfsc_name(item, ext=out_ext)
+                out = base / (organized_name or descriptive_ffpfsc_name(item, ext=out_ext))
                 if getattr(item, "_name_was_truncated", False):
                     self.log("WARN", f"Output filename shortened to fit the {SHADOWMOUNT_NAME_LIMIT}-"
                                      f"byte ShadowMount limit: {out.name}")
@@ -8964,10 +9209,20 @@ class App:
 
         # ── fPKG BUILD job (/app0 folder or packed image -> built .pkg) ──────
         if op == "fpkg-build":
-            # A bundle (game + DLC extras in one folder) mirrors its folder at the
-            # destination for .pkg output too, like a pack does.
-            if sub and out.suffix.lower() != ".pkg":
-                out = out / sanitize_filename(sub)
+            # Same placement rules as a pack: auto-organize into the game's own folder (the
+            # tool names the .pkg by content id; the worker renames it afterwards — see
+            # _finalize_pkg_name), else a bundle mirrors its folder, never into the source.
+            item._organized_pkg_name = None
+            if out.suffix.lower() != ".pkg":
+                if self._auto_organize_on(item):
+                    _b, _pkg_name = self._organized_layout(item, out, ".pkg")
+                    if _b is not None:
+                        out = _b
+                        item._organized_pkg_name = _pkg_name
+                    elif sub:
+                        out = self._mirror_base(item, out, sub)
+                elif sub:
+                    out = self._mirror_base(item, out, sub)
             head = (pycmd + ["placeholder", str(out)] if getattr(sys, "frozen", False)
                     else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
             cmd = head + [
@@ -9349,7 +9604,35 @@ class App:
         .sprx into fakelib/, and build the index. No-op for non-APR games / disk images."""
         if not getattr(item, "ampr_emu", False) or not getattr(item, "path", None):
             return
+        game = Path(item.path)
         self.log("INFO", f"AMPR: {item.name} is a PlayGo/APR title — preparing emu files.")
+        # Releases often SHIP the emu already — fakelib/libSceAmpr.sprx + libScePlayGo.sprx
+        # and usually an ampr_emu.index. Then there is nothing to ask for or to inject.
+        shipped = [f for f in AMPR_SPRX_FILES if (game / "fakelib" / f).is_file()]
+        shipped_index = (game / "ampr_emu.index").is_file()
+        if len(shipped) == len(AMPR_SPRX_FILES):
+            self.log("INFO", "AMPR: the game ships its own fakelib/ emu files"
+                             + (" and ampr_emu.index" if shipped_index else "") + " — no emu folder needed.")
+            want_sign = bool(self.fake_sign_before_pack_var.get()) and game.is_dir()
+            if want_sign and shipped_index and not getattr(item, "_from_archive", False):
+                # Signing changes file sizes, so the shipped index would go stale — and this
+                # is the user's own library folder, whose files we never rewrite.
+                self.log("WARN", "AMPR: fake-sign-before-pack skipped for this game — it ships an "
+                                 "ampr_emu.index that must match its files, and the source is your own folder.")
+                want_sign = False
+            if want_sign:
+                self._fake_sign_folder_inproc(game)
+            if want_sign or not shipped_index:
+                self.log("INFO", "AMPR: rebuilding ampr_emu.index after fake-signing (AMPRIDX3)." if shipped_index
+                                 else "AMPR: no ampr_emu.index shipped — building one (AMPRIDX3).")
+                self._build_ampr_index(item)
+            else:
+                self.log("INFO", "AMPR: keeping the shipped ampr_emu.index as-is.")
+            return
+        if shipped:
+            missing = [f for f in AMPR_SPRX_FILES if f not in shipped]
+            self.log("INFO", f"AMPR: the game ships {', '.join(shipped)} but not {', '.join(missing)} — "
+                             f"the emu folder supplies the rest.")
         if not self._ensure_ampr_folder():
             self.log("WARN", "AMPR: no emu folder set — packing WITHOUT AMPR support; this "
                              "APR title may not boot until you set the folder in Settings.")

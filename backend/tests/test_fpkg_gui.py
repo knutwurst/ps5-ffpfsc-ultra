@@ -277,6 +277,16 @@ try:
     exp_dir.mkdir(parents=True, exist_ok=True); dummy = exp_dir / "UP9000-PPSA99099_00-PROSPERO00000000-A0100-V0100.pkg"; dummy.write_bytes(b"x")
     renamed = app._finalize_pkg_name(fi2, dummy)
     ok("organize.fpkg.renamed", renamed.name == "LibProsperoPKG [PPSA99099] [v01.000].pkg" and renamed.exists() and not dummy.exists(), str(renamed.name))
+    # the real worker path: the backend's "[OK] fPKG complete: <path>" marker pre-sets output_path
+    # and _find_output returns from that branch — the rename must happen there (1.1.4 missed it)
+    fi3 = app._fpkg_item_for(FF, dict(app.fpkg_defaults), output_path=str(OUT)); fi3.auto_organize = True
+    cmd3w, cwd3, out3w, tmp3 = app.build_command(fi3)
+    out3w.mkdir(parents=True, exist_ok=True); dummy2 = out3w / "UP9000-PPSA99099_00-PROSPERO00000000-A0100-V0100.pkg"; dummy2.write_bytes(b"pkg")
+    w = m.CLIWorker(app, fi3, cmd3w, cwd3, out3w, tmp3); w.start_time = time.time() - 30
+    w.output_path = str(dummy2)          # what the marker line sets
+    found = w._find_output()
+    ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000].pkg"
+       and Path(w.output_path).exists() and not dummy2.exists(), f"{found} {w.output_path}")
     ok("organize.title-cleanup", m.canonical_game_title("DOOM: The Dark Ages™") == "DOOM - The Dark Ages"
        and m.organized_names({"title": "Alan Wake II Deluxe Edition", "title_id": "PPSA02572", "version": "01.200.007"}, ".ffpfsc")
        == ("Alan Wake II Deluxe Edition [PPSA02572] [v01.200.007]", "Alan Wake II Deluxe Edition [PPSA02572] [v01.200].ffpfsc"),

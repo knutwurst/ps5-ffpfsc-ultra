@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -621,6 +622,134 @@ def test_deterministic_build(r: Runner):
             f"drift: {sha(pa)[:16]} vs {sha(pb)[:16]}")
 
 
+def test_list_and_selective_extract(r: Runner):
+    """list-inner + extract-inner --members: the PFS-browser contract for fPKGs. The JSON
+    listing must describe exactly what a full extract-inner writes (same file set, same
+    sizes, every directory incl. empty ones, CNT-lifted sce_sys files tagged), and a
+    selective extract must reproduce the chosen files byte-for-byte and nothing else,
+    with progress lines the GUI regex accepts."""
+    hbt = fetch_hbt(r.work / "hbt")
+
+    # Fixture 2: a synthetic /app0 with a few 20-40 MB files. HomebrewTest's real eboot.bin
+    # and sce_sys are copied in — the synth ELF stub is not fake-signable, the build refuses it.
+    synth = make_synth_folder(r.work / "lsx_src", with_param=False, with_icon=False, with_eboot=False,
+                              data_files=[("data/blob1.bin", os.urandom(30_000_000)),
+                                          ("data/sub/blob2.bin", os.urandom(20_000_000)),
+                                          ("data/sub/deeper/text.txt", b"the quick brown fox\n" * 1_000_000),
+                                          ("notes.txt", b"hello\n")])
+    shutil.copy2(hbt / "eboot.bin", synth / "eboot.bin")
+    shutil.copytree(hbt / "sce_sys", synth / "sce_sys", dirs_exist_ok=True)
+    (synth / "data" / "empty_dir").mkdir(parents=True, exist_ok=True)
+
+    bar_re = re.compile(r"\[#{2,}\]\s*(\d{1,3})%")      # the GUI's progress regex
+    fixtures = [("hbt",   hbt,   "kraken", ["README.md", "eboot.bin", "sce_sys"]),
+                ("synth", synth, "none",   ["data/blob1.bin", "sce_sys/param.json", "data/sub"])]
+    for tag, src, mode, members in fixtures:
+        pkgd = r.work / f"lsx_{tag}_pkg"; full = r.work / f"lsx_{tag}_full"; sel = r.work / f"lsx_{tag}_sel"
+        for d in (pkgd, full, sel):
+            if d.exists(): shutil.rmtree(d)
+            d.mkdir(parents=True)
+        rc, log = r.run_tool(["build", str(src), str(pkgd),
+                              "--content-id", "UP9000-PPSA99099_00-PROSPERO00000000",
+                              "--title-id", "PPSA99099", "--mode", mode, "--kraken-backend", "builtin"])
+        pkg = next(pkgd.glob("*.pkg"), None)
+        if not r.check(f"lsx.{tag}.build", rc == 0 and pkg is not None, f"inner={mode}", log[-300:]):
+            continue
+
+        # Ground truth: the full extraction (inner PFS + CNT merge).
+        rc, log = r.run_tool(["extract-inner", str(pkg), str(full)])
+        if not r.check(f"lsx.{tag}.full-extract", rc == 0, "extract-inner ok", log[-300:]):
+            continue
+        full_files = {str(p.relative_to(full)): p for p in full.rglob("*") if p.is_file()}
+
+        # list-inner: one JSON object on stdout (run_tool merges stderr, so pick the JSON line).
+        rc, log = r.run_tool(["list-inner", str(pkg)])
+        jline = next((ln for ln in log.splitlines() if ln.startswith("{")), "")
+        try:
+            doc = json.loads(jline)
+        except Exception as e:
+            r.check(f"lsx.{tag}.list.json", False, "", f"rc={rc}; stdout is not JSON ({e}): {log[-300:]}")
+            continue
+        r.check(f"lsx.{tag}.list.json", rc == 0 and doc.get("root") == pkg.name and doc.get("errors") == [],
+                f"{doc.get('file_count')} files, {doc.get('dir_count')} dirs",
+                f"rc={rc}; root={doc.get('root')!r} errors={doc.get('errors')}")
+        entries = doc["entries"]
+        files = {e["path"]: e for e in entries if e["type"] == "file"}
+        dirs = {e["path"] for e in entries if e["type"] == "dir"}
+        r.check(f"lsx.{tag}.list.fileset", set(files) == set(full_files),
+                "file set == full extract-inner",
+                f"only-in-list={sorted(set(files) - set(full_files))[:5]} "
+                f"only-in-extract={sorted(set(full_files) - set(files))[:5]}")
+        bad_sizes = [p for p, e in files.items() if p in full_files and e["size"] != full_files[p].stat().st_size]
+        r.check(f"lsx.{tag}.list.sizes", not bad_sizes, "sizes == extracted sizes", f"mismatch: {bad_sizes[:5]}")
+        parents = {p.rsplit("/", 1)[0] for p in list(files) + list(dirs) if "/" in p}
+        r.check(f"lsx.{tag}.list.dirs", parents <= dirs, "every parent directory has its own dir entry",
+                f"missing: {sorted(parents - dirs)[:5]}")
+        r.check(f"lsx.{tag}.list.cnt",
+                files.get("sce_sys/param.json", {}).get("source") == "cnt"
+                and files.get("sce_sys/icon0.png", {}).get("source") == "cnt",
+                "param.json/icon0.png tagged source=cnt",
+                f"{files.get('sce_sys/param.json')} {files.get('sce_sys/icon0.png')}")
+        r.check(f"lsx.{tag}.list.sorted", [e["path"] for e in entries] == sorted(e["path"] for e in entries),
+                "entries sorted by path", "not sorted")
+        r.check(f"lsx.{tag}.list.counts", doc["file_count"] == len(files) and doc["dir_count"] == len(dirs),
+                "file_count/dir_count match", "counts differ from entries")
+        if tag == "synth":
+            r.check("lsx.synth.list.empty-dir", "data/empty_dir" in dirs, "empty directory listed",
+                    f"dirs={sorted(dirs)}")
+
+        # Selective extraction: two files + one directory subtree.
+        mf = r.work / f"lsx_{tag}_members.txt"
+        mf.write_text("\n".join(members) + "\n", encoding="utf-8")
+        rc, log = r.run_tool(["extract-inner", str(pkg), str(sel), "--members", str(mf)])
+        r.check(f"lsx.{tag}.sel.rc", rc == 0, f"exit {rc}", log[-300:])
+        expected = {p for p in full_files if any(p == m or p.startswith(m + "/") for m in members)}
+        got = {str(p.relative_to(sel)): p for p in sel.rglob("*") if p.is_file()}
+        r.check(f"lsx.{tag}.sel.exact-set", set(got) == expected, f"{len(expected)} file(s), nothing else",
+                f"extra={sorted(set(got) - expected)[:5]} missing={sorted(expected - set(got))[:5]}")
+        diff = [p for p in expected if p in got and sha(got[p]) != sha(full_files[p])]
+        r.check(f"lsx.{tag}.sel.identical", not diff, "byte-identical to the full extract", f"differs: {diff[:5]}")
+        r.check(f"lsx.{tag}.sel.cnt-file", (sel / "sce_sys" / "param.json").is_file(),
+                "CNT sce_sys/param.json selectable", "sce_sys/param.json missing")
+        pcts = [int(m.group(1)) for m in (bar_re.search(ln) for ln in log.splitlines()) if m]
+        r.check(f"lsx.{tag}.sel.progress", bool(pcts) and pcts[-1] == 100 and pcts == sorted(pcts),
+                f"{len(pcts)} progress lines, monotone, ends at 100%", f"pcts={pcts[:10]}")
+        if tag == "hbt":
+            # The pre-existing --json documents must be parseable too. Trimming had switched
+            # reflection-based System.Text.Json off and all three crashed on the shipped binary.
+            jd = r.work / "lsx_hbt_json_ext"; jd.mkdir(exist_ok=True)
+            verdicts = []
+            for label, argv, keys in (
+                    ("inspect",       ["inspect", str(pkg), "--json"],            {"path", "content_id", "finalized", "fih"}),
+                    ("validate",      ["validate", str(pkg), "--json"],           {"pass", "warn", "fail", "results"}),
+                    ("extract-inner", ["extract-inner", str(pkg), str(jd), "--json"], {"extracted", "cnt_merged", "output", "files"})):
+                rc, out = r.run_tool(argv)                 # stdout first, then stderr
+                try:
+                    obj, _ = json.JSONDecoder().raw_decode(out.lstrip())
+                    good = rc == 0 and isinstance(obj, dict) and keys <= set(obj)
+                except Exception:
+                    good = False
+                verdicts.append((label, good, rc, out[:120].replace("\n", " ")))
+            r.check("lsx.json.legacy-docs", all(v[1] for v in verdicts),
+                    "inspect/validate/extract-inner --json exit 0 and parse",
+                    "; ".join(f"{l}: rc={rc} {o!r}" for l, g, rc, o in verdicts if not g))
+
+        if tag == "synth":
+            # A directory member with nothing inside is still recreated (structure parity with mkpfs).
+            sel2 = r.work / "lsx_synth_sel2"; sel2.mkdir(exist_ok=True)
+            mf2 = r.work / "lsx_synth_members2.txt"; mf2.write_text("data/empty_dir\n")
+            rc, log = r.run_tool(["extract-inner", str(pkg), str(sel2), "--members", str(mf2)])
+            ed = sel2 / "data" / "empty_dir"
+            r.check("lsx.synth.sel.empty-dir", rc == 0 and ed.is_dir() and not any(ed.iterdir()),
+                    "an empty directory member is recreated", f"rc={rc}; {log[-200:]}")
+            # An unknown member alone is a clean refusal, not a crash.
+            sel3 = r.work / "lsx_synth_sel3"; sel3.mkdir(exist_ok=True)
+            mf3 = r.work / "lsx_synth_members3.txt"; mf3.write_text("does/not/exist\n")
+            rc, log = r.run_tool(["extract-inner", str(pkg), str(sel3), "--members", str(mf3)])
+            r.check("lsx.synth.sel.unknown-member", rc == 1 and "None of the requested" in log,
+                    "refused with rc=1", f"rc={rc}; {log[-200:]}")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="fPKG pipeline end-to-end tests")
@@ -656,6 +785,7 @@ def main():
         ("chain-4: .ffpfsc → fPKG one-click", test_chain4_image_to_fpkg_oneclick),
         ("gui progress translation",        test_gui_progress_translation),
         ("determinism: byte-identical",     test_deterministic_build),
+        ("list-inner + selective extract",  test_list_and_selective_extract),
     ]:
         if args.only and args.only.lower() not in name.lower():
             continue

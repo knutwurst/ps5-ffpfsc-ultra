@@ -1354,9 +1354,17 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── PFS BROWSE MODE (list / extract; standalone, no temp, no mkpfs pack) ─────
+    # A .pkg (fPKG) browses the same way: the bundled tool lists / extracts the inner
+    # image block-wise (list-inner / extract-inner --members) and answers in the same
+    # JSON shape and progress-line format, so the GUI dialog needs no second path.
     if args.list_image:
+        img = Path(args.list_image).resolve()
         try:
-            result = list_pfs_image(Path(args.list_image).resolve())
+            if img.suffix.lower() == ".pkg":
+                import fpkg as _fpkg
+                result = _fpkg.list_inner(img)
+            else:
+                result = list_pfs_image(img)
         except Exception as e:
             print(f"PFSBROWSE_ERROR: {e}", flush=True)
             sys.exit(1)
@@ -1371,9 +1379,15 @@ def main() -> None:
         except Exception as e:
             print(f"[ERROR] Could not read members file: {e}", flush=True)
             sys.exit(1)
+        img = Path(args.extract_from).resolve()
         try:
-            rc = extract_pfs_members(Path(args.extract_from).resolve(), members,
-                                     Path(args.dest).resolve())
+            if img.suffix.lower() == ".pkg":
+                import fpkg as _fpkg
+                rc = _fpkg.extract_members(img, Path(args.dest).resolve(),
+                                           Path(args.members_file).resolve(),
+                                           on_line=lambda l: print(l, flush=True))
+            else:
+                rc = extract_pfs_members(img, members, Path(args.dest).resolve())
         except Exception as e:
             print(f"[ERROR] Extraction failed: {e}", flush=True)
             sys.exit(1)

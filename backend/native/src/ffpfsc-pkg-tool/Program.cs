@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using LibProsperoPkg;
 using LibProsperoPkg.PKG;
@@ -21,6 +23,7 @@ internal static class Program
             {
                 "version" => CmdVersion(),
                 "inspect" => CmdInspect(args),
+                "list-inner" => CmdListInner(args),
                 "extract-inner" => CmdExtract(args, inner: true),
                 "extract-outer" => CmdExtract(args, inner: false),
                 "build" => CmdBuild(args),
@@ -42,7 +45,14 @@ internal static class Program
         Console.WriteLine("ffpfsc-pkg-tool <command> [args]");
         Console.WriteLine("  version");
         Console.WriteLine("  inspect       <pkg>                              [--json]");
+        Console.WriteLine("  list-inner    <pkg> [--passcode P]");
+        Console.WriteLine("      One JSON object on stdout: the /app0 tree (files with logical sizes, every");
+        Console.WriteLine("      directory, CNT-lifted sce_sys metadata tagged \"source\":\"cnt\") — read via");
+        Console.WriteLine("      random access, the inner image is NOT decoded as a whole.");
         Console.WriteLine("  extract-inner <pkg> <out-dir> [--passcode P]     [--json]");
+        Console.WriteLine("  extract-inner <pkg> <out-dir> --members <file> [--passcode P] [--json]");
+        Console.WriteLine("      Selective: <file> lists one path per line (relative to /app0); a directory");
+        Console.WriteLine("      means its whole subtree incl. empty folders. Prints '[####] NN% extract (path)'.");
         Console.WriteLine("  extract-outer <pkg> <out-dir> [--passcode P]     [--decompress|--no-decompress]");
         Console.WriteLine("  validate      <pkg>                              [--json]");
         Console.WriteLine("      Diagnostic checklist: header magic + fields, CNT wrap, PFS bounds,");
@@ -85,7 +95,7 @@ internal static class Program
         bool json = Array.Exists(args, a => a == "--json");
         var type = ProsperoPkgReader.DetectType(pkg);
         var pkgObj = ProsperoPkgReader.Read(pkg);
-        var info = new
+        var info = new InspectDoc
         {
             path = Path.GetFullPath(pkg),
             size_bytes = new FileInfo(pkg).Length,
@@ -98,7 +108,7 @@ internal static class Program
             entry_count = pkgObj.Header?.EntryCount,
             sc_entry_count = pkgObj.Header?.ScEntryCount,
             finalized = pkgObj.Fih != null,
-            fih = pkgObj.Fih == null ? null : new {
+            fih = pkgObj.Fih == null ? null : new InspectFihDoc {
                 is_official = pkgObj.Fih.IsOfficial,
                 signed_byte = pkgObj.Fih.SignedByte,
                 pfs_image_offset = pkgObj.Fih.PfsImageOffset,
@@ -109,7 +119,7 @@ internal static class Program
                 naps_layout_size = pkgObj.Fih.NapsLayoutSize,
             },
         };
-        if (json) Console.WriteLine(JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true }));
+        if (json) Console.WriteLine(JsonSerializer.Serialize(info, PkgToolJsonContext.Indented.InspectDoc));
         else
         {
             Console.WriteLine($"path         : {info.path}");
@@ -138,6 +148,7 @@ internal static class Program
         bool decompress = true;
         bool json = false;
         bool mergeCnt = true;   // for extract-inner: also drop param.json/icon0/playgo-* into sce_sys/
+        string? membersFile = null;
         for (int i = 3; i < args.Length; i++)
         {
             if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
@@ -145,6 +156,12 @@ internal static class Program
             else if (args[i] == "--no-decompress") decompress = false;
             else if (args[i] == "--json") json = true;
             else if (args[i] == "--no-merge-cnt") mergeCnt = false;
+            else if (args[i] == "--members" && i + 1 < args.Length) membersFile = args[++i];
+        }
+        if (membersFile != null)
+        {
+            if (!inner) return Bad("--members is only supported by extract-inner");
+            return CmdExtractMembers(pkg, outDir, passcode, membersFile, json);
         }
         Directory.CreateDirectory(outDir);
         Console.Error.WriteLine($"[info] extract-{(inner ? "inner" : "outer")}  {pkg} -> {outDir}");
@@ -167,9 +184,7 @@ internal static class Program
                 var sceSys = Path.Combine(outDir, "sce_sys");
                 Directory.CreateDirectory(sceSys);
                 // CNT filenames we lift into sce_sys/ (the console's /app0 layout).
-                var wanted = new[] { "param.json", "icon0.png", "pic0.png", "pic1.png",
-                                     "playgo-chunk.dat", "playgo-ficm.dat", "playgo-hash-table.dat",
-                                     "playgo-manifest.xml", "npbind.dat", "changeinfo.xml" };
+                var wanted = CntSceSysNames;
                 foreach (var name in wanted)
                 {
                     var src = Path.Combine(tmpCnt, name);
@@ -191,11 +206,11 @@ internal static class Program
 
         if (json)
         {
-            Console.WriteLine(JsonSerializer.Serialize(new {
+            Console.WriteLine(JsonSerializer.Serialize(new ExtractResultDoc {
                 extracted = files.Count,
                 cnt_merged = mergedCount,
-                output = Path.GetFullPath(outDir), files
-            }, new JsonSerializerOptions { WriteIndented = true }));
+                output = Path.GetFullPath(outDir), files = files.ToList()
+            }, PkgToolJsonContext.Indented.ExtractResultDoc));
         }
         else
         {
@@ -203,6 +218,307 @@ internal static class Program
             Console.WriteLine($"OK — extracted {files.Count} file(s){extra} to {Path.GetFullPath(outDir)}");
         }
         return 0;
+    }
+
+    // CNT entry names that belong in /app0/sce_sys/ but live in the CNT table, not the inner PFS.
+    // Shared by the full extract (merge step), list-inner and the selective extract so the three
+    // agree on what "the inner tree" contains.
+    static readonly string[] CntSceSysNames = { "param.json", "icon0.png", "pic0.png", "pic1.png",
+                                                "playgo-chunk.dat", "playgo-ficm.dat", "playgo-hash-table.dat",
+                                                "playgo-manifest.xml", "npbind.dat", "changeinfo.xml" };
+
+    /// <summary>
+    /// Extracts the CNT entries into <paramref name="tmpDir"/> and returns "sce_sys/&lt;name&gt;" -> temp
+    /// file for every lifted name that exists. Failures are reported into <paramref name="errors"/>
+    /// (the inner tree is still usable without them, matching the full extract's [warn] behaviour).
+    /// </summary>
+    static Dictionary<string, string> LiftCntSceSys(string pkg, string passcode, string tmpDir, List<string> errors)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            Directory.CreateDirectory(tmpDir);
+            ProsperoPackageArchive.ExtractCntEntries(pkg, tmpDir, passcode, includeEncrypted: true);
+            foreach (var name in CntSceSysNames)
+            {
+                var src = Path.Combine(tmpDir, name);
+                if (File.Exists(src)) result["sce_sys/" + name] = src;
+            }
+        }
+        catch (Exception ex)
+        {
+            errors.Add("CNT metadata unavailable: " + ex.Message);
+        }
+        return result;
+    }
+
+    // The binary is published trimmed, which turns reflection-based System.Text.Json off, so every
+    // --json document goes through the source-generated serializer (PkgToolJsonContext below).
+    // The classes mirror the anonymous types the commands used before: same field names, same
+    // number/bool/null shapes.
+    internal sealed class InspectDoc
+    {
+        public string path { get; set; } = "";
+        public long size_bytes { get; set; }
+        public string? package_type { get; set; }
+        public string? content_id { get; set; }
+        public string? title_id { get; set; }
+        public uint? drm_type { get; set; }
+        public uint? content_type { get; set; }
+        public uint? entry_count { get; set; }
+        public ushort? sc_entry_count { get; set; }
+        public bool finalized { get; set; }
+        public InspectFihDoc? fih { get; set; }
+    }
+
+    internal sealed class InspectFihDoc
+    {
+        public bool is_official { get; set; }
+        public byte signed_byte { get; set; }
+        public ulong pfs_image_offset { get; set; }
+        public ulong pfs_image_size { get; set; }
+        public ulong embedded_cnt_off { get; set; }
+        public uint inner_blocks { get; set; }
+        public uint metadata_blocks { get; set; }
+        public ulong naps_layout_size { get; set; }
+    }
+
+    internal sealed class ExtractResultDoc
+    {
+        public int extracted { get; set; }
+        public int cnt_merged { get; set; }
+        public string output { get; set; } = "";
+        public List<string> files { get; set; } = new();
+    }
+
+    internal sealed class ValidateReportDoc
+    {
+        public int pass { get; set; }
+        public int warn { get; set; }
+        public int fail { get; set; }
+        public List<ValidateResult> results { get; set; } = new();
+    }
+
+    internal sealed class InnerEntry
+    {
+        public string path { get; set; } = "";
+        public string type { get; set; } = "file";   // "file" | "dir"
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public long? size { get; set; }
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public string? source { get; set; }             // "pfs" | "cnt" (files only)
+    }
+
+    internal sealed class ListInnerDoc
+    {
+        public string root { get; set; } = "";
+        public List<InnerEntry> entries { get; set; } = new();
+        public int file_count { get; set; }
+        public int dir_count { get; set; }
+        public List<string> errors { get; set; } = new();
+    }
+
+    internal sealed class MembersResultDoc
+    {
+        public int extracted { get; set; }
+        public int dirs { get; set; }
+        public int cnt_extracted { get; set; }
+        public string output { get; set; } = "";
+        public List<string> files { get; set; } = new();
+        public List<string> errors { get; set; } = new();
+    }
+
+    /// <summary>Rejects the path shapes the library rejects (empty, '.', '..' segments).</summary>
+    static string SafeRelative(string rel)
+    {
+        var norm = rel.Replace('\\', '/').Trim().Trim('/');
+        if (norm.Length == 0 || norm.Split('/').Any(p => p.Length == 0 || p == "." || p == ".."))
+            throw new InvalidDataException("unsafe package path: " + rel);
+        return norm;
+    }
+
+    static string SafeTarget(string root, string rel)
+    {
+        var rootFull = Path.GetFullPath(root) + Path.DirectorySeparatorChar;
+        var full = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
+        if (!full.StartsWith(rootFull, StringComparison.Ordinal))
+            throw new InvalidDataException("package path escapes output directory: " + rel);
+        return full;
+    }
+
+    /// <summary>
+    /// The /app0 tree as list-inner reports it and as extract-inner --members resolves it:
+    /// inner-PFS files + dirs, plus the CNT-lifted sce_sys files (which win over a same-named
+    /// PFS file, exactly like the full extract's overwrite-merge).
+    /// </summary>
+    static SortedDictionary<string, InnerEntry> BuildInnerTree(InnerImage img, IReadOnlyDictionary<string, string> cnt)
+    {
+        var tree = new SortedDictionary<string, InnerEntry>(StringComparer.Ordinal);
+        void AddDirs(string filePath)
+        {
+            int idx = -1;
+            while ((idx = filePath.IndexOf('/', idx + 1)) >= 0)
+            {
+                var d = filePath.Substring(0, idx);
+                if (!tree.ContainsKey(d)) tree[d] = new InnerEntry { path = d, type = "dir" };
+            }
+        }
+        foreach (var d in img.AllDirs())
+        {
+            var rel = SafeRelative(img.RelativePath(d));
+            tree[rel] = new InnerEntry { path = rel, type = "dir" };
+        }
+        foreach (var f in img.Pfs.GetAllFiles())
+        {
+            var rel = SafeRelative(img.RelativePath(f));
+            AddDirs(rel);
+            tree[rel] = new InnerEntry { path = rel, type = "file", size = f.size, source = "pfs" };
+        }
+        foreach (var kv in cnt)
+        {
+            AddDirs(kv.Key);
+            tree[kv.Key] = new InnerEntry { path = kv.Key, type = "file", size = new FileInfo(kv.Value).Length, source = "cnt" };
+        }
+        return tree;
+    }
+
+    static int CmdListInner(string[] args)
+    {
+        if (args.Length < 2) return Bad("list-inner needs <pkg>");
+        var pkg = args[1];
+        if (!File.Exists(pkg)) throw new FileNotFoundException("package not found", pkg);
+        string passcode = new string('0', 32);
+        for (int i = 2; i < args.Length; i++)
+            if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
+
+        var errors = new List<string>();
+        var tmpCnt = Path.Combine(Path.GetTempPath(), "fpkg-list-cnt-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var img = new InnerImage(pkg, passcode);
+            var cnt = LiftCntSceSys(pkg, passcode, tmpCnt, errors);
+            var tree = BuildInnerTree(img, cnt);
+            int files = 0, dirs = 0;
+            foreach (var e in tree.Values) { if (e.type == "dir") dirs++; else files++; }
+            var doc = new ListInnerDoc
+            {
+                root = Path.GetFileName(pkg),
+                entries = tree.Values.ToList(),
+                file_count = files,
+                dir_count = dirs,
+                errors = errors,
+            };
+            Console.WriteLine(JsonSerializer.Serialize(doc, PkgToolJsonContext.Default.ListInnerDoc));
+            if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
+                Console.Error.WriteLine($"[trace] list-inner: logical image {img.LogicalSize:N0} B, superblock @0x{img.SuperblockOffset:X}, " +
+                                        $"{img.RangeCalls} range decodes / {img.RangeBytes:N0} B");
+            return 0;
+        }
+        finally
+        {
+            try { if (Directory.Exists(tmpCnt)) Directory.Delete(tmpCnt, recursive: true); } catch { }
+        }
+    }
+
+    static int CmdExtractMembers(string pkg, string outDir, string passcode, string membersFile, bool json)
+    {
+        if (!File.Exists(pkg)) throw new FileNotFoundException("package not found", pkg);
+        if (!File.Exists(membersFile)) throw new FileNotFoundException("members file not found", membersFile);
+        var wanted = new List<string>();
+        foreach (var raw in File.ReadAllLines(membersFile, System.Text.Encoding.UTF8))
+        {
+            var m = raw.Replace('\\', '/').Trim().Trim('/');
+            if (m.Length > 0 && !wanted.Contains(m)) wanted.Add(m);
+        }
+        if (wanted.Count == 0) return Bad("--members file lists no paths");
+        bool Under(string rel) => wanted.Any(m => rel == m || rel.StartsWith(m + "/", StringComparison.Ordinal));
+
+        Directory.CreateDirectory(outDir);
+        Console.Error.WriteLine($"[info] extract-inner (members)  {pkg} -> {outDir}  ({wanted.Count} member(s))");
+        var errors = new List<string>();
+        var tmpCnt = Path.Combine(Path.GetFullPath(outDir), ".cnt-tmp-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            // 4 MiB cache blocks: metadata walks need few of them and file data streams through
+            // the chunked fast path anyway, so the plan-rebuild cost per DecompressRange amortizes.
+            using var img = new InnerImage(pkg, passcode, cacheBlockSize: 4 << 20, cacheBlocks: 8);
+            var cnt = LiftCntSceSys(pkg, passcode, tmpCnt, errors);
+            foreach (var e in errors) Console.Error.WriteLine("[warn] " + e);
+            var tree = BuildInnerTree(img, cnt);
+
+            var dirTargets = tree.Values.Where(e => e.type == "dir" && Under(e.path)).Select(e => e.path).ToList();
+            var fileTargets = tree.Values.Where(e => e.type == "file" && Under(e.path)).ToList();
+            foreach (var m in wanted)
+                if (!tree.ContainsKey(m)) Console.Error.WriteLine($"[warn] member not found in the image: {m}");
+            if (dirTargets.Count == 0 && fileTargets.Count == 0)
+            {
+                Console.Error.WriteLine("[ERROR] None of the requested items were found in the image.");
+                return 1;
+            }
+
+            // Directories first (parent-first by sort order) so empty ones survive.
+            foreach (var d in dirTargets) Directory.CreateDirectory(SafeTarget(outDir, d));
+            // Parents of selected files that were not themselves selected.
+            foreach (var f in fileTargets)
+                Directory.CreateDirectory(Path.GetDirectoryName(SafeTarget(outDir, f.path))!);
+
+            long total = fileTargets.Sum(e => e.size ?? 0), done = 0;
+            int lastPct = -1;
+            var written = new List<string>();
+            int cntCount = 0;
+            void Progress(long delta, string rel)
+            {
+                done += delta;
+                int pct = total > 0 ? (int)Math.Min(99, done * 100 / total) : 99;
+                if (pct != lastPct)
+                {
+                    lastPct = pct;
+                    Console.WriteLine($"[####] {pct}% extract ({rel})");
+                }
+            }
+            foreach (var e in fileTargets)
+            {
+                var dst = SafeTarget(outDir, e.path);
+                if (e.source == "cnt")
+                {
+                    File.Copy(cnt[e.path], dst, overwrite: true);
+                    cntCount++;
+                    Progress(e.size ?? 0, e.path);
+                }
+                else
+                {
+                    var node = img.Pfs.GetFile(e.path) ?? throw new InvalidDataException("inner file vanished: " + e.path);
+                    using var fs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+                    img.CopyFile(node, fs, n => Progress(n, e.path));
+                }
+                written.Add(e.path);
+            }
+            Console.WriteLine("[####] 100% extract");
+            if (json)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(new MembersResultDoc
+                {
+                    extracted = written.Count,
+                    dirs = dirTargets.Count,
+                    cnt_extracted = cntCount,
+                    output = Path.GetFullPath(outDir),
+                    files = written,
+                    errors = errors,
+                }, PkgToolJsonContext.Indented.MembersResultDoc));
+            }
+            else
+            {
+                string extra = cntCount > 0 ? $" (+{cntCount} sce_sys metadata)" : "";
+                Console.WriteLine($"OK — extracted {written.Count} file(s) and {dirTargets.Count} folder(s){extra} to {Path.GetFullPath(outDir)}");
+            }
+            if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
+                Console.Error.WriteLine($"[trace] members: {img.RangeCalls} range decodes / {img.RangeBytes:N0} B for {done:N0} B of output");
+            return 0;
+        }
+        finally
+        {
+            try { if (Directory.Exists(tmpCnt)) Directory.Delete(tmpCnt, recursive: true); } catch { }
+        }
     }
 
     static int CmdValidate(string[] args)
@@ -350,7 +666,7 @@ internal static class Program
         return fails == 0 ? 0 : 1;
     }
 
-    sealed class ValidateResult
+    internal sealed class ValidateResult
     {
         public string Check { get; set; } = "";
         public string Level { get; set; } = "pass"; // pass / warn / fail
@@ -363,11 +679,11 @@ internal static class Program
         foreach (var r in checks) { if (r.Level == "pass") p++; else if (r.Level == "warn") w++; else f++; }
         if (json)
         {
-            Console.WriteLine(JsonSerializer.Serialize(new
+            Console.WriteLine(JsonSerializer.Serialize(new ValidateReportDoc
             {
                 pass = p, warn = w, fail = f,
                 results = checks,
-            }, new JsonSerializerOptions { WriteIndented = true }));
+            }, PkgToolJsonContext.Indented.ValidateReportDoc));
             return;
         }
         foreach (var r in checks)
@@ -464,4 +780,17 @@ internal static class Program
             foreach (var w in result.Warnings) Console.Error.WriteLine("[warn] " + w);
         return 0;
     }
+}
+
+[System.Text.Json.Serialization.JsonSourceGenerationOptions(WriteIndented = false)]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Program.ListInnerDoc))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Program.MembersResultDoc))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Program.InspectDoc))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Program.ExtractResultDoc))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Program.ValidateReportDoc))]
+internal sealed partial class PkgToolJsonContext : System.Text.Json.Serialization.JsonSerializerContext
+{
+    static PkgToolJsonContext? _indented;
+    /// <summary>Same contract, pretty-printed — for the human-facing --json outputs.</summary>
+    public static PkgToolJsonContext Indented => _indented ??= new PkgToolJsonContext(new JsonSerializerOptions { WriteIndented = true });
 }

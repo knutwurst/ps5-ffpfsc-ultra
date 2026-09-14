@@ -11,7 +11,7 @@ badges/details, double-click dispatch, dialog sizing, and queue persistence.
 Needs the GUI deps (customtkinter, tkinterdnd2, pillow, psutil) and a display; the
 user's settings.json is snapshotted before and restored after the run.
 """
-import sys, importlib.util, traceback, argparse, shutil, subprocess, tempfile, time, zipfile
+import sys, importlib.util, traceback, argparse, shutil, subprocess, tempfile, time, zipfile, json, re
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -309,6 +309,27 @@ try:
     app.auto_organize_var.set(False); si = m.GameItem(HBT); app.queue.append(si); app.update_queue_box()
     ok("organize.snapshot", si.auto_organize is False, str(getattr(si, "auto_organize", None)))
     app.queue.remove(si); app.auto_organize_var.set(True)
+    # 14d) fPKG in the PFS browser: the backend routes .pkg to the tool's list-inner /
+    #      extract-inner --members and answers in the browser's own JSON / progress format
+    if pkg:
+        r1 = subprocess.run([sys.executable, "-u", str(CLI), "--list-image", str(pkg)], capture_output=True, text=True, timeout=300)
+        line = next((l for l in r1.stdout.splitlines() if l.startswith("PFSBROWSE_JSON:")), "")
+        data = json.loads(line.split(":", 1)[1]) if line else {}
+        paths = {e["path"] for e in data.get("entries", [])}
+        ok("browser.cli.list-pkg", "sce_sys/param.json" in paths and "eboot.bin" in paths and data.get("file_count", 0) >= 3
+           and any(e.get("type") == "dir" and e["path"] == "sce_sys" for e in data.get("entries", [])), f"{sorted(paths)[:6]} {r1.stderr[-120:]}")
+        mdir = S / "browse_members"; mdir.mkdir(exist_ok=True); mf = mdir / "m.txt"; mf.write_text("sce_sys/param.json\neboot.bin\n")
+        dest = mdir / "out"
+        r2 = subprocess.run([sys.executable, "-u", str(CLI), "--extract-from", str(pkg), "--dest", str(dest), "--members-file", str(mf)],
+                            capture_output=True, text=True, timeout=300)
+        ok("browser.cli.extract-pkg-members", r2.returncode == 0 and (dest / "sce_sys" / "param.json").is_file() and (dest / "eboot.bin").is_file()
+           and re.search(r"\[#{2,}\]\s*\d{1,3}%", r2.stdout) is not None and not (dest / "sce_sys" / "icon0.png").exists(),
+           f"rc={r2.returncode} {r2.stdout[-140:]}")
+        br = m.PfsBrowserDialog(app, image_path=pkg); root.update()
+        pump(lambda: "files" in br.status_var.get() or br.status_var.get().startswith(("Failed", "Could not", "Bad")), timeout=90)
+        ok("browser.dialog.pkg-listing", "files" in br.status_var.get() and any(p.endswith("param.json") for p in br._iid_path.values())
+           and "fPKG" in br.title(), br.status_var.get())
+        br.destroy()
     # 15) queue save/restore keeps fpkg fields
     app._queue_restored = True; app._save_queue()
     saved = m.load_settings().get("queue") or []

@@ -30,3 +30,5 @@ backend/native/src/ffpfsc-pkg-tool/out/
 
 # macOS
 .DS_Store
+
+backend/native/src/ffpfsc-pkg-tool/publish.log

@@ -163,12 +163,19 @@ try:
     dlg4b.src_var.set(str(HBT)); root.update()
     ok("dialog.noparam.unforced-on-good-source", not dlg4b._ident_forced and dlg4b.irow.winfo_manager() == "", f"forced={dlg4b._ident_forced}")
     dlg4b.destroy()
-    # 6b) a .ffpfsc is refused for the .ffpfsc / .ffpfs formats (already packed) …
+    # 6b) a .ffpfsc source with the .ffpfsc TARGET format → same-format copy job (1.1.8+).
+    # The pre-1.1.8 refusal ("already packed — pick .pkg to build an fPKG") is gone: the file
+    # is already in the target format, so it's transported as-is via the queue's copy op.
     dlg5 = m.PackDialog(app, source=FF, fmt="ffpfsc"); root.update()
-    ok("dialog.ffpfsc.hint", "already packed" in dlg5.src_hint.get().lower(), dlg5.src_hint.get())
+    ok("dialog.ffpfsc.copy-hint", "copied unchanged" in dlg5.src_hint.get().lower(), dlg5.src_hint.get())
+    ok("dialog.ffpfsc.copy-row-shown", dlg5.copy_row.winfo_manager() != "", f"manager={dlg5.copy_row.winfo_manager()!r}")
     dlg5.out_var.set(str(OUT)); n3 = len(app.queue); dlg5._add(); root.update()
-    ok("dialog.ffpfsc.refused-for-pack", len(app.queue) == n3 and any("Already packed" in e for e in errors), str(errors[-1:]))
-    dlg5.destroy()
+    ok("dialog.ffpfsc.enqueued-as-copy",
+       len(app.queue) == n3 + 1 and app.queue[-1].operation == "copy",
+       f"op={getattr(app.queue[-1], 'operation', None) if app.queue else None} errors={errors[-1:]}")
+    ok("dialog.ffpfsc.copy.delete-source-default", getattr(app.queue[-1], "copy_delete_source", None) is True,
+       f"delete_source={getattr(app.queue[-1], 'copy_delete_source', None)}")
+    app.queue.pop()   # keep the fixture queue clean for later tests
     # 7) ARCHIVE source with .pkg → queued as an fPKG placeholder; the payload copy after extraction keeps it fPKG
     dlg6 = m.PackDialog(app, source=ZP, fmt="pkg"); root.update()
     ok("dialog.archive.hint", "extracted" in dlg6.src_hint.get().lower(), dlg6.src_hint.get())

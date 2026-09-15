@@ -3,7 +3,45 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.8  (current)
+  v1.1.9  (current)
+────────────────────────────────────────────────────────────────────────
+
+COPY JOB FIXES — the 1.1.8 copy op reported failure after succeeding
+
+  • A successful copy raised "Compression Failed — Backend exited but no
+    new .ffpfsc output was created". The copy op fell through to the PACK
+    completion path, which scans the output folder for a newly-created
+    .ffpfsc. A copy's file lands synchronously at the exact name the
+    backend was told to use, so there is nothing to discover. Copy now
+    short-circuits on a clean exit like fake-sign does, and skips the
+    bundle-siblings copy and the ShadowMount sniff (neither applies to a
+    straight file transport).
+
+  • Copy jobs no longer land in the compression history (they move an
+    existing package, they do not produce a new one), and no longer arm
+    the OOM auto-retry (there is no memory-hungry pass to retry).
+
+  • Exit 2 (source == destination) and exit 3 (a different file already
+    owns that name) are deliberate skips, not failures. They now report
+    "Copy skipped — <reason>. Nothing was changed." instead of the
+    failure dialog.
+
+  • The error dialog is job-aware. "Compression Failed" with MkPFS and
+    temp-space causes made no sense for a copy, an extraction or a
+    fake-sign, so the title and the Possible Causes list now match the
+    job that actually failed.
+
+  • Startup leftover sweep widened: it also scans every output folder
+    recorded in the history (and its parent), so orphaned _ffpfsc_temp /
+    _extracted folders on drives used in earlier sessions get surfaced
+    instead of accumulating silently. Prompt threshold lowered from
+    1 GiB to 64 MiB.
+
+  • 8 new regression tests drive a real copy job through CLIWorker end to
+    end (88 GUI tests total, all green).
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.8
 ────────────────────────────────────────────────────────────────────────
 
 COPY / ORGANIZE — SAME-FORMAT JOBS SKIP THE ENCODER

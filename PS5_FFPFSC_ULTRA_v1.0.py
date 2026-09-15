@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1485,9 +1485,44 @@ class FirstRunWizard(ctk.CTkToplevel):
 # ─── Detailed Error Dialog ─────────────────────────────────────────────────────
 
 class ErrorDialog(ctk.CTkToplevel):
-    def __init__(self, parent, msg: str, last_cmd: str = "", log_lines: str = ""):
+    # Title + likely causes per job kind. The pack/MkPFS causes are actively misleading
+    # for a job that never runs MkPFS (a copy moves a finished file; fake-sign rewrites
+    # executables in place), so each kind gets the causes that can actually apply to it.
+    _TITLES = {
+        "copy":         "Copy Failed",
+        "unpack":       "Extraction Failed",
+        "fpkg-extract": "fPKG Extraction Failed",
+        "fpkg-build":   "fPKG Build Failed",
+        "fake-sign":    "Fake-Signing Failed",
+    }
+    _CAUSES = {
+        "copy": [
+            "• Insufficient free space on the output drive",
+            "• Source or destination drive disconnected or write-protected",
+            "• Destination folder not writable (permissions)",
+            "• The source file was moved or deleted while the job was queued",
+        ],
+        "fake-sign": [
+            "• Folder unavailable or not writable (permissions)",
+            "• An executable is corrupted or not a valid ELF",
+            "• External drive disconnected mid-run",
+        ],
+    }
+    _DEFAULT_CAUSES = [
+        "• Insufficient free space on temp or output drive",
+        "• External drive disconnected or write-protected",
+        "• Temp folder unavailable or permissions issue",
+        "• MkPFS backend failure (corrupted dump or unsupported format)",
+        "• Python not found or wrong version",
+        "• Antivirus blocking backend process",
+    ]
+
+    def __init__(self, parent, msg: str, last_cmd: str = "", log_lines: str = "",
+                 operation: str = "pack"):
         super().__init__(parent)
-        self.title("Compression Failed")
+        self._op = operation or "pack"
+        self._heading = self._TITLES.get(self._op, "Compression Failed")
+        self.title(self._heading)
         self.geometry("700x560")
         self.resizable(True, True)
         self.grab_set()
@@ -1498,7 +1533,7 @@ class ErrorDialog(ctk.CTkToplevel):
         self._build()
 
     def _build(self):
-        ctk.CTkLabel(self, text="Compression Failed", font=ctk.CTkFont(size=22, weight="bold"),
+        ctk.CTkLabel(self, text=self._heading, font=ctk.CTkFont(size=22, weight="bold"),
                       text_color=RED).pack(anchor="w", padx=20, pady=(20, 4))
 
         ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=660, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
@@ -1507,14 +1542,7 @@ class ErrorDialog(ctk.CTkToplevel):
         causes.pack(fill="x", padx=20, pady=(0, 12))
         ctk.CTkLabel(causes, text="Possible Causes:", text_color=YELLOW,
                       font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(10, 4))
-        for cause in [
-            "• Insufficient free space on temp or output drive",
-            "• External drive disconnected or write-protected",
-            "• Temp folder unavailable or permissions issue",
-            "• MkPFS backend failure (corrupted dump or unsupported format)",
-            "• Python not found or wrong version",
-            "• Antivirus blocking backend process",
-        ]:
+        for cause in self._CAUSES.get(self._op, self._DEFAULT_CAUSES):
             ctk.CTkLabel(causes, text=cause, text_color=MUTED, anchor="w").pack(anchor="w", padx=24, pady=1)
         ctk.CTkFrame(causes, height=8, fg_color=PANEL).pack()
 
@@ -3672,13 +3700,26 @@ class CLIWorker(threading.Thread):
             if self.app.cancel_requested:
                 self.app.finish(False, "Cancelled by user.", self.last_cmd_str)
                 return
+            # A copy job's exit 2 / 3 are deliberate SKIPS, not failures: the source and
+            # destination are the same file (2), or a different file already owns the
+            # destination name (3). Nothing was written, nothing was lost, and the
+            # pack-flavoured "Compression Failed" dialog (with MkPFS/temp-space causes)
+            # would be actively misleading. Report them as a plain skip instead.
+            if self.operation == "copy" and code in (2, 3):
+                reason = ("source and destination are the same file"
+                          if code == 2 else
+                          "a different file already uses that name in the output folder")
+                self._write_report(True)
+                self.app.finish(True, f"Copy skipped — {reason}. Nothing was changed.",
+                                self.last_cmd_str)
+                return
             if code != 0:
                 smart = smart_error_from_log()
                 msg = smart if smart else f"Backend exited with code {code}."
                 # Flag an out-of-memory kill so the main thread can auto-retry with fewer
                 # cores: either a printed MemoryError, or a SIGKILL (-9 / 137) during a
                 # pack — the OS memory-pressure kill leaves mkpfs no chance to print one.
-                if (self.operation not in ("unpack", "fpkg-extract", "fpkg-build")
+                if (self.operation not in ("unpack", "fpkg-extract", "fpkg-build", "copy")
                         and (getattr(self, "_mem_error_shown", False) or code in (-9, 137))):
                     self.oom_killed = True
                 self.app.finish(False, msg, self.last_cmd_str)
@@ -3696,6 +3737,17 @@ class CLIWorker(threading.Thread):
             if self.operation == "fake-sign":
                 self._write_report(True)
                 self.app.finish(True, "Fake-signing completed successfully.", self.last_cmd_str)
+                return
+
+            # A COPY job's output is a single file at a name the backend already picked
+            # ("--copy-name" for auto-organize, else the source's basename). It landed
+            # synchronously in this run — no post-hoc "did a new .ffpfsc appear" scan,
+            # no bundle-siblings copy (this is a straight file transport), no ShadowMount
+            # sniff (we didn't repack anything). Exit 0 with a printed [SUCCESS] line is
+            # the success signal.
+            if self.operation == "copy":
+                self._write_report(True)
+                self.app.finish(True, "Copy completed successfully.", self.last_cmd_str)
                 return
 
             if not self._find_output():
@@ -10088,7 +10140,12 @@ class App:
         _extracted on the temp drive, plus _ffpfsc_temp / _ffpfsc_extract on the output
         drive — and offer to reclaim it. Sizing walks large trees, so it runs in a
         background thread; the confirm prompt + delete are marshalled to the main thread.
-        Only this app's own working dirs are ever touched."""
+        Only this app's own working dirs are ever touched.
+
+        1.1.8: also scans every unique output folder recorded in the history so leftovers
+        on drives the user built to in past sessions (a spread run, an aborted job on an
+        external HDD) get surfaced instead of aging out silently. Threshold dropped from
+        1 GiB → 64 MiB so small-but-real orphans stop accumulating."""
         if getattr(self, "_browser_only", False):
             return   # browser-only launch (double-clicked a .ffpfsc) — don't prompt on the hidden window
         NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner")
@@ -10100,9 +10157,38 @@ class App:
                 bases += [str(p) for p in self._temp_pool_dirs()]   # extra scratch SSDs too
             except Exception:
                 pass
+            # Drives from the history: each recorded output path is a folder we WROTE to,
+            # so its parent may still hold our _ffpfsc_temp from a run that never cleaned up.
+            try:
+                hist = load_history() or []
+                hist_bases: set[str] = set()
+                for h in hist[-100:]:
+                    out = str((h or {}).get("output") or "").strip()
+                    if not out:
+                        continue
+                    op = Path(out)
+                    # Try the output path itself and its parent — the temp dir might sit
+                    # next to the .ffpfsc file OR one level up (per-title organize folder).
+                    for cand in (op, op.parent):
+                        try:
+                            s = str(cand.resolve())
+                        except Exception:
+                            s = str(cand)
+                        hist_bases.add(s)
+                bases += sorted(hist_bases)
+            except Exception:
+                pass
+            base_seen: set[str] = set()
             for base_str in bases:
                 if not base_str:
                     continue
+                try:
+                    bk = str(Path(base_str).resolve())
+                except Exception:
+                    bk = base_str
+                if bk in base_seen:
+                    continue
+                base_seen.add(bk)
                 base = Path(base_str)
                 if not base.exists():
                     continue
@@ -10124,7 +10210,7 @@ class App:
                     total += get_folder_size(p)
                 except Exception:
                     pass
-            if targets and total >= 1 * 1024**3:   # ignore trivial (<1 GiB) leftovers
+            if targets and total >= 64 * 1024**2:   # 64 MiB threshold (was 1 GiB — too permissive)
                 self.root.after(0, lambda: self._prompt_startup_sweep(targets, total))
 
         threading.Thread(target=_scan, daemon=True).start()
@@ -11231,7 +11317,7 @@ class App:
                 completed_operation = getattr(completed_item, "operation", "pack") if completed_item else "pack"
                 # History applies only to jobs that PRODUCE a .ffpfsc (pack, patch).
                 # Unpack and fake-sign create no packed game → skip them.
-                if completed_operation not in ("unpack", "fake-sign", "fpkg-extract"):
+                if completed_operation not in ("unpack", "fake-sign", "fpkg-extract", "copy"):
                     # Record history HERE (main thread) — add_history mutates Tk widgets.
                     try:
                         _w = self.worker
@@ -11322,7 +11408,9 @@ class App:
                         self._show_batch_complete()
                     else:
                         log_lines = get_last_log_lines(50)
-                        ErrorDialog(self.root, msg, last_cmd, log_lines)
+                        ErrorDialog(self.root, msg, last_cmd, log_lines,
+                                    operation=getattr(completed_item, "operation", "pack")
+                                    if completed_item else "pack")
         except queue.Empty:
             pass
 

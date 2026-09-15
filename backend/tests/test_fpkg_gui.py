@@ -342,6 +342,41 @@ try:
     saved = m.load_settings().get("queue") or []
     ok("queue.persist.fpkg-fields", any(d.get("operation") == "fpkg-build" and "fpkg_level" in d and "fpkg_content_id" in d for d in saved), f"{len(saved)} saved")
     ok("settings.persist.format", m.load_settings().get("output_format") == "ffpfsc" and isinstance(m.load_settings().get("fpkg_defaults"), dict), "")
+
+    # ── COPY job, driven through the REAL CLIWorker (1.1.8 regression) ─────────
+    # 1.1.8 shipped a copy op whose worker fell through to the pack completion path
+    # and raised "Backend exited but no new .ffpfsc output was created" AFTER a
+    # successful move. Drive a real copy end to end and assert finish(True).
+    copy_src_dir = S / "copy_src"; copy_src_dir.mkdir(exist_ok=True)
+    copy_src = copy_src_dir / "CopyMe [PPSA99099] [v01.000].ffpfsc"
+    _sh.copy2(FF, copy_src)
+    copy_out = S / "copy_out"; copy_out.mkdir(exist_ok=True)
+    ci = app._copy_item_for(copy_src, output_path=str(copy_out), delete_source=True, auto_organize=True)
+    ok("copy.item.built", ci is not None and ci.operation == "copy" and ci.copy_delete_source is True,
+       f"op={getattr(ci, 'operation', None)}")
+    ccmd, ccwd, cout, ctmp = app.build_command(ci)
+    ok("copy.build_command", "--copy" in ccmd and str(copy_src) in ccmd and "--keep-source" not in ccmd,
+       " ".join(ccmd[-6:]))
+    ok("copy.organized-dir", cout.name.startswith("LibProsperoPKG [PPSA99099]"), str(cout.name))
+    # single-pass + space gate must not route a copy through the mkpfs estimates
+    ok("copy.single-pass", m._item_is_single_pass(ci) is True, "")
+    ok("copy.space-gate-passes", m._space_preflight_ok(ci, ctmp, cout) is True, "")
+    # run it for real through CLIWorker and capture the finish() outcome
+    fin = {}
+    _real_finish = app.finish
+    app.finish = lambda success, msg, cmd=None, **k: fin.update(success=success, msg=msg)
+    try:
+        cw = m.CLIWorker(app, ci, ccmd, ccwd, cout, ctmp)
+        cw.start(); pump(lambda: "success" in fin, timeout=60.0)
+    finally:
+        app.finish = _real_finish
+    ok("copy.worker.finishes-success", fin.get("success") is True,
+       f"success={fin.get('success')} msg={fin.get('msg')!r}")
+    ok("copy.worker.no-false-ffpfsc-error", "no new .ffpfsc" not in str(fin.get("msg", "")),
+       str(fin.get("msg")))
+    moved = list(cout.glob("*.ffpfsc"))
+    ok("copy.landed-and-source-gone", len(moved) == 1 and not copy_src.exists(),
+       f"moved={[p.name for p in moved]} src_exists={copy_src.exists()}")
 except Exception:
     res.append(("driver", False, traceback.format_exc()))
 finally:

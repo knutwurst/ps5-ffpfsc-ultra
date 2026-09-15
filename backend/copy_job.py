@@ -134,7 +134,8 @@ def run_copy(src, dst_dir, *,
             _print(on_line, f"[ERROR] copy: rename failed: {e}")
             return 1
         _print(on_line, f"[####] 100% move")
-        _print(on_line, "[PHASE] Complete")
+        # No "[PHASE] Complete" — the worker owns stage transitions; emitting our own
+        # would race the completion path and briefly show "Complete: 0%" in the log.
         _print(on_line, f"[SUCCESS] Moved {src.name} → {dst}")
         return 0
 
@@ -179,7 +180,6 @@ def run_copy(src, dst_dir, *,
             # the target is intact, the user can delete the source manually.
             _print(on_line, f"[WARN] copy: source could not be deleted: {e}")
 
-    _print(on_line, "[PHASE] Complete")
     _print(on_line, f"[SUCCESS] {'Moved' if delete_source else 'Copied'} "
                     f"{src.name} → {dst}")
     return 0

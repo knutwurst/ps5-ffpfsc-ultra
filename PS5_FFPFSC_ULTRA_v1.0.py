@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -351,6 +351,11 @@ def _item_is_single_pass(item) -> bool:
     compressed in a SINGLE pass by the backend — no inner image on the temp drive.
     Derived purely from persistent attributes so it works after queue save/restore."""
     try:
+        # A copy job never runs mkpfs: same-drive is an os.rename, cross-drive is a
+        # straight file copy. Only the OUTPUT drive needs space (for the copy target
+        # on cross-drive; nothing new on same-drive). No temp, no inner image.
+        if getattr(item, "operation", "pack") == "copy":
+            return True
         # Only a PACK of a single image file is single-pass. A patch job also has a
         # .ffpfsc file path + inplace source_kind, but it extracts AND repacks (needs
         # temp) — so it must NOT be treated as single-pass. unpack/fake-sign likewise.
@@ -485,6 +490,18 @@ def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
     # uncompressed → full size) and, for archives, the known compressed source-set size.
     comp  = bool(getattr(item, "_output_compressed", True))
     known = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
+    if getattr(item, "operation", "pack") == "copy":
+        # Copy: same-drive is a rename (0 bytes). Cross-drive writes source_size bytes
+        # (streamed through a .copy-tmp then os.replace — no doubling). 1.02x slack for
+        # filesystem overhead; the source drive doesn't need anything free.
+        try:
+            src = Path(str(getattr(item, "path", "") or ""))
+            src_dir = src.parent if src.exists() else Path()
+        except Exception:
+            src_dir = Path()
+        if src_dir and same_drive(src_dir, out_dir):
+            return True
+        return get_free_space(out_dir) >= int(size * 1.02)
     if _item_is_single_pass(item):
         # Single-pass: mkpfs compresses the disk image directly — no inner image on temp,
         # no spool. Only the output drive needs space for the final .ffpfsc.
@@ -3178,6 +3195,7 @@ class GameItem:
     patch_overwrite = False # patch: overwrite the source .ffpfsc in place vs a "[patched]" copy
     patch_inplace = False   # patch: overlay onto a throwaway temp extract (archive game source)
     unwrap = True           # convert/unpack: True = unwrap to a folder, False = stop at inner .ffpfs
+    copy_delete_source = True  # copy: delete the source after a successful cross-drive copy
 
     def __init__(self, path: Path):
         self.path       = path
@@ -4463,6 +4481,13 @@ class PackDialog(ctk.CTkToplevel):
         if init_org is None:
             init_org = bool(app.auto_organize_var.get())
         self.organize_var = tk.BooleanVar(value=bool(init_org))
+        # Same-format copy: on cross-drive delete the source after a successful copy so
+        # the job feels like a move (same-drive is always an atomic rename regardless).
+        # The default is app-wide and persisted; per-job overrides land on the item.
+        init_del = getattr(item, "copy_delete_source", None) if item is not None else None
+        if init_del is None:
+            init_del = bool(app.copy_delete_source_var.get()) if hasattr(app, "copy_delete_source_var") else True
+        self.copy_delete_source_var = tk.BooleanVar(value=bool(init_del))
         self.title("Pack — edit job" if item else "Pack — add job to queue")
 
         self.src_var   = tk.StringVar(value=init_src)
@@ -4558,6 +4583,22 @@ class PackDialog(ctk.CTkToplevel):
         self._fmt_seg.pack(side="left")
         ctk.CTkLabel(frow, textvariable=self.fmt_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ── Same-format copy row (shown only when the source suffix matches the target ──
+        # format, so no re-encode is needed). Same drive → atomic rename; cross-drive →
+        # chunked copy, then delete the source when this box stays checked.
+        self.copy_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
+        self.copy_hint = tk.StringVar(value="")
+        ctk.CTkLabel(self.copy_row, text="Same format — no re-encode",
+                      text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold")).pack(
+            anchor="w", padx=10, pady=(6, 0))
+        ctk.CTkLabel(self.copy_row, textvariable=self.copy_hint, text_color=MUTED,
+                      font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(
+            anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkCheckBox(self.copy_row, text="Delete source after successful copy (cross-drive only; same-drive is always a move)",
+                        variable=self.copy_delete_source_var, checkbox_width=18, checkbox_height=18,
+                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
+                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── fPKG block (shown for the .pkg format only; packed before the button row) ──
         # Compact by default: ONE summary line plus "Edit…". The defaults are the best values
@@ -4667,6 +4708,19 @@ class PackDialog(ctk.CTkToplevel):
         self._apply_format()
         self._on_source_changed()
 
+    def _same_format_source_suffix(self) -> str:
+        """The source's suffix when it matches the target format ('.ffpfsc', '.ffpfs',
+        '.pkg'), else '' — the three cases where 'pack' collapses to a straight copy."""
+        raw = (self.src_var.get() or "").strip()
+        if not raw:
+            return ""
+        p = Path(raw)
+        if not (p.is_file()):
+            return ""
+        suf = p.suffix.lower()
+        want = ".pkg" if self.fmt_key == "pkg" else f".{self.fmt_key}"
+        return suf if suf == want and suf in (".ffpfsc", ".ffpfs", ".pkg") else ""
+
     def _apply_format(self) -> None:
         key = self.fmt_key
         self.fmt_hint.set(self._FMT_HINT[key])
@@ -4678,6 +4732,28 @@ class PackDialog(ctk.CTkToplevel):
             self.out_label.set("Output folder  (this job's .pkg lands here, named <content-id>-A<app>-V<ver>.pkg):")
         else:
             self.out_label.set(f"Output folder  (this job's .{key} lands here):")
+        # Same-format copy row: only when the source is a file whose suffix matches the
+        # target format. Also hide the fPKG panel in that case — no build parameters
+        # apply to a straight copy.
+        copy_suf = self._same_format_source_suffix()
+        if copy_suf:
+            self.copy_hint.set(
+                f"The source is already a {copy_suf}. It will be copied unchanged into the output folder — "
+                "same drive: atomic rename (instant); different drive: chunked copy with progress."
+            )
+            try:
+                self.copy_row.pack(fill="x", padx=20, pady=4, before=self._btns)
+            except Exception:
+                self.copy_row.pack(fill="x", padx=20, pady=4)
+            if self._panel_shown:
+                self.fpkg_panel.pack_forget()
+                self._panel_shown = False
+            self._fit()
+            return
+        try:
+            self.copy_row.pack_forget()
+        except Exception:
+            pass
         if key == "pkg":
             if not self._panel_shown:
                 self.fpkg_panel.pack(fill="x", padx=20, before=self._btns)
@@ -4791,8 +4867,18 @@ class PackDialog(ctk.CTkToplevel):
             self.src_hint.set("")
             self.ident_note.set(self._IDENT_AUTO)
             self._set_ident_forced(False)
+            self._apply_format()   # refresh the copy row for the empty state
             return
         suf = p.suffix.lower() if p.is_file() else ""
+        # Same-format shortcut: the "already packed"/"use fPKG⇢" hints do not apply when
+        # the source's format matches the target format — that's the copy path, not a
+        # rejection. _apply_format shows the dedicated copy row for it.
+        if self._same_format_source_suffix():
+            self.src_hint.set(f"Same as target format ({suf}) — will be copied unchanged (see below).")
+            self.ident_note.set(self._IDENT_AUTO)
+            self._set_ident_forced(False)
+            self._apply_format()
+            return
         if self.fmt_key != "pkg":
             if suf == ".ffpfsc":
                 self.src_hint.set("⚠ A .ffpfsc is already packed — choose the .pkg format to build an fPKG from it, "
@@ -4801,6 +4887,7 @@ class PackDialog(ctk.CTkToplevel):
                 self.src_hint.set("⚠ A .pkg is a PS5 fake package — use fPKG⇢ to extract it.")
             else:
                 self.src_hint.set("")
+            self._apply_format()
             return
         # .pkg format
         if p.is_dir():
@@ -4830,6 +4917,7 @@ class PackDialog(ctk.CTkToplevel):
         # A game folder without param.json cannot get its identity from anywhere else:
         # the identity rows open by themselves and are marked required.
         self._set_ident_forced(p.is_dir() and is_game_folder(p) and not (p / "sce_sys" / "param.json").is_file())
+        self._apply_format()   # refresh the copy row (hidden here — this branch is fpkg-source)
 
     def _set_ident_forced(self, forced: bool) -> None:
         forced = bool(forced)
@@ -4945,18 +5033,23 @@ class PackDialog(ctk.CTkToplevel):
             messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
         fmt = self.fmt_key
         suf = src.suffix.lower() if src.is_file() else ""
-        if suf == ".pkg":
-            messagebox.showerror("Use fPKG⇢",
-                                 "A .pkg is a PS5 fake package. Use the fPKG⇢ job to extract it to a folder.",
-                                 parent=self); return
-        if fmt != "pkg" and suf == ".ffpfsc":
-            messagebox.showerror("Already packed",
-                                 "A .ffpfsc is already packed. Choose the .pkg format to build an installable fPKG "
-                                 "from it, or use the Convert job to unpack/convert it.",
-                                 parent=self); return
-        if fmt == "pkg" and src.is_file() and suf not in self.app.FPKG_FILE_SOURCES:
-            messagebox.showerror("Wrong type", "For a .pkg the source must be a game folder, an archive "
-                                 "(.zip/.rar/.7z) or a .ffpfsc / .ffpfs / .exfat / .ffpkg image.", parent=self); return
+        # Same-format shortcut: source suffix == target format → copy job (no re-encode).
+        # This BYPASSES the '.pkg-forbidden' and 'already packed' rejections below because
+        # in these three cases the source IS what the queue is meant to produce.
+        same_fmt_copy = bool(self._same_format_source_suffix())
+        if not same_fmt_copy:
+            if suf == ".pkg":
+                messagebox.showerror("Use fPKG⇢",
+                                     "A .pkg is a PS5 fake package. Use the fPKG⇢ job to extract it to a folder.",
+                                     parent=self); return
+            if fmt != "pkg" and suf == ".ffpfsc":
+                messagebox.showerror("Already packed",
+                                     "A .ffpfsc is already packed. Choose the .pkg format to build an installable fPKG "
+                                     "from it, or use the Convert job to unpack/convert it.",
+                                     parent=self); return
+            if fmt == "pkg" and src.is_file() and suf not in self.app.FPKG_FILE_SOURCES:
+                messagebox.showerror("Wrong type", "For a .pkg the source must be a game folder, an archive "
+                                     "(.zip/.rar/.7z) or a .ffpfsc / .ffpfs / .exfat / .ffpkg image.", parent=self); return
         outf = (self.out_var.get() or "").strip()
         if not outf:
             messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
@@ -4979,6 +5072,21 @@ class PackDialog(ctk.CTkToplevel):
         self.app.output_var.set(outf)
         self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
         self.app.auto_organize_var.set(organize)   # likewise remembered + snapshotted onto the item(s)
+        # Same-format copy job: skip the whole build path — enqueue a copy item and remember
+        # the "delete source after copy" default the user just picked.
+        if same_fmt_copy:
+            delete_src = bool(self.copy_delete_source_var.get())
+            self.app.copy_delete_source_var.set(delete_src)
+            item = self.app._copy_item_for(src, output_path=outf, delete_source=delete_src,
+                                           auto_organize=organize, parent=self)
+            if item is None:
+                return
+            self.app.queue.append(item)
+            self.app.update_queue_box(select_item=item)
+            action = "Move (same-drive rename) or copy+delete (cross-drive)" if delete_src else "Copy (source kept)"
+            self.app.log("OK", f"{action} queued: {item.name} → {outf}.  Press ▶ START to run.")
+            self.destroy()
+            return
         if fmt == "pkg" and src.is_file() and suf in self._IMAGE_SUFFIXES + self._ARCHIVE_SUFFIXES:
             # A single packed image or archive → a direct fPKG job carrying the identity
             # typed here as fallback (the shared add path would queue a .ffpfsc as an UNPACK
@@ -6289,6 +6397,10 @@ class App:
         # whatever the source was called. Per job (snapshotted like the format); this is the
         # remembered default the Pack dialog pre-fills.
         self.auto_organize_var = self._persisted_bool(settings, "auto_organize", True)
+        # Same-format copy job: on a cross-drive copy delete the source afterwards so the
+        # operation feels like a move regardless of which drives are involved. Same-drive
+        # is always an atomic rename and this toggle does not apply to it. Persisted.
+        self.copy_delete_source_var = self._persisted_bool(settings, "copy_delete_source", True)
         # Keep external drives awake DURING A RUN only: a fast tiny flushed write so
         # bus-powered 2.5" USB HDDs (WD Elements) stay spun-up with heads LOADED across the
         # short gaps between games in a batch — so each game doesn't pay a fresh spinup. The
@@ -6324,6 +6436,7 @@ class App:
         self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "📥  fPKG⇢", self.fpkg_extract_dialog,              width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🔎  Browse",  self.open_pfs_browser,               width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "🗂  Organize", self.organize_folder_dialog,        width=118).pack(side="left", padx=(0, 8))
         # (Building an fPKG is the Pack dialog's third output format — no separate door.)
         ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image (Pack, remembered format) or a .pkg file (fPKG⇢)",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
@@ -6777,6 +6890,83 @@ class App:
 
     def open_pack_dialog(self):
         PackDialog(self)
+
+    def organize_folder_dialog(self):
+        """Walk a folder tree, batch-enqueue every .ffpfsc/.ffpfs/.pkg as a copy job.
+
+        The user picks a source root and an output root; each match is added as an
+        individual copy item so the queue's progress, cancel, edit and save-queue
+        machinery all work per file. Same-drive → atomic rename; cross-drive →
+        chunked copy (source deleted when Delete-source is on). Auto-organize
+        places each file under its own ``<Title> [TID] [vX.Y.Z]/…`` folder derived
+        from the source's param.json."""
+        src_root = filedialog.askdirectory(
+            title="Organize — pick a folder to scan (recursively) for .ffpfsc / .ffpfs / .pkg",
+            parent=self.root)
+        if not src_root:
+            return
+        src_root = Path(src_root)
+        out_root = filedialog.askdirectory(
+            title="Organize — pick the destination root (files land in ‹Title [TID] [vX.Y.Z]›/… inside it)",
+            parent=self.root, initialdir=str(self.output_var.get() or src_root))
+        if not out_root:
+            return
+        out_root = Path(out_root)
+
+        # Recursive scan. rglob is cheap even on large libraries; the metadata read
+        # per file is where time is spent (each hit reads sce_sys/param.json).
+        hits: list[Path] = []
+        for suf in (".ffpfsc", ".ffpfs", ".pkg"):
+            hits.extend(src_root.rglob(f"*{suf}"))
+        # Deduplicate deterministically and drop anything already living in the
+        # destination tree (organizing in place onto themselves would collide).
+        seen: set[str] = set()
+        picked: list[Path] = []
+        for p in sorted(hits, key=lambda q: str(q).lower()):
+            try:
+                rp = p.resolve()
+            except Exception:
+                continue
+            key = str(rp).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(p)
+
+        if not picked:
+            messagebox.showinfo("Organize",
+                                f"No .ffpfsc / .ffpfs / .pkg files were found under:\n{src_root}",
+                                parent=self.root)
+            return
+
+        delete_src = bool(self.copy_delete_source_var.get())
+        organize = True   # organizing without auto-organize would be a plain copy — that's not this feature
+        # Persist the target as the app's output folder — matches what Pack does and gives
+        # a nice default for a follow-up Add.
+        self.output_var.set(str(out_root))
+
+        added = 0
+        skipped = 0
+        for src in picked:
+            try:
+                item = self._copy_item_for(src, output_path=str(out_root),
+                                           delete_source=delete_src,
+                                           auto_organize=organize, parent=self.root)
+            except Exception as e:
+                self.log("ERROR", f"Organize: could not enqueue {src}: {e}")
+                skipped += 1
+                continue
+            if item is None:
+                skipped += 1
+                continue
+            self.queue.append(item)
+            added += 1
+
+        self.update_queue_box()
+        action = "move (same-drive) / copy+delete (cross-drive)" if delete_src else "copy (source kept)"
+        msg = (f"Organize: queued {added} file(s) from {src_root} → {out_root} as {action}."
+               + (f"  ({skipped} skipped)" if skipped else ""))
+        self.log("OK", msg)
 
 
     def open_settings(self):
@@ -8603,6 +8793,36 @@ class App:
         base.output_path = Path(output_path) if output_path else None
         return base
 
+    def _copy_item_for(self, src, *, output_path=None, delete_source=True,
+                       auto_organize=None, parent=None):
+        """A fresh COPY job for a source whose format already matches the target format
+        (`.ffpfsc` / `.ffpfs` / `.pkg`). The backend routes same-drive through os.rename
+        (atomic) and cross-drive through a chunked copy that deletes the source on
+        success unless *delete_source* is False. Returns None (after an error dialog) for
+        anything else."""
+        src = Path(src)
+        if not (src.is_file() and src.suffix.lower() in (".ffpfsc", ".ffpfs", ".pkg")):
+            messagebox.showerror("Wrong type",
+                                 f"Copy needs a .ffpfsc, .ffpfs or .pkg file:\n{src}",
+                                 parent=parent or self.root)
+            return None
+        try:
+            base = GameItem.from_exfat(src)   # single-file image; we override operation below
+        except Exception as e:
+            messagebox.showerror("Copy failed", f"Could not classify the source:\n{e}",
+                                 parent=parent or self.root)
+            return None
+        base.operation = "copy"
+        base.copy_delete_source = bool(delete_source)
+        base.output_compressed = (src.suffix.lower() == ".ffpfsc")   # marks the snapshot as taken
+        base.output_path = Path(output_path) if output_path else None
+        if auto_organize is not None:
+            base.auto_organize = bool(auto_organize)
+        # Show the file's stem in the queue row (from_exfat already does that, but keep
+        # explicit so a restored queue can't accidentally regress).
+        base.name = src.stem
+        return base
+
     # ── Auto-organize: where a job lands and what it is called ───────────────
     def _auto_organize_on(self, item) -> bool:
         v = getattr(item, "auto_organize", None)
@@ -8632,7 +8852,7 @@ class App:
                 ver = guess_game_version(p)
                 if title or tid:
                     ident = {"title": title, "title_id": tid, "version": ver}
-            elif p.is_file() and p.suffix.lower() in (".ffpfs", ".ffpfsc", ".exfat", ".ffpkg"):
+            elif p.is_file() and p.suffix.lower() in (".ffpfs", ".ffpfsc", ".exfat", ".ffpkg", ".pkg"):
                 ident = self._read_image_metadata(p)
         except Exception as e:
             self.log("WARN", f"Auto-organize: could not read the game's metadata from {p.name}: {e}")
@@ -8686,6 +8906,8 @@ class App:
         generic metadata reader does not follow (it reports 'missing exFAT signature') —
         so ask the backend's browse path for the single member sce_sys/param.json, exactly
         like the PFS browser does (only the touched blocks are decompressed).
+        .pkg: read sce_sys/param.json out of the CNT via ffpfsc-pkg-tool's selective
+        extract (touches only the CNT entry — no full decompression).
         .exfat / .ffpkg: the vendored MkPFS exFAT reader."""
         suf = p.suffix.lower()
         if suf in (".ffpfs", ".ffpfsc"):
@@ -8696,6 +8918,26 @@ class App:
                 dest = tmp / "out"
                 cmd = self._backend_cmd("--extract-from", str(p), "--dest", str(dest), "--members-file", str(mfile))
                 subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                pj = dest / "sce_sys" / "param.json"
+                return self._ident_from_param_json(pj) if pj.is_file() else None
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        if suf == ".pkg":
+            tmp = Path(tempfile.mkdtemp(prefix="ffpfsc_pkg_ident_"))
+            try:
+                mfile = tmp / "members.txt"
+                mfile.write_text("sce_sys/param.json\n", encoding="utf-8")
+                dest = tmp / "out"
+                # Route through the backend's fpkg module so a frozen build finds the tool.
+                backend = backend_base_dir()
+                if str(backend) not in sys.path:
+                    sys.path.insert(0, str(backend))
+                try:
+                    import fpkg as _fpkg
+                    _fpkg.extract_members(p, dest, mfile, on_line=lambda _l: None)
+                except Exception as e:
+                    self.log("WARN", f"Auto-organize: could not read param.json out of {p.name}: {e}")
+                    return None
                 pj = dest / "sce_sys" / "param.json"
                 return self._ident_from_param_json(pj) if pj.is_file() else None
             finally:
@@ -8960,7 +9202,8 @@ class App:
             badge = {"unpack": "CONVERT", "patch": "PATCH ",
                      "fake-sign": "SIGN   ",
                      "fpkg-extract": "fPKG-EX",
-                     "fpkg-build":   "fPKG-BD"}.get(opn, "PACK   ")
+                     "fpkg-build":   "fPKG-BD",
+                     "copy":         "COPY   "}.get(opn, "PACK   ")
             # Per-job detail: jobs that don't have a meaningful source size show their
             # target/mode instead of "0 B".
             if opn == "fake-sign":
@@ -8973,6 +9216,9 @@ class App:
                 _b = (getattr(item, "fpkg_kraken_backend", "builtin") or "builtin")
                 _m = (getattr(item, "fpkg_inner_mode", "none") or "none")
                 detail = f"→ .pkg  ({_m}/{_b})"
+            elif opn == "copy":
+                _mode = "move (or copy+delete)" if getattr(item, "copy_delete_source", True) else "copy (keep src)"
+                detail = f"{format_size(getattr(item, 'size', 0) or 0)}  ·  {_mode}"
             else:
                 # Archives store the COMPRESSED set size in .size; show the EXTRACTED size
                 # (what space/placement actually use), tagged with ~ as a header estimate.
@@ -9205,6 +9451,47 @@ class App:
             head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
             cmd = head + ["--fake-sign", str(item.path)]
             return cmd, backend, Path(item.path), temp
+
+        # ── COPY job (same format in/out — no re-encode) ─────────────────────
+        # The source is a packed image (.ffpfsc / .ffpfs / .pkg). The output
+        # folder mirrors the auto-organize layout used for a fresh build: a
+        # per-title folder + library filename derived from param.json. When the
+        # source and target land on the same drive the backend performs an
+        # atomic os.rename; otherwise it does a chunked copy and (unless the
+        # user unchecked the option) deletes the source afterwards.
+        if op == "copy":
+            src = Path(item.path)
+            out_ext = src.suffix.lower()
+            explicit_file = out.suffix.lower() in (".ffpfsc", ".ffpfs", ".pkg")
+            copy_name = None
+            base = out
+            if not explicit_file:
+                if self._auto_organize_on(item):
+                    _b, _nm = self._organized_layout(item, out, out_ext)
+                    if _b is not None:
+                        base = _b
+                        copy_name = _nm
+                    elif sub:
+                        base = self._mirror_base(item, out, sub)
+                elif sub:
+                    base = self._mirror_base(item, out, sub)
+                out = base
+            else:
+                # Explicit output path — split the filename off so --copy-name carries it.
+                copy_name = out.name
+                out = out.parent
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            head = (pycmd + ["placeholder", str(out)] if getattr(sys, "frozen", False)
+                    else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
+            cmd = head + ["--copy", str(src)]
+            if copy_name:
+                cmd += ["--copy-name", copy_name]
+            if not bool(getattr(item, "copy_delete_source", True)):
+                cmd.append("--keep-source")
+            return cmd, backend, out, temp
 
         # ── fPKG EXTRACT job (built package -> /app0 folder) ─────────────────
         if op == "fpkg-extract":

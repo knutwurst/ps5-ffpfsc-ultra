@@ -3,7 +3,43 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.7  (current)
+  v1.1.8  (current)
+────────────────────────────────────────────────────────────────────────
+
+COPY / ORGANIZE — SAME-FORMAT JOBS SKIP THE ENCODER
+
+  • The Pack dialog now recognises when a source is already in the target
+    format (.ffpfsc → .ffpfsc, .ffpfs → .ffpfs, .pkg → .pkg) and routes
+    it through a straight file copy instead of re-encoding. Same drive
+    (matching st_dev) → os.rename, atomic and instant regardless of file
+    size. Different drive → chunked copy via a *.copy-tmp file with
+    os.replace on success (no half-written target visible under the
+    final name); the source is deleted afterwards unless the new
+    "Delete source after successful copy" checkbox is unchecked.
+    Setting persists as copy_delete_source in settings.json.
+
+  • New "🗂 Organize" button in the job bar: pick a source folder and a
+    destination root; the app walks recursively for .ffpfsc / .ffpfs /
+    .pkg, deduplicates by resolved path (symlink-safe), and enqueues one
+    copy job per file. Each job runs the same auto-organize naming as a
+    fresh build (‹Title [TID] [vX.Y.Z]›/‹Title [TID] [vX.Y]› derived
+    from the source's own param.json — read out of the CNT for a .pkg
+    or the inner PFS for a .ffpfsc/.ffpfs, no full decode).
+
+  • The queue shows COPY jobs with their own badge and detail line
+    ("<size> · move (or copy+delete)" / "copy (keep src)").
+
+  • Two safety rails on every copy: a src → dst that resolves to the
+    same file skips (exit 2, source kept); a dst already occupied by a
+    different file skips (exit 3, both kept intact — never overwritten,
+    never renamed to (2)).
+
+  • backend/copy_job.py + backend/tests/test_copy_job.py (10 tests) +
+    backend/tests/test_organize_walk.py (5 tests); cli.py gains --copy,
+    --copy-name and --keep-source.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.7
 ────────────────────────────────────────────────────────────────────────
 
 fPKG BUILDS THE CONSOLE ACTUALLY LAUNCHES  (on ≤ 11.40)

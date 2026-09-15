@@ -1289,6 +1289,18 @@ def main() -> None:
                         help="FAKE-SIGN MODE: recursively fake-sign every executable "
                              "(eboot.bin/.elf/.prx/.sprx) under DIR in place, then exit. "
                              "Already-signed files are skipped (idempotent). No pack/unpack.")
+    parser.add_argument("--copy", type=str, default=None, metavar="SRC",
+                        help="COPY MODE: transport SRC (.ffpfsc/.ffpfs/.pkg) to OUTPUT (a "
+                             "folder) unchanged. Same-drive → os.rename (atomic, instant). "
+                             "Cross-drive → chunked copy, then delete SRC unless "
+                             "--keep-source is set. Used for same-format queue items and "
+                             "the Organize Folder… batch flow.")
+    parser.add_argument("--copy-name", type=str, default=None, metavar="NAME",
+                        help="Destination filename for --copy (defaults to SRC's basename). "
+                             "Auto-organize passes the library name here.")
+    parser.add_argument("--keep-source", action="store_true",
+                        help="For --copy on a cross-drive move: keep the source instead "
+                             "of deleting it after a successful copy.")
     parser.add_argument("--fpkg-extract", type=str, default=None, metavar="PKG",
                         help="fPKG MODE: extract the /app0 inner files from a finalized "
                              "PS5 fake package (.pkg) into OUTPUT (a folder). No mkpfs "
@@ -1414,6 +1426,23 @@ def main() -> None:
         print(f"\n[SUCCESS] Fake-signed {counts.get('signed', 0)} file(s); "
               f"skipped {counts.get('skipped', 0)} non-ELF.", flush=True)
         return
+
+    # ── COPY MODE (same-format transport, no re-encode) ──────────────────────────
+    # Runs before every mkpfs-shaped path: --copy needs no game_folder positional
+    # (SRC is on --copy), the OUTPUT positional is the destination folder.
+    if args.copy:
+        try:
+            import copy_job as _copy_job
+        except Exception as e:
+            print(f"[ERROR] copy support unavailable ({e}). Rebuild backend/copy_job.py.", flush=True)
+            sys.exit(1)
+        src = Path(args.copy).resolve()
+        dst_dir = Path(args.output).resolve()
+        rc = _copy_job.run_copy(src, dst_dir,
+                                dst_name=args.copy_name or None,
+                                delete_source=not args.keep_source,
+                                on_line=lambda l: print(l, flush=True))
+        sys.exit(rc)
 
     # ── fPKG MODE (extract / build / validate via bundled ffpfsc-pkg-tool) ──────
     if args.fpkg_extract or args.fpkg_build or args.fpkg_validate:

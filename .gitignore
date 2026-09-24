@@ -32,3 +32,4 @@ backend/native/src/ffpfsc-pkg-tool/out/
 .DS_Store
 
 backend/native/src/ffpfsc-pkg-tool/publish.log
+/*.pkg

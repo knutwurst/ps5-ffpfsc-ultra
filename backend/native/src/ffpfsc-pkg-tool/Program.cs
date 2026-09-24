@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using LibProsperoPkg;
+using LibProsperoPkg.PFS;
 using LibProsperoPkg.PKG;
 
 namespace PkgTool;
@@ -831,6 +832,20 @@ internal static class Program
             // is >1. The build path also uses this value for its outer parallelism.
             KrakenMaxDegreeOfParallelism = 1,
             LegacyZlibMaxDegreeOfParallelism = 1,
+            // PS5 debug-image loader only accepts the plaintext-no-auth outer PFS
+            // (mode 0x000D with the "PPPLAIN-NOAUTH!" seed marker) — a random-seed
+            // AES-XTS wrap validates structurally and extract-inner reads it fine,
+            // but the console-loader rejects it with CE-100096-6 at launch time
+            // (verified on FW 11.60 + kstuff-1.13-dr-test3, retail PS5, 2026-09-24).
+            // Sony's Publishing Tools DLL always uses this mode for debug images;
+            // a diff of pfs-dump showed the inner PFS is byte-identical to a
+            // reference build made with libScePubTools.dll — only the outer PFS
+            // wrap differed. Setting PlaintextNoAuth makes our output byte-exact.
+            PublisherImageMode = ProsperoPublisherImageMode.PlaintextNoAuth,
+            // Sony's publisher packs every launch-time file into PlayGo chunk 0;
+            // LibProsperoPkg's default of 64 spreads them out. Both boot, but the
+            // 1-chunk layout matches every known-working reference package.
+            PlayGoChunkCount = 1,
         };
         for (int i = 3; i < args.Length; i++)
         {
@@ -883,6 +898,15 @@ internal static class Program
                     // Kraken accepts -4..9 (drakmor's encoder), the legacy zlib path 0..9.
                     opts.KrakenCompressionLevel = Math.Clamp(lvl, -4, 9);
                     opts.LegacyZlibCompressionLevel = Math.Clamp(lvl, 0, 9);
+                    i++;
+                    break;
+                case "--playgo-chunks":
+                    // LibProsperoPkg defaults to 64 and spreads files over as many chunks as
+                    // there are files; Sony's publisher packs every launch-time file into
+                    // chunk 0 (default here). Override 1..255 for advanced PlayGo layouts.
+                    if (!int.TryParse(v, out int chunks) || chunks < 1 || chunks > 255)
+                        throw new ArgumentException("--playgo-chunks needs an integer 1..255");
+                    opts.PlayGoChunkCount = chunks;
                     i++;
                     break;
                 default: return Bad("unknown build flag: " + a);

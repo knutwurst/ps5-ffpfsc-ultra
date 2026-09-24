@@ -115,8 +115,18 @@ Measured on 240 MB of mixed data: a NativeAOT build is 16–18 MB instead of 25 
 
 ## Firmware compatibility
 
-fPKG install-and-launch works on jailbroken PS5 firmware **≤ 11.40**. Sony patched the
-fPKG install path with system software 11.50 — a package built by any tool (this one,
-the a53 reference GUI, verified reference packages that launch on older firmwares) will
-install but fail to start with `CE-100096-6` on 11.60. Nothing about how the package is
-built changes that; it is the console's install path itself that changed.
+fPKG install-and-launch works on jailbroken PS5 firmware **up to at least 11.60** when
+the console runs kstuff-lite 1.13+ (Drakmor's PPR-A53 patch, released 2026-09; earlier
+kstuff builds top out at 11.40). The console-side ceiling is the jailbreak stack, not
+the package format — as soon as a newer kstuff exists for 11.7x/12.xx, packages this
+tool produces are expected to install and launch there too.
+
+Once-critical builder detail, kept for future readers who might hit the same wall:
+LibProsperoPkg 1.2.0's default outer PFS wrap is a random-seed AES-XTS envelope which
+validates structurally and round-trips through `extract-inner` but is rejected by the
+PS5 debug loader with `CE-100096-6` at launch (verified 2026-09-24 on FW 11.60). Sony's
+Publishing Tools DLL always writes the outer PFS with `ProsperoPublisherImageMode.
+PlaintextNoAuth` (mode 0x000D + the `PPPLAIN-NOAUTH!` seed marker — no actual wrap).
+`Program.cs` now forces that mode; a `pfs-dump` diff against a `libScePubTools.dll`
+reference build shows layer B/L/C are byte-identical, only the outer PFS wrap remained
+non-deterministic (timestamp/ICV bytes, harmless).

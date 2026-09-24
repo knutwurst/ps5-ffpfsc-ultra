@@ -3,7 +3,49 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.9  (current)
+  v1.1.10  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG BUILDS FINALLY LAUNCH ON 11.60 (kstuff-lite 1.13+)
+
+  • Root cause found: LibProsperoPkg 1.2.0's built-in Kraken encoder
+    produces byte-identical output to Sony's Publishing Tools DLL — no
+    Wine needed, no DLL reversing. The whole "≤ 11.40 only" story was
+    a single wrong flag in our builder.
+
+    LibProsperoPkg defaults to a random-seed AES-XTS wrap on the outer
+    PFS. The PS5 debug loader accepts only the plaintext-no-auth mode
+    (outer PFS marked encrypted, seed set to the sentinel value
+    "PPPLAIN-NOAUTH!", no actual wrap). Sony's DLL always uses that
+    mode for debug images. Ours didn't — validated structurally,
+    extract-inner worked, but the console rejected it at launch with
+    CE-100096-6.
+
+    Program.cs now sets ProsperoPublisherImageMode.PlaintextNoAuth and
+    PlayGoChunkCount = 1 (Sony's default; LibProsperoPkg's was 64).
+    Both fixes verified against a libScePubTools.dll reference build:
+    inner PFS byte-identical; outer PFS wrap differs only in harmless
+    timestamp/ICV bytes.
+
+  • pfs-dump (scratch tool, not shipped): opens a fPKG, decrypts the
+    outer PFS, dumps three layers (A = outer decrypted, B = stored
+    pfs_image.dat, C = fully NAPS-decompressed inner PFS) so future
+    debugging can byte-diff a builder's output against a reference at
+    each level of the container.
+
+  • --playgo-chunks NEW build flag (integer 1..255) — overrides the
+    new default of 1 for advanced PlayGo layouts.
+
+  • Firmware note in the Pack dialog, the fPKG-tool README and the
+    top-level README updated: no more "≤ 11.40 only". The ceiling on
+    any given firmware is the jailbreak stack, not the builder.
+
+  • Verified on-console 2026-09-24: retail PS5 on FW 11.60 with
+    kstuff-lite 1.13-dr-test3 launches the HomebrewTest fPKG built by
+    this tool.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.9
 ────────────────────────────────────────────────────────────────────────
 
 COPY JOB FIXES — the 1.1.8 copy op reported failure after succeeding

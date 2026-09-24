@@ -1,0 +1,46 @@
+MIT License
+
+Copyright (c) 2024–2026 Knutwurst
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+
+Scope
+-----
+
+This MIT license covers the original source code authored for this project:
+
+  * PS5_FFPFSC_ULTRA_v1.0.py                     (the GUI application)
+  * backend/cli.py, backend/fpkg.py,             (Python wrappers around the
+    backend/copy_job.py, backend/fake_sign.py     bundled tools)
+  * backend/native/src/ffpfsc-pkg-tool/**        (the C# wrapper around
+                                                  LibProsperoPkg)
+  * All Python test suites under backend/tests/
+  * The build scripts (BUILD_MACOS_APP.sh, BUILD_EXE.bat, PyInstaller specs)
+  * Everything under images/ authored for this project
+
+Bundled third-party components keep their own licenses. See NOTICES.md at the
+repository root for the full list of bundled components, their upstream
+authors, and their licensing. The compiled application binary — because it
+statically embeds MkPFS (GPL-3.0-or-later) and LibProsperoPkg 1.2.0
+(GPL-3.0-or-later) — is a combined work under the terms of the GNU General
+Public License, version 3, per GPL-3 section 5. All source needed to
+reproduce it is present in this repository, and every bundled component's
+license is compatible with that combination.

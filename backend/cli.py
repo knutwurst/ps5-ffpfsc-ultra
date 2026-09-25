@@ -1325,20 +1325,38 @@ def main() -> None:
                         help="fPKG build: content version NN.NNN.NNN (default 01.000.000). Fallback only.")
     parser.add_argument("--fpkg-passcode", type=str, default="0"*32,
                         help="fPKG build/extract: 32-char passcode (default 32 zeroes).")
-    parser.add_argument("--fpkg-inner", type=str, default="none",
+    parser.add_argument("--fpkg-inner", type=str, default="kraken",
                         choices=("none", "zlib", "kraken"),
                         help="fPKG build: extra codec layer over the whole inner image (every "
-                             "file is Kraken-packed regardless): 'none' (no extra layer, default), "
-                             "'zlib' (legacy PFSC layer), 'kraken' (block-level Kraken layer).")
+                             "file is Kraken-packed regardless): 'kraken' (block-level Kraken "
+                             "layer; the configuration verified to launch on a retail PS5, "
+                             "default), 'none' (no extra layer, console-untested), 'zlib' "
+                             "(legacy PFSC layer).")
     parser.add_argument("--fpkg-kraken-backend", type=str, default="builtin",
                         choices=("automatic", "builtin", "publishingtools", "uncompressed"),
                         help="fPKG build: Kraken encoder policy. Default 'builtin' (pure "
-                             "managed, no external DLL). 'publishingtools' requires the "
-                             "leaked Sony libScePubTools.dll AND 64-bit Windows — on any other "
-                             "OS LibProsperoPkg throws and the build fails (no fallback).")
+                             "managed, no external DLL) — the only one whose output launches "
+                             "on a console; 'uncompressed'/'automatic' fail with CE-100096-6. "
+                             "'publishingtools' requires the leaked Sony libScePubTools.dll AND "
+                             "64-bit Windows — on any other OS LibProsperoPkg throws and the "
+                             "build fails (no fallback).")
     parser.add_argument("--fpkg-deterministic", action="store_true",
                         help="fPKG build: produce byte-reproducible output (fixed seeds "
                              "and RSA wrapping; the timestamp still comes from --fpkg-version).")
+    parser.add_argument("--fpkg-no-retail-normalize", action="store_true",
+                        help="fPKG build: do NOT apply the retail fixes to a 'standard'-DRM "
+                             "source (valid license entries, retail SELF flavour, Sony-style "
+                             "param.json fields). Default is to apply them.")
+    parser.add_argument("--fpkg-no-hdr-flag", action="store_true",
+                        help="fPKG build: leave param.json 'attribute' as the source has it "
+                             "instead of setting bit 29 (HDR support). A console on 'HDR when "
+                             "supported' then runs the title in SDR.")
+    parser.add_argument("--fpkg-regen-playgo", action="store_true",
+                        help="fPKG build: discard the source's sce_sys/playgo-*.dat even when "
+                             "they look valid and let the builder regenerate them. A corrupt "
+                             "set is always regenerated.")
+    parser.add_argument("--fpkg-no-fake-sign", action="store_true",
+                        help="fPKG build: do not fake-sign raw ELFs found in the source.")
     parser.add_argument("--fpkg-pubtools-dll", type=str, default=None,
                         help="fPKG build: path to Sony libScePubTools.dll for the "
                              "'publishingtools' backend. Overrides the LIBPROSPERO_PUBTOOLS_DLL "
@@ -1604,7 +1622,11 @@ def main() -> None:
             print(f"[INFO] fPKG identity: {_cid}  title id {_tid}  version {ident['version']}"
                   f"  title {ident['title']!r}   (from {ident['source']})", flush=True)
 
-            print(f"[INFO] fPKG build ({args.fpkg_inner}, {args.fpkg_kraken_backend}, level {args.compression_level}): "
+            _opts = (f"retail-normalize {'off' if args.fpkg_no_retail_normalize else 'on'}, "
+                     f"HDR flag {'off' if args.fpkg_no_hdr_flag else 'on'}, "
+                     f"PlayGo {'regenerate' if args.fpkg_regen_playgo else 'auto'}, "
+                     f"fake-sign {'off' if args.fpkg_no_fake_sign else 'on'}")
+            print(f"[INFO] fPKG build ({args.fpkg_inner}, {args.fpkg_kraken_backend}, level {args.compression_level}; {_opts}): "
                   f"{build_src} -> {out_dir}   [temp: {fpkg_temp}]", flush=True)
             _set_phase("Scanning Files")
             try:
@@ -1620,6 +1642,10 @@ def main() -> None:
                                  deterministic=bool(args.fpkg_deterministic),
                                  temp_dir=str(fpkg_temp),
                                  level=int(args.compression_level),
+                                 retail_normalize=not args.fpkg_no_retail_normalize,
+                                 hdr_flag=not args.fpkg_no_hdr_flag,
+                                 regen_playgo=bool(args.fpkg_regen_playgo),
+                                 fake_sign=not args.fpkg_no_fake_sign,
                                  on_line=_gui_line)
             finally:
                 if staged is not None:

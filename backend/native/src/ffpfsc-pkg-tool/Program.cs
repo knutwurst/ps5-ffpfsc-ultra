@@ -76,6 +76,16 @@ internal static class Program
         Console.WriteLine("      --level <n>                  compression level: Kraken -4..9, zlib 0..9 (default 7)");
         Console.WriteLine("      --playgo-chunks <1..255>     PlayGo chunk count (auto-detected from source sce_sys/playgo-chunk.dat)");
         Console.WriteLine("      --fake-sign / --no-fake-sign fake-sign raw ELFs in source before packing (default ON; idempotent)");
+        Console.WriteLine("      --regen-playgo               discard source sce_sys/playgo-*.dat and let the builder regenerate them");
+        Console.WriteLine("                                   (a CORRUPT prepared set — wrong format, e.g. JSON under hash-table.dat — is");
+        Console.WriteLine("                                   always discarded automatically; this forces it for valid-looking sets too)");
+        Console.WriteLine("      --hdr-flag / --no-hdr-flag   set param.json attribute bit 29 (HDR support) — default ON; without it");
+        Console.WriteLine("                                   a console on \"HDR when supported\" runs the title in SDR (verified)");
+        Console.WriteLine("      --retail-normalize / --no-retail-normalize");
+        Console.WriteLine("                                   auto-upgrade a \"standard\" retail source (default ON):");
+        Console.WriteLine("                                     staged param.json standard -> upgradable (drm_type=16),");
+        Console.WriteLine("                                     replace placeholder license.dat/info with a valid debug license,");
+        Console.WriteLine("                                     add CNT entries 0x0400/0x0401 via IProsperoLicenseProvider");
         Console.WriteLine("");
         Console.WriteLine("  Default passcode 32 x '0'. Default output is a finalized debug image.");
         Console.WriteLine("  Auto-fake-sign scans for raw ELF magic (0x7F454C46) in eboot.bin, *.elf, *.prx, *.sprx");
@@ -824,6 +834,9 @@ internal static class Program
         if (args.Length < 3) return Bad("build needs <src-dir> <out-dir>");
         bool autoFakeSign = true;         // fake-sign raw ELFs in source before build (idempotent)
         bool playGoChunksExplicit = false; // did the user pass --playgo-chunks?
+        bool retailNormalize = true;      // auto-upgrade a "standard" retail source to a shape the console launches
+        bool regenPlayGo = false;         // force-discard a prepared PlayGo set even if it validates
+        bool hdrFlag = true;              // set param.json attribute bit 29 (HDR support) in retail-normalize
 
         var opts = new ProsperoBuildOptions
         {
@@ -886,6 +899,11 @@ internal static class Program
                         "uncompressed" => ProsperoKrakenBackend.Uncompressed,
                         _ => throw new ArgumentException($"unknown --kraken-backend: {v}")
                     };
+                    if (opts.KrakenBackend is ProsperoKrakenBackend.Uncompressed or ProsperoKrakenBackend.Automatic)
+                        // Verified on a retail PS5 (FW 11.60, kstuff-lite 1.13): the stored/
+                        // automatic path installs and shows its icon but the launch fails with
+                        // CE-100096-6. Only the built-in Kraken encoder is console-launchable.
+                        Console.Error.WriteLine($"[warn] --kraken-backend {v}: this output is NOT launchable on a console (CE-100096-6 verified); use 'builtin'");
                     i++;
                     break;
                 case "--pubtools-dll": opts.PublishingToolsLibraryPath = v!; i++; break;
@@ -932,6 +950,31 @@ internal static class Program
                 case "--fake-sign":
                     // Explicit opt-in (redundant with the default). Kept for clarity.
                     autoFakeSign = true;
+                    break;
+                case "--no-retail-normalize":
+                    // Retail-normalize replaces placeholder license.dat/info from the source
+                    // with a valid debug license issued by LibProsperoPkg (fixes "bad RIF
+                    // magic" skip) and flips staged applicationDrmType "standard" to
+                    // "upgradable" so LibProsperoPkg writes drm_type=16 into the CNT header
+                    // instead of its Application/standard-hardcoded 0 (see 1.1.12 changelog).
+                    // Turn OFF for byte-exact re-packs or when packing something already
+                    // finalized by Sony's tools.
+                    retailNormalize = false;
+                    break;
+                case "--retail-normalize":
+                    retailNormalize = true;
+                    break;
+                case "--regen-playgo":
+                    // Discard the source's sce_sys/playgo-*.dat even when they validate, so
+                    // LibProsperoPkg generates a set that matches the inner tree it builds.
+                    regenPlayGo = true;
+                    break;
+                case "--hdr-flag": hdrFlag = true; break;
+                case "--no-hdr-flag":
+                    // Leave param.json "attribute" exactly as the source has it. With the
+                    // console on "HDR when supported" the title then runs in SDR unless the
+                    // source already carries bit 29.
+                    hdrFlag = false;
                     break;
                 default: return Bad("unknown build flag: " + a);
             }
@@ -984,6 +1027,45 @@ internal static class Program
             catch (Exception ex) { Console.Error.WriteLine($"[warn] could not read source playgo-chunk.dat ({ex.GetType().Name}); using PlayGoChunkCount={opts.PlayGoChunkCount}"); }
         }
 
+        // -- Retail-normalize discovery (read source param.json once) --
+        // A "standard"-DRM retail dump needs four things LibProsperoPkg 1.2.0 does not do
+        // on its own before a JB PS5 (FW 11.60, kstuff-lite 1.13+) launches the result.
+        // All are applied in the staged mirror; the on-disk source is never modified.
+        // Verified 2026-09-25 on a retail PS5 with the retail sample (A/B builds L vs M):
+        //   - drm_type=16 in the CNT header. Upstream hard-codes 0 for any Application
+        //     whose applicationDrmType is not "upgradable"; retail packages carry 16.
+        //     Fixed upstream of this code by the IL patch in patches/ (no param.json
+        //     change needed, so applicationDrmType stays "standard" like Sony's own).
+        //   - Valid license.dat/license.info CNT entries (0x0400/0x0401). Dumps ship
+        //     placeholder bytes that upstream validates and silently drops; without the
+        //     entries the homescreen shows a padlock. We drop the placeholders and hand
+        //     upstream a DebugLicenseProvider (its own BuildDebugLicense bytes).
+        //   - The retail SELF flavour on eboot.bin and every prx/sprx (ProgramType bit
+        //     0x10000000, byte 0x0B of the SELF header). Sony-signed retail SELFs carry
+        //     it; older fake-signers used the dev flavour.
+        //   - Optional: param.json attribute bit 29 (0x20000000) = HDR support flag.
+        //     Build M (bit unset) launched fine but the console stayed in SDR; build L
+        //     (bit set) launched in HDR10. Sony's own packages set it for HDR titles.
+        //     Switch: --hdr-flag / --no-hdr-flag (default on).
+        //   Also injected: a "kernel" block with the retail reference's values when the source has none.
+        //   Verified NOT launch-critical (build M had none and launched); kept because
+        //   every Sony retail package carries one and L is the validated configuration.
+        // Everything the loader actually rejected the launch on turned out to be the
+        // PlayGo prepared set (see the sanity block above) — not any of these.
+        bool sourceIsStandardApp = false;
+        try
+        {
+            var srcParam = Path.Combine(srcSceSys, "param.json");
+            if (File.Exists(srcParam))
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllBytes(srcParam));
+                if (doc.RootElement.TryGetProperty("applicationDrmType", out var dt))
+                    sourceIsStandardApp = string.Equals(dt.GetString(), "standard", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[warn] could not read source param.json for retail-normalize check ({ex.GetType().Name})"); }
+        bool doRetailNormalize = retailNormalize && sourceIsStandardApp;
+
         try
         {
             // Discover work first (so we can stage exactly once).
@@ -993,7 +1075,63 @@ internal static class Program
                                        && !File.Exists(Path.Combine(srcSceSys, Path.ChangeExtension(n, ".dds")))).ToArray()
                 : Array.Empty<string>();
             var elfsToSign = autoFakeSign ? FindRawElfs(effectiveSource) : Array.Empty<string>();
-            bool needStage = pngsToConvert.Length > 0 || elfsToSign.Length > 0;
+
+            // -- PlayGo prepared-set sanity --
+            // LibProsperoPkg only COUNTS sce_sys/playgo-{chunk,hash-table,ficm}.dat: 3/3
+            // present → "complete prepared set found; its layout will be preserved" and the
+            // bytes go verbatim into CNT entries 0x1001/0x2010/0x2011, which ShellCore and
+            // kstuff's PPR parse at install/launch. Scene dumps frequently carry these
+            // under the WRONG names (seen on the retail sample: hash-table.dat = param.json
+            // text, ficm.dat = the real hash table, origin-param.json = a DDS). Such a
+            // package installs and shows its icon but the launch dies with CE-100022-5,
+            // while the same dump runs via ShadowMount because nothing reads those files
+            // there. Validate each file against the on-wire format LibProsperoPkg itself
+            // emits (ProsperoPlayGo.BuildChunkDat/BuildHashTable/BuildFicm); if any present
+            // file fails, drop the whole set from the staged mirror so the builder
+            // regenerates a consistent one from the actual inner tree.
+            var playgoNames = new[] { "playgo-chunk.dat", "playgo-hash-table.dat", "playgo-ficm.dat" };
+            var playgoPresent = Directory.Exists(srcSceSys)
+                ? playgoNames.Where(n => File.Exists(Path.Combine(srcSceSys, n))).ToArray()
+                : Array.Empty<string>();
+            var playgoBad = new List<string>();
+            foreach (var n in playgoPresent)
+            {
+                byte[] b;
+                try { b = File.ReadAllBytes(Path.Combine(srcSceSys, n)); } catch { playgoBad.Add(n + " (unreadable)"); continue; }
+                bool ok = n switch
+                {
+                    "playgo-chunk.dat"      => LooksLikePlayGoChunkDat(b),
+                    "playgo-hash-table.dat" => LooksLikePlayGoHashTable(b),
+                    _                       => LooksLikePlayGoFicm(b),
+                };
+                if (!ok) playgoBad.Add(n + (LooksLikeJsonText(b) ? " (is JSON text)" : LooksLikePlayGoHashTable(b) ? " (is a hash table)" : " (bad format)"));
+            }
+            bool discardPlayGo = playgoPresent.Length > 0 && (regenPlayGo || playgoBad.Count > 0);
+            if (discardPlayGo)
+                Console.Error.WriteLine(regenPlayGo && playgoBad.Count == 0
+                    ? $"  [playgo] --regen-playgo: discarding prepared set ({playgoPresent.Length} file(s)); LibProsperoPkg will regenerate {opts.PlayGoChunkCount} chunk(s)"
+                    : $"  [playgo] prepared set is CORRUPT — {string.Join(", ", playgoBad)}; discarding all {playgoPresent.Length} file(s) so LibProsperoPkg regenerates a consistent {opts.PlayGoChunkCount}-chunk set");
+
+            // Any sce_sys/*.json that is not JSON is a mislabeled dump artifact (same
+            // shifted-name bug); it would land in the inner PFS as junk. Drop it.
+            var badJson = Directory.Exists(srcSceSys)
+                ? Directory.EnumerateFiles(srcSceSys, "*.json").Where(p =>
+                    { try { return !LooksLikeJsonText(File.ReadAllBytes(p)); } catch { return false; } })
+                  .Select(Path.GetFileName).ToArray()
+                : Array.Empty<string>();
+            if (badJson.Length > 0)
+                Console.Error.WriteLine($"  [sce_sys] dropping mislabeled non-JSON file(s): {string.Join(", ", badJson)}");
+
+            // sce_sys/keystone is the save-data key material: a package built with a
+            // regenerated keystone (different passcode) reports every existing save of
+            // the title as corrupt (verified, build N). LibProsperoPkg keeps a present
+            // keystone and only generates one when it is missing — say which happened.
+            if (File.Exists(Path.Combine(srcSceSys, "keystone")))
+                Console.Error.WriteLine("  [keystone] source keystone preserved (save-data key; saves stay compatible with the original dump)");
+            else
+                Console.Error.WriteLine($"  [keystone] source has no sce_sys/keystone — the builder generates one for passcode {opts.Passcode}; saves from other builds of this title will NOT be readable");
+
+            bool needStage = pngsToConvert.Length > 0 || elfsToSign.Length > 0 || doRetailNormalize || discardPlayGo || badJson.Length > 0;
 
             if (needStage)
             {
@@ -1003,6 +1141,18 @@ internal static class Program
                 Directory.CreateDirectory(autoStage);
                 MirrorAsHardLinks(effectiveSource, autoStage);
                 Console.Error.WriteLine($"  [stage] mirrored source into {autoStage}");
+
+                // (0) Drop corrupt/mislabeled sce_sys metadata from the mirror (unlinks the
+                //     hardlink; the on-disk source is untouched).
+                if (discardPlayGo || badJson.Length > 0)
+                {
+                    var stagedSceSys0 = Path.Combine(autoStage, "sce_sys");
+                    foreach (var n in (discardPlayGo ? playgoPresent : Array.Empty<string>()).Concat(badJson))
+                    {
+                        var p = Path.Combine(stagedSceSys0, n);
+                        try { if (File.Exists(p) || IsSymlink(p)) File.Delete(p); } catch (Exception ex) { Console.Error.WriteLine($"  [stage] could not drop sce_sys/{n}: {ex.GetType().Name}"); }
+                    }
+                }
 
                 // (a) DDS icon CNT entries
                 if (pngsToConvert.Length > 0)
@@ -1050,6 +1200,163 @@ internal static class Program
                     Console.Error.WriteLine($"  [sign] fake-signed {signed} ELF(s); skipped {skipped} (already-SELF, non-ELF, or errors)");
                 }
 
+                // (c) Retail-normalize: two moves to make a "standard"-DRM retail dump
+                // produce a package that a JB PS5 with kstuff-lite 1.13+ launches.
+                //   (c.i) Drop placeholder license.dat/info from the staged mirror so
+                //         LibProsperoPkg's per-file iterator does not warn+skip on them.
+                //         The unlink is against the hardlink; source stays untouched.
+                //   (c.ii) Install a LicenseProvider that returns a valid debug license
+                //         for this contentId. LibProsperoPkg calls GetLicense() during
+                //         CollectMediaEntries and yields the returned bytes as CNT
+                //         entries 0x0400 (license.dat) and 0x0401 (license.info) — kills
+                //         the "License missing" padlock on the PS5 homescreen.
+                // drm_type=16 in the CNT header is handled UPSTREAM by our IL-patched
+                // LibProsperoPkg.dll (patches/README.md documents the one-byte hex patch
+                // that flips the hardcoded 0-for-Application ternary to always-16). This
+                // lets us keep applicationDrmType="standard" verbatim in the embedded
+                // param.json — flipping it to "upgradable" inside the pkg breaks games
+                // whose source metadata declares an upgrade chain (originContentVersion,
+                // targetContentVersion) because LibProsperoPkg strips those fields on
+                // build → the console sees an "upgradable" app without a target and
+                // refuses to launch with CE-100022-5.
+                if (doRetailNormalize)
+                {
+                    var stagedSceSys = Path.Combine(autoStage, "sce_sys");
+                    Directory.CreateDirectory(stagedSceSys);
+                    foreach (var badFile in new[] { "license.dat", "license.info" })
+                    {
+                        var p = Path.Combine(stagedSceSys, badFile);
+                        try { if (File.Exists(p) || IsSymlink(p)) File.Delete(p); } catch { }
+                    }
+                    opts.LicenseProvider = new DebugLicenseProvider(opts.ContentId);
+
+                    // (c.iii-a) Patch SELF headers of eboot.bin and every prx to the retail
+                    //           SELF pattern Sony's own toolchain stamps. Diffed the SELF
+                    //           header (first 16 bytes) between a retail reference title retail eboot +
+                    //           libc.prx (both launch on FW 11.60 + kstuff-lite 1.13+) and
+                    //           the retail sample-source's eboot + prx (fail with CE-100022-5 post-icon):
+                    //             the retail reference eboot.bin + .prx:  ver=0x0110  ProgramType=0x10000101  info=0x05100530
+                    //             the retail sample  eboot.bin + .prx:  ver=0x0100  ProgramType=0x00000101  info=0x05100560
+                    //           The ProgramType bit 0x10000000 is the "retail application"
+                    //           flag the console loader gates launch on. the retail sample-source's SELFs
+                    //           were fake-signed by an older tool that stamps dev-flavor
+                    //           headers (0x00000101). We patch to retail flavor in place —
+                    //           kstuff-lite bypasses the fake signature anyway, and the
+                    //           patched bytes stay within the SELF-header range the loader
+                    //           reads for its retail check. sce_sys/about/right.sprx keeps
+                    //           the dev pattern: Sony's own the retail reference has ProgramType=0x00000101
+                    //           on that one file too — it's a metadata SPRX that never
+                    //           executes, so the loader doesn't gate it on retail-bit.
+                    // Surgical patch: only flip byte 0x0B (dev 0x00 → retail 0x10) to set
+                    // ProgramType bit 0x10000000. Leaves HeaderSize/MetaSize + all other SELF
+                    // header offsets untouched so the loader's parser reads exactly the
+                    // structure the file actually has (patching version + info_field earlier
+                    // caused HeaderSize/MetaSize to reparse to smaller values, which put the
+                    // SDK-version record past the new-declared metadata boundary and confused
+                    // the loader).
+                    int selfPatched = 0, selfLeft = 0;
+                    foreach (var relPath in Directory.EnumerateFiles(autoStage, "*", SearchOption.AllDirectories))
+                    {
+                        var name = Path.GetFileName(relPath);
+                        var ext = Path.GetExtension(relPath).ToLowerInvariant();
+                        var relFromRoot = Path.GetRelativePath(autoStage, relPath).Replace('\\','/');
+                        bool isLoadable = name == "eboot.bin" || ext == ".prx" || ext == ".sprx";
+                        if (!isLoadable) continue;
+                        if (relFromRoot.StartsWith("sce_sys/about/", StringComparison.OrdinalIgnoreCase)) continue;
+                        try
+                        {
+                            byte[] head = new byte[16];
+                            using (var fs = new FileStream(relPath, FileMode.Open, FileAccess.Read))
+                            {
+                                int n = fs.Read(head, 0, 16);
+                                if (n < 16 || head[0] != 0x54 || head[1] != 0x14 || head[2] != 0xF5 || head[3] != 0xEE)
+                                { selfLeft++; continue; }
+                            }
+                            if (head[0x0B] == 0x10) { selfLeft++; continue; }
+                            var backup = relPath + ".pre-retail";
+                            File.Copy(relPath, backup, overwrite: true);
+                            File.Delete(relPath);
+                            File.Move(backup, relPath);
+                            using (var fs = new FileStream(relPath, FileMode.Open, FileAccess.Write))
+                            {
+                                fs.Seek(0x0B, SeekOrigin.Begin);
+                                fs.WriteByte(0x10);
+                            }
+                            selfPatched++;
+                        }
+                        catch (Exception ex) { Console.Error.WriteLine($"  [self-hdr] skipped {relFromRoot}: {ex.GetType().Name}: {ex.Message}"); selfLeft++; }
+                    }
+                    Console.Error.WriteLine($"  [self-hdr] set retail bit (byte 0x0B: 0x10) on {selfPatched} eboot.bin/*.prx; left {selfLeft} untouched");
+
+                    // (c.iii) Rewrite staged param.json:
+                    //   (a) attribute |= 0x20000000 when --hdr-flag (default). Bit 29 is the
+                    //       HDR support flag: with the console on "HDR when supported", the
+                    //       build without it (M) ran in SDR, the build with it (L) in HDR10.
+                    //       the retail reference and the second retail reference (Sony-built) both carry it. Some dumps ship 0.
+                    //   (b) a "kernel" block (the retail reference's cpu/gpu page-table + flexible-memory
+                    //       sizes) when the source has none. Not launch-critical (M had none
+                    //       and launched), kept to match Sony retail packages and the
+                    //       validated L configuration. A source's own block always wins.
+                    var stagedParam = Path.Combine(stagedSceSys, "param.json");
+                    var srcParam = Path.Combine(srcSceSys, "param.json");
+                    if (File.Exists(srcParam))
+                    {
+                        try
+                        {
+                            using var pdoc = JsonDocument.Parse(File.ReadAllBytes(srcParam));
+                            long currentAttr = 0;
+                            if (pdoc.RootElement.TryGetProperty("attribute", out var at)) currentAttr = at.GetInt64();
+                            long newAttr = hdrFlag ? (currentAttr | 0x20000000L) : currentAttr;
+                            bool hasKernel = pdoc.RootElement.TryGetProperty("kernel", out _);
+                            bool changed = (newAttr != currentAttr) || !hasKernel;
+                            if (changed)
+                            {
+                                var buf = new System.IO.MemoryStream();
+                                using (var w = new Utf8JsonWriter(buf, new JsonWriterOptions { Indented = true }))
+                                {
+                                    w.WriteStartObject();
+                                    bool kernelWritten = false;
+                                    foreach (var prop in pdoc.RootElement.EnumerateObject())
+                                    {
+                                        // Keep source order; write kernel just before "localizedParameters"
+                                        // (typical Sony ordering) if missing.
+                                        if (!hasKernel && !kernelWritten && prop.Name == "localizedParameters")
+                                        {
+                                            w.WriteStartObject("kernel");
+                                            w.WriteNumber("cpuPageTableSize", 67108864);       // 64 MiB
+                                            w.WriteNumber("flexibleMemorySize", 272629760);    // ~260 MiB (the retail reference's value)
+                                            w.WriteNumber("gpuPageTableSize", 67108864);       // 64 MiB
+                                            w.WriteEndObject();
+                                            kernelWritten = true;
+                                        }
+                                        if (prop.Name == "attribute")
+                                            w.WriteNumber("attribute", newAttr);
+                                        else
+                                            prop.WriteTo(w);
+                                    }
+                                    // Fallback: if we didn't find localizedParameters, append kernel at end
+                                    if (!hasKernel && !kernelWritten)
+                                    {
+                                        w.WriteStartObject("kernel");
+                                        w.WriteNumber("cpuPageTableSize", 67108864);
+                                        w.WriteNumber("flexibleMemorySize", 272629760);
+                                        w.WriteNumber("gpuPageTableSize", 67108864);
+                                        w.WriteEndObject();
+                                    }
+                                    w.WriteEndObject();
+                                }
+                                if (File.Exists(stagedParam) || IsSymlink(stagedParam)) File.Delete(stagedParam);
+                                File.WriteAllBytes(stagedParam, buf.ToArray());
+                                var kernelNote = hasKernel ? "" : ", added kernel{cpuPageTable=64Mi, flex=260Mi, gpuPageTable=64Mi}";
+                                var attrNote = newAttr != currentAttr ? $"set param.json attribute 0x{currentAttr:X8} -> 0x{newAttr:X8} (HDR support flag, bit 29)" : $"param.json attribute 0x{currentAttr:X8} kept";
+                                Console.Error.WriteLine($"  [retail] {attrNote}{kernelNote}");
+                            }
+                        }
+                        catch (Exception ex) { Console.Error.WriteLine($"[warn] retail-normalize: param.json rewrite failed ({ex.GetType().Name})"); }
+                    }
+                    Console.Error.WriteLine("  [retail] dropped placeholder license.dat/info; installed DebugLicenseProvider (CNT entries 0x0400/0x0401); drm_type=16 via patched LibProsperoPkg.dll");
+                }
+
                 opts.SourceFolder = autoStage;
             }
         }
@@ -1063,7 +1370,7 @@ internal static class Program
                 Console.Error.WriteLine(ex.ToString());
         }
 
-        Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"}, chunks={opts.PlayGoChunkCount}, fake-sign={autoFakeSign})");
+        Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"}, chunks={opts.PlayGoChunkCount}, fake-sign={autoFakeSign}, retail-normalize={doRetailNormalize})");
         ProsperoBuildResult result;
         try { result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s)); }
         finally { if (autoStage != null && Directory.Exists(autoStage)) { try { Directory.Delete(autoStage, recursive: true); } catch { } } }
@@ -1071,6 +1378,50 @@ internal static class Program
         if (result.Warnings != null)
             foreach (var w in result.Warnings) Console.Error.WriteLine("[warn] " + w);
         return 0;
+    }
+
+    /// <summary>LicenseProvider that issues a valid debug license.dat/info pair for a given
+    /// content-id. Wraps LibProsperoPkg.PKG.ProsperoSystemFiles.BuildDebugLicense — the exact
+    /// generator LibProsperoPkg itself uses at PackageBuilder.cs when a "standard" Application
+    /// source has no license files. We hand it back for the "upgradable" trick path where
+    /// the source-file iterator would otherwise emit nothing, so the console gets
+    /// well-formed CNT entries 0x0400 (license.dat) + 0x0401 (license.info).</summary>
+    sealed class DebugLicenseProvider : IProsperoLicenseProvider
+    {
+        private readonly string _contentId;
+        public DebugLicenseProvider(string contentId) { _contentId = contentId; }
+        public ProsperoLicenseArtifacts GetLicense(ProsperoLicenseRequest request)
+        {
+            var key = request.EntitlementKey ?? Array.Empty<byte>();
+            return ProsperoSystemFiles.BuildDebugLicense(request.VolumeType, _contentId, key);
+        }
+    }
+
+    // PlayGo on-wire formats, mirrored from LibProsperoPkg.ProsperoPlayGo (which is what
+    // Sony's publisher emits too — verified against an untouched a retail reference title retail pkg).
+    static uint U32(byte[] b, int o) => (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
+
+    /// <summary>playgo-chunk.dat: "plgx" magic, u32 total size at 0x10 equals the length.</summary>
+    static bool LooksLikePlayGoChunkDat(byte[] b)
+        => b.Length >= 0x40 && b[0] == (byte)'p' && b[1] == (byte)'l' && b[2] == (byte)'g' && b[3] == (byte)'x'
+           && U32(b, 0x10) == (uint)b.Length;
+
+    /// <summary>playgo-hash-table.dat: u32 1, u32 0x08000000, u32 56 (header), u32 table
+    /// size, "\x7fFLT" at 0x18; 56 + table size equals the length.</summary>
+    static bool LooksLikePlayGoHashTable(byte[] b)
+        => b.Length >= 56 && U32(b, 0) == 1u && U32(b, 4) == 0x08000000u && U32(b, 8) == 56u
+           && b[24] == 0x7F && b[25] == (byte)'F' && b[26] == (byte)'L' && b[27] == (byte)'T'
+           && 56u + U32(b, 12) == (uint)b.Length;
+
+    /// <summary>playgo-ficm.dat: u32 1, u32 16 (header) at 0x08, u32 payload size at 0x0C;
+    /// 16 + payload equals the length.</summary>
+    static bool LooksLikePlayGoFicm(byte[] b)
+        => b.Length >= 16 && U32(b, 0) == 1u && U32(b, 8) == 16u && 16u + U32(b, 12) == (uint)b.Length;
+
+    static bool LooksLikeJsonText(byte[] b)
+    {
+        try { using var d = JsonDocument.Parse(b); return d.RootElement.ValueKind == JsonValueKind.Object || d.RootElement.ValueKind == JsonValueKind.Array; }
+        catch { return false; }
     }
 
     /// <summary>Return relative paths (from *root*) of every regular file whose first bytes

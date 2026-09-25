@@ -27,6 +27,12 @@ backend/native/src/ffpfsc-pkg-tool/lib/
 backend/native/src/ffpfsc-pkg-tool/bin/
 backend/native/src/ffpfsc-pkg-tool/obj/
 backend/native/src/ffpfsc-pkg-tool/out/
+backend/native/src/ffpfsc-pkg-tool/patches/CecilPatch/bin/
+backend/native/src/ffpfsc-pkg-tool/patches/CecilPatch/obj/
+
+# Local console-test artifacts (multi-GB pkg variants, inspect dumps of retail packages)
+/hh-build/
+/aw2-analysis/
 
 # macOS
 .DS_Store

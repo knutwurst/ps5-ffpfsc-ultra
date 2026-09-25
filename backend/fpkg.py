@@ -157,12 +157,16 @@ def build(src_dir: Path, out_dir: Path,
           title: str = "",
           version: str = "01.000.000",
           passcode: str = "0" * 32,
-          inner_mode: str = "none",             # "none" | "zlib" | "kraken"
+          inner_mode: str = "kraken",           # "none" | "zlib" | "kraken"
           kraken_backend: str = "builtin",      # "automatic" | "builtin" | "publishingtools" | "uncompressed"
           publishing_tools_dll: Optional[str] = None,
           deterministic: bool = False,
           temp_dir: Optional[str] = None,
           level: Optional[int] = None,
+          retail_normalize: bool = True,
+          hdr_flag: bool = True,
+          regen_playgo: bool = False,
+          fake_sign: bool = True,
           on_line=None) -> int:
     """
     Build a debug fPKG from a prepared /app0-style source folder.
@@ -172,14 +176,26 @@ def build(src_dir: Path, out_dir: Path,
     - Every build Kraken-packs each file individually (raw only when that would not
       shrink it) — that is the native package layout and cannot be switched off.
       inner_mode adds a codec LAYER over the whole inner image on top of that:
-      'none' = no extra layer (default), 'kraken' = block-level Kraken layer (v1.2.0
-      path), 'zlib' = the legacy whole-inner PFSC layer. Measured on already
-      Kraken-packed data the three produce the same size; they differ in structure.
-    - kraken_backend 'builtin' uses LibProsperoPkg's own managed encoder (no external DLL).
+      'kraken' = block-level Kraken layer (v1.2.0 path; the configuration verified to
+      launch on a retail PS5, default), 'none' = no extra layer (console-untested),
+      'zlib' = the legacy whole-inner PFSC layer. Measured on already Kraken-packed
+      data the three produce the same size; they differ in structure.
+    - kraken_backend 'builtin' uses LibProsperoPkg's own managed encoder (no external DLL)
+      and is the only backend whose output launches on a console. 'uncompressed' and
+      'automatic' (stored blocks) install but fail to launch with CE-100096-6 (verified).
       'publishingtools' requires the leaked libScePubTools.dll at the given path AND
       64-bit Windows: on any other OS LibProsperoPkg throws ("the Reduced Oodle backend
       requires 64-bit Windows") and the build fails — there is no fallback. Verified
       with the real DLL on macOS.
+    - retail_normalize: for a "standard"-DRM source, inject valid license entries, set
+      the retail SELF flavour on executables and add Sony-style param.json fields
+      (drm_type=16 comes from the patched LibProsperoPkg). Default on.
+    - hdr_flag: set param.json attribute bit 29 (HDR support). Off = the console runs
+      the title in SDR when set to "HDR when supported". Default on.
+    - regen_playgo: discard the source's sce_sys/playgo-*.dat even when they look valid.
+      A CORRUPT set (wrong on-wire format — scene dumps mislabel these files) is always
+      discarded and regenerated; that was the sole launch blocker on the retail sample.
+    - fake_sign: fake-sign raw ELFs found in the source (idempotent). Default on.
     - temp_dir: where LibProsperoPkg stages the inner image / CNT / outer image
       (defaults to $TMPDIR). Pass the app's fast temp drive for big games.
     - level: Kraken preset. Measured: 0..9 give byte-identical output (the encoder's
@@ -206,6 +222,14 @@ def build(src_dir: Path, out_dir: Path,
         argv += ["--temp", str(temp_dir)]
     if level is not None:
         argv += ["--level", str(int(level))]
+    if not retail_normalize:
+        argv += ["--no-retail-normalize"]
+    if not hdr_flag:
+        argv += ["--no-hdr-flag"]
+    if regen_playgo:
+        argv += ["--regen-playgo"]
+    if not fake_sign:
+        argv += ["--no-fake-sign"]
     return _run(argv, on_line=on_line)
 
 

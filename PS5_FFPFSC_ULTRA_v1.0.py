@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.13"
+APP_VERSION = "1.1.14"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4450,6 +4450,17 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
+def _hdr_mode(v) -> str:
+    """Normalise the fPKG HDR-flag setting to 'auto' | 'on' | 'off'. 1.1.12/1.1.13 stored a
+    bool whose default (True) nobody chose consciously → 'auto'; an explicit False → 'off'."""
+    if v is True:
+        return "auto"
+    if v is False:
+        return "off"
+    s = str(v or "auto").strip().lower()
+    return s if s in ("auto", "on", "off") else "auto"
+
+
 class PackDialog(ctk.CTkToplevel):
     """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
 
@@ -4567,7 +4578,7 @@ class PackDialog(ctk.CTkToplevel):
         # Retail switches — defaults are the configuration verified to launch on a retail
         # PS5 (CHANGELOG 1.1.12). Off positions exist for byte-exact re-packs and A/B tests.
         self.retail_var = tk.BooleanVar(value=bool(fp.get("retail_normalize", True)))
-        self.hdr_var    = tk.BooleanVar(value=bool(fp.get("hdr_flag", True)))
+        self.hdr_var    = tk.StringVar(value=_hdr_mode(fp.get("hdr_flag", "auto")))   # auto | on | off
         self.regen_var  = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
         self.sign_var   = tk.BooleanVar(value=bool(fp.get("fake_sign", True)))
         self.back_hint = tk.StringVar()
@@ -4729,14 +4740,23 @@ class PackDialog(ctk.CTkToplevel):
         self.orow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
         r4 = ctk.CTkFrame(self.orow, fg_color=PANEL); r4.pack(fill="x", padx=10, pady=(6, 2))
         ctk.CTkLabel(r4, text="Retail options:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        for _var, _text in ((self.retail_var, "Retail fixes"), (self.hdr_var, "HDR flag"),
+        for _var, _text in ((self.retail_var, "Retail fixes"),
                             (self.regen_var, "Rebuild PlayGo"), (self.sign_var, "Fake-sign ELFs")):
             ctk.CTkCheckBox(r4, text=_text, variable=_var, checkbox_width=18, checkbox_height=18,
                             fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
                             font=ctk.CTkFont(size=11), command=self._update_summary).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(self.orow, text="Defaults are the configuration verified on the console. HDR flag off = the title "
-                                     "runs in SDR · Rebuild PlayGo also drops a valid set (a corrupt one is always "
-                                     "rebuilt) · sce_sys/keystone, the save-data key, is always kept.",
+        # HDR is a three-way choice, not a bool: the source's own param.json declares whether
+        # the title supports HDR, and "auto" keeps exactly that (the publisher's intent).
+        r5 = ctk.CTkFrame(self.orow, fg_color=PANEL); r5.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(r5, text="HDR flag:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        ctk.CTkSegmentedButton(r5, values=["auto", "on", "off"], variable=self.hdr_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                command=lambda *_: self._update_summary()).pack(side="left")
+        ctk.CTkLabel(r5, text="  auto = as the source declares  ·  on = force HDR output  ·  off = clear the flag",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(self.orow, text="Defaults are the configuration verified on the console · Rebuild PlayGo also drops a "
+                                     "valid set (a corrupt one is always rebuilt) · sce_sys/keystone, the save-data key, "
+                                     "is always kept.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(0, 8))
         for _v in (self.cid_var, self.tid_var):
@@ -4910,8 +4930,8 @@ class PackDialog(ctk.CTkToplevel):
             parts.append("Sony DLL backend")
         if not self.retail_var.get():
             parts.append("retail fixes OFF")
-        if not self.hdr_var.get():
-            parts.append("HDR flag off")
+        if self.hdr_var.get() in ("on", "off"):
+            parts.append(f"HDR flag {self.hdr_var.get()}")
         if self.regen_var.get():
             parts.append("PlayGo rebuilt")
         if not self.sign_var.get():
@@ -5121,7 +5141,7 @@ class PackDialog(ctk.CTkToplevel):
         dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
         return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
                 "inner": inner, "backend": back, "level": level, "dll": dll,
-                "retail_normalize": bool(self.retail_var.get()), "hdr_flag": bool(self.hdr_var.get()),
+                "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
                 "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get())}
 
     # ── commit ───────────────────────────────────────────────────────────────
@@ -6476,7 +6496,7 @@ class App:
             "backend": _fd.get("backend") if _fd.get("backend") in ("builtin", "publishingtools") else "builtin",
             "level":   max(-4, min(9, _fl)),      # Kraken: <0 = fast preset, else normal (the tool's 0..9 are identical)
             "retail_normalize": bool(_fd.get("retail_normalize", True)),
-            "hdr_flag":         bool(_fd.get("hdr_flag", True)),
+            "hdr_flag":         _hdr_mode(_fd.get("hdr_flag", "auto")),   # 1.1.12/13 bool → auto/off
             "regen_playgo":     bool(_fd.get("regen_playgo", False)),
             "fake_sign":        bool(_fd.get("fake_sign", True)),
             "v1112":            True,
@@ -8793,7 +8813,7 @@ class App:
             "level":      max(-4, min(9, lvl)),     # -4..-1 = Kraken fast preset, 0..9 = normal
             "dll":        getattr(item, "fpkg_pubtools_dll", "") or "",
             "retail_normalize": bool(getattr(item, "fpkg_retail_normalize", True)),
-            "hdr_flag":         bool(getattr(item, "fpkg_hdr_flag", True)),
+            "hdr_flag":         _hdr_mode(getattr(item, "fpkg_hdr_flag", "auto")),
             "regen_playgo":     bool(getattr(item, "fpkg_regen_playgo", False)),
             "fake_sign":        bool(getattr(item, "fpkg_fake_sign", True)),
         }
@@ -8820,7 +8840,7 @@ class App:
         except Exception:
             item.fpkg_level = 7
         item.fpkg_retail_normalize = bool(params.get("retail_normalize", True))
-        item.fpkg_hdr_flag         = bool(params.get("hdr_flag", True))
+        item.fpkg_hdr_flag         = _hdr_mode(params.get("hdr_flag", "auto"))
         item.fpkg_regen_playgo     = bool(params.get("regen_playgo", False))
         item.fpkg_fake_sign        = bool(params.get("fake_sign", True))
         dll = str(params.get("dll", "") or "").strip()
@@ -9656,8 +9676,9 @@ class App:
             # the backend's defaults are the console-verified configuration.
             if not getattr(item, "fpkg_retail_normalize", True):
                 cmd += ["--fpkg-no-retail-normalize"]
-            if not getattr(item, "fpkg_hdr_flag", True):
-                cmd += ["--fpkg-no-hdr-flag"]
+            _hdr = _hdr_mode(getattr(item, "fpkg_hdr_flag", "auto"))
+            if _hdr != "auto":
+                cmd += ["--fpkg-hdr-flag", _hdr]
             if getattr(item, "fpkg_regen_playgo", False):
                 cmd += ["--fpkg-regen-playgo"]
             if not getattr(item, "fpkg_fake_sign", True):

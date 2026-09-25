@@ -79,8 +79,9 @@ internal static class Program
         Console.WriteLine("      --regen-playgo               discard source sce_sys/playgo-*.dat and let the builder regenerate them");
         Console.WriteLine("                                   (a CORRUPT prepared set — wrong format, e.g. JSON under hash-table.dat — is");
         Console.WriteLine("                                   always discarded automatically; this forces it for valid-looking sets too)");
-        Console.WriteLine("      --hdr-flag / --no-hdr-flag   set param.json attribute bit 29 (HDR support) — default ON; without it");
-        Console.WriteLine("                                   a console on \"HDR when supported\" runs the title in SDR (verified)");
+        Console.WriteLine("      --hdr-flag auto|on|off       param.json attribute bit 29 (HDR support). auto = keep what the source");
+        Console.WriteLine("                                   declares (default; that is the publisher's intent), on = set it, off = clear");
+        Console.WriteLine("                                   it. A console on \"HDR when supported\" switches output modes on this bit.");
         Console.WriteLine("      --retail-normalize / --no-retail-normalize");
         Console.WriteLine("                                   auto-upgrade a \"standard\" retail source (default ON):");
         Console.WriteLine("                                     staged param.json standard -> upgradable (drm_type=16),");
@@ -836,7 +837,7 @@ internal static class Program
         bool playGoChunksExplicit = false; // did the user pass --playgo-chunks?
         bool retailNormalize = true;      // auto-upgrade a "standard" retail source to a shape the console launches
         bool regenPlayGo = false;         // force-discard a prepared PlayGo set even if it validates
-        bool hdrFlag = true;              // set param.json attribute bit 29 (HDR support) in retail-normalize
+        string hdrFlag = "auto";          // param.json attribute bit 29 (HDR support): auto = as the source declares, on, off
 
         var opts = new ProsperoBuildOptions
         {
@@ -969,13 +970,16 @@ internal static class Program
                     // LibProsperoPkg generates a set that matches the inner tree it builds.
                     regenPlayGo = true;
                     break;
-                case "--hdr-flag": hdrFlag = true; break;
-                case "--no-hdr-flag":
-                    // Leave param.json "attribute" exactly as the source has it. With the
-                    // console on "HDR when supported" the title then runs in SDR unless the
-                    // source already carries bit 29.
-                    hdrFlag = false;
+                case "--hdr-flag":
+                    // auto: keep the source's declaration (a console on "HDR when supported"
+                    // follows bit 29 — set means it switches to HDR output for this title).
+                    // on: set the bit even if the source lacks it. off: clear it.
+                    hdrFlag = (v ?? "").ToLowerInvariant();
+                    if (hdrFlag is not ("auto" or "on" or "off"))
+                        throw new ArgumentException("--hdr-flag needs auto, on or off");
+                    i++;
                     break;
+                case "--no-hdr-flag": hdrFlag = "off"; break;   // 1.1.12/1.1.13 spelling
                 default: return Bad("unknown build flag: " + a);
             }
         }
@@ -1043,10 +1047,11 @@ internal static class Program
         //   - The retail SELF flavour on eboot.bin and every prx/sprx (ProgramType bit
         //     0x10000000, byte 0x0B of the SELF header). Sony-signed retail SELFs carry
         //     it; older fake-signers used the dev flavour.
-        //   - Optional: param.json attribute bit 29 (0x20000000) = HDR support flag.
-        //     Build M (bit unset) launched fine but the console stayed in SDR; build L
-        //     (bit set) launched in HDR10. Sony's own packages set it for HDR titles.
-        //     Switch: --hdr-flag / --no-hdr-flag (default on).
+        //   - param.json attribute bit 29 (0x20000000) = HDR support flag. A console on
+        //     "HDR when supported" switches to HDR output when it is set (verified: the
+        //     build with it ran the console in HDR10, the build without in SDR). The
+        //     source's own declaration is the publisher's intent, so --hdr-flag auto
+        //     (default) keeps it; on/off override. Not launch-critical either way.
         //   Also injected: a "kernel" block with a retail reference package's values when the source has none.
         //   Verified NOT launch-critical (build M had none and launched); kept because
         //   every Sony retail package carries one and L is the validated configuration.
@@ -1289,14 +1294,14 @@ internal static class Program
                     Console.Error.WriteLine($"  [self-hdr] set retail bit (byte 0x0B: 0x10) on {selfPatched} eboot.bin/*.prx; left {selfLeft} untouched");
 
                     // (c.iii) Rewrite staged param.json:
-                    //   (a) attribute |= 0x20000000 when --hdr-flag (default). Bit 29 is the
-                    //       HDR support flag: with the console on "HDR when supported", the
-                    //       build without it (M) ran in SDR, the build with it (L) in HDR10.
-                    //       Retail reference packages carry it; some sources ship 0.
+                    //   (a) attribute bit 29 (0x20000000, HDR support) per --hdr-flag. auto keeps
+                    //       the source's declaration — that is the publisher's intent, and a
+                    //       console on "HDR when supported" switches output modes on it. on/off
+                    //       set/clear it explicitly.
                     //   (b) a "kernel" block (a retail reference package's cpu/gpu page-table + flexible-memory
-                    //       sizes) when the source has none. Not launch-critical (M had none
-                    //       and launched), kept to match Sony retail packages and the
-                    //       validated L configuration. A source's own block always wins.
+                    //       sizes) when the source has none. Not launch-critical (a build without
+                    //       it launched), kept to match retail packages. A source's own block
+                    //       always wins.
                     var stagedParam = Path.Combine(stagedSceSys, "param.json");
                     var srcParam = Path.Combine(srcSceSys, "param.json");
                     if (File.Exists(srcParam))
@@ -1306,7 +1311,21 @@ internal static class Program
                             using var pdoc = JsonDocument.Parse(File.ReadAllBytes(srcParam));
                             long currentAttr = 0;
                             if (pdoc.RootElement.TryGetProperty("attribute", out var at)) currentAttr = at.GetInt64();
-                            long newAttr = hdrFlag ? (currentAttr | 0x20000000L) : currentAttr;
+                            const long HdrBit = 0x20000000L;
+                            bool srcHdr = (currentAttr & HdrBit) != 0;
+                            long newAttr = hdrFlag switch
+                            {
+                                "on"  => currentAttr | HdrBit,
+                                "off" => currentAttr & ~HdrBit,
+                                _     => currentAttr,
+                            };
+                            string hdrNote = hdrFlag switch
+                            {
+                                "on"  => srcHdr ? "HDR support flag already set in source (--hdr-flag on)" : "HDR support flag set (--hdr-flag on; the source did not declare it)",
+                                "off" => srcHdr ? "HDR support flag CLEARED (--hdr-flag off; the source declared it)" : "HDR support flag absent in source, left absent (--hdr-flag off)",
+                                _     => srcHdr ? "source declares HDR support (attribute bit 29) — kept" : "source does not declare HDR support (attribute bit 29) — kept as is; pass --hdr-flag on to force HDR output",
+                            };
+                            Console.Error.WriteLine($"  [retail] {hdrNote}");
                             bool hasKernel = pdoc.RootElement.TryGetProperty("kernel", out _);
                             bool changed = (newAttr != currentAttr) || !hasKernel;
                             if (changed)
@@ -1347,8 +1366,8 @@ internal static class Program
                                 }
                                 if (File.Exists(stagedParam) || IsSymlink(stagedParam)) File.Delete(stagedParam);
                                 File.WriteAllBytes(stagedParam, buf.ToArray());
-                                var kernelNote = hasKernel ? "" : ", added kernel{cpuPageTable=64Mi, flex=260Mi, gpuPageTable=64Mi}";
-                                var attrNote = newAttr != currentAttr ? $"set param.json attribute 0x{currentAttr:X8} -> 0x{newAttr:X8} (HDR support flag, bit 29)" : $"param.json attribute 0x{currentAttr:X8} kept";
+                                var kernelNote = hasKernel ? "" : "; added kernel{cpuPageTable=64Mi, flex=260Mi, gpuPageTable=64Mi}";
+                                var attrNote = newAttr != currentAttr ? $"param.json attribute 0x{currentAttr:X8} -> 0x{newAttr:X8}" : $"param.json attribute 0x{currentAttr:X8} unchanged";
                                 Console.Error.WriteLine($"  [retail] {attrNote}{kernelNote}");
                             }
                         }

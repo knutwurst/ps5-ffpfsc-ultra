@@ -164,7 +164,7 @@ def build(src_dir: Path, out_dir: Path,
           temp_dir: Optional[str] = None,
           level: Optional[int] = None,
           retail_normalize: bool = True,
-          hdr_flag: bool = True,
+          hdr_flag: str = "auto",               # "auto" | "on" | "off" (bool accepted: True→on, False→off)
           regen_playgo: bool = False,
           fake_sign: bool = True,
           on_line=None) -> int:
@@ -190,8 +190,9 @@ def build(src_dir: Path, out_dir: Path,
     - retail_normalize: for a "standard"-DRM source, inject valid license entries, set
       the retail SELF flavour on executables and add Sony-style param.json fields
       (drm_type=16 comes from the patched LibProsperoPkg). Default on.
-    - hdr_flag: set param.json attribute bit 29 (HDR support). Off = the console runs
-      the title in SDR when set to "HDR when supported". Default on.
+    - hdr_flag: param.json attribute bit 29 (HDR support). 'auto' (default) keeps what the
+      source declares — the publisher's intent; a console on "HDR when supported" switches
+      to HDR output for the title only when the bit is set. 'on' sets it, 'off' clears it.
     - regen_playgo: discard the source's sce_sys/playgo-*.dat even when they look valid.
       A CORRUPT set (wrong on-wire format — some containers ship these files with
       swapped contents) is always discarded and regenerated; that alone turned an
@@ -225,8 +226,10 @@ def build(src_dir: Path, out_dir: Path,
         argv += ["--level", str(int(level))]
     if not retail_normalize:
         argv += ["--no-retail-normalize"]
-    if not hdr_flag:
-        argv += ["--no-hdr-flag"]
+    if isinstance(hdr_flag, bool):
+        hdr_flag = "on" if hdr_flag else "off"
+    if hdr_flag in ("on", "off"):
+        argv += ["--hdr-flag", hdr_flag]
     if regen_playgo:
         argv += ["--regen-playgo"]
     if not fake_sign:

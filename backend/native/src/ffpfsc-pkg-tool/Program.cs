@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using LibProsperoPkg;
+using LibProsperoPkg.Content;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PKG;
 
@@ -73,8 +74,12 @@ internal static class Program
         Console.WriteLine("      --deterministic              byte-reproducible build");
         Console.WriteLine("      --temp <dir>                 intermediate files go here (default: $TMPDIR)");
         Console.WriteLine("      --level <n>                  compression level: Kraken -4..9, zlib 0..9 (default 7)");
+        Console.WriteLine("      --playgo-chunks <1..255>     PlayGo chunk count (auto-detected from source sce_sys/playgo-chunk.dat)");
+        Console.WriteLine("      --fake-sign / --no-fake-sign fake-sign raw ELFs in source before packing (default ON; idempotent)");
         Console.WriteLine("");
         Console.WriteLine("  Default passcode 32 x '0'. Default output is a finalized debug image.");
+        Console.WriteLine("  Auto-fake-sign scans for raw ELF magic (0x7F454C46) in eboot.bin, *.elf, *.prx, *.sprx");
+        Console.WriteLine("  and rewrites them as SCE fake-selves in a hardlink mirror; source is never modified.");
     }
 
     static int Bad(string m) { Console.Error.WriteLine("[usage] " + m); PrintUsage(); return 2; }
@@ -817,6 +822,9 @@ internal static class Program
         static int CmdBuild(string[] args)
     {
         if (args.Length < 3) return Bad("build needs <src-dir> <out-dir>");
+        bool autoFakeSign = true;         // fake-sign raw ELFs in source before build (idempotent)
+        bool playGoChunksExplicit = false; // did the user pass --playgo-chunks?
+
         var opts = new ProsperoBuildOptions
         {
             SourceFolder = args[1],
@@ -844,7 +852,8 @@ internal static class Program
             PublisherImageMode = ProsperoPublisherImageMode.PlaintextNoAuth,
             // Sony's publisher packs every launch-time file into PlayGo chunk 0;
             // LibProsperoPkg's default of 64 spreads them out. Both boot, but the
-            // 1-chunk layout matches every known-working reference package.
+            // 1-chunk layout matches every known-working reference package. Auto-
+            // detected from the source's own sce_sys/playgo-chunk.dat later.
             PlayGoChunkCount = 1,
         };
         for (int i = 3; i < args.Length; i++)
@@ -903,11 +912,26 @@ internal static class Program
                 case "--playgo-chunks":
                     // LibProsperoPkg defaults to 64 and spreads files over as many chunks as
                     // there are files; Sony's publisher packs every launch-time file into
-                    // chunk 0 (default here). Override 1..255 for advanced PlayGo layouts.
+                    // chunk 0 (default here). Auto-detected from source's playgo-chunk.dat
+                    // when present; this override wins over the auto-detect.
                     if (!int.TryParse(v, out int chunks) || chunks < 1 || chunks > 255)
                         throw new ArgumentException("--playgo-chunks needs an integer 1..255");
                     opts.PlayGoChunkCount = chunks;
+                    playGoChunksExplicit = true;
                     i++;
+                    break;
+                case "--no-fake-sign":
+                    // Retail games have raw ELFs that must be fake-signed to boot on a
+                    // jailbroken console. Default is ON so a retail-shaped source (with
+                    // eboot.bin + fakelib SPRXes) becomes launch-ready without a separate
+                    // Sign pass. Use this flag to skip if the source is already fake-signed
+                    // and you want to keep bytes identical, or if signing would corrupt an
+                    // exotic SELF variant.
+                    autoFakeSign = false;
+                    break;
+                case "--fake-sign":
+                    // Explicit opt-in (redundant with the default). Kept for clarity.
+                    autoFakeSign = true;
                     break;
                 default: return Bad("unknown build flag: " + a);
             }
@@ -916,45 +940,117 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(opts.TitleId)) return Bad("--title-id required");
         Directory.CreateDirectory(opts.OutputFolder);
 
-        // Auto-generate the sce_sys/*.dds icon CNT entries the console needs to launch an
-        // app. LibProsperoPkg 1.2.0's builder moves any sce_sys/*.dds into the outer CNT
-        // (see ProsperoPfsLayoutOptions.FilterOuterPackageEntries) but does NOT create
-        // them itself — the a53 GUI does that up front via ProsperoDdsEncoder. We do the
-        // same: for every icon0/pic0/pic1/pic2.png in the source's sce_sys/, produce the
-        // matching .dds via ProsperoDdsEncoder.EncodePngToDds and drop it into a temp
-        // copy of the source folder that becomes the actual build input. The original
-        // library folder is never touched. Requires Magick.NET (bundled).
+        // Stage: mirror the source into a temp folder (hard links, no gigabyte copy) if
+        // ANY of these pre-build transforms need to run on the source:
+        //   (a) auto-generate sce_sys/*.dds from PNGs the source only provides as PNG
+        //       (LibProsperoPkg's builder moves sce_sys/*.dds into the outer CNT but does
+        //       NOT generate the DDS itself; without them the .pkg installs but never
+        //       launches — see the 1.1.7 CHANGELOG entry);
+        //   (b) fake-sign raw ELFs (eboot.bin, *.elf, *.prx, *.sprx) that a retail-shape
+        //       source ships unsigned — a jailbroken PS5's app loader rejects a package
+        //       whose eboot is not a fake-self and kills the process immediately (short
+        //       fan-spin then CE-100096-6). Idempotent — already-signed inputs are skipped.
+        // Auto-detect PlayGoChunkCount from the source's own sce_sys/playgo-chunk.dat is a
+        // pure metadata read and runs regardless of whether we stage a mirror.
         string effectiveSource = opts.SourceFolder!;
-        string? autoDdsStage = null;
+        string? autoStage = null;
+        var srcSceSys = Path.Combine(effectiveSource, "sce_sys");
+
+        // -- PlayGoChunkCount auto-detect (unless the user pinned it explicitly) --
+        if (!playGoChunksExplicit)
+        {
+            try
+            {
+                var pgChunk = Path.Combine(srcSceSys, "playgo-chunk.dat");
+                if (File.Exists(pgChunk))
+                {
+                    var bytes = File.ReadAllBytes(pgChunk);
+                    // Layout probed against known good sources (Sony DLL builds):
+                    //   0x00  magic 'plgx'
+                    //   0x08  u16 attribute count
+                    //   0x0A  u16 chunk count  <-- this is what LibProsperoPkg uses
+                    if (bytes.Length >= 12 &&
+                        bytes[0] == (byte)'p' && bytes[1] == (byte)'l' && bytes[2] == (byte)'g' && bytes[3] == (byte)'x')
+                    {
+                        int detected = bytes[0x0A] | (bytes[0x0B] << 8);
+                        if (detected >= 1 && detected <= 255 && detected != opts.PlayGoChunkCount)
+                        {
+                            Console.Error.WriteLine($"  [playgo] source declares {detected} chunk(s); using that (was default {opts.PlayGoChunkCount})");
+                            opts.PlayGoChunkCount = detected;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[warn] could not read source playgo-chunk.dat ({ex.GetType().Name}); using PlayGoChunkCount={opts.PlayGoChunkCount}"); }
+        }
+
         try
         {
-            var srcSceSys = Path.Combine(effectiveSource, "sce_sys");
+            // Discover work first (so we can stage exactly once).
             var iconNames = new[] { "icon0.png", "pic0.png", "pic1.png", "pic2.png" };
             var pngsToConvert = Directory.Exists(srcSceSys)
                 ? iconNames.Where(n => File.Exists(Path.Combine(srcSceSys, n))
                                        && !File.Exists(Path.Combine(srcSceSys, Path.ChangeExtension(n, ".dds")))).ToArray()
                 : Array.Empty<string>();
-            if (pngsToConvert.Length > 0)
+            var elfsToSign = autoFakeSign ? FindRawElfs(effectiveSource) : Array.Empty<string>();
+            bool needStage = pngsToConvert.Length > 0 || elfsToSign.Length > 0;
+
+            if (needStage)
             {
-                autoDdsStage = Path.Combine(
+                autoStage = Path.Combine(
                     string.IsNullOrEmpty(opts.TemporaryDirectory) ? Path.GetTempPath() : opts.TemporaryDirectory!,
-                    "ffpfsc-dds-" + Guid.NewGuid().ToString("N").Substring(0, 8));
-                Directory.CreateDirectory(autoDdsStage);
-                // Mirror the entire source folder with SYMLINKS so the build path is
-                // otherwise unchanged (no gigabyte copy for a real game).
-                MirrorAsHardLinks(effectiveSource, autoDdsStage);
-                var stagedSceSys = Path.Combine(autoDdsStage, "sce_sys");
-                Directory.CreateDirectory(stagedSceSys);
-                foreach (var name in pngsToConvert)
+                    "ffpfsc-stage-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                Directory.CreateDirectory(autoStage);
+                MirrorAsHardLinks(effectiveSource, autoStage);
+                Console.Error.WriteLine($"  [stage] mirrored source into {autoStage}");
+
+                // (a) DDS icon CNT entries
+                if (pngsToConvert.Length > 0)
                 {
-                    var png = File.ReadAllBytes(Path.Combine(srcSceSys, name));
-                    var dds = ProsperoDdsEncoder.EncodePngToDds(png, opts.TemporaryDirectory ?? Path.GetTempPath());
-                    var ddsPath = Path.Combine(stagedSceSys, Path.ChangeExtension(name, ".dds"));
-                    if (File.Exists(ddsPath) || IsSymlink(ddsPath)) File.Delete(ddsPath);
-                    File.WriteAllBytes(ddsPath, dds);
-                    Console.Error.WriteLine($"  [icon] generated sce_sys/{Path.ChangeExtension(name, ".dds")} ({dds.Length:N0} B) from {name}");
+                    var stagedSceSys = Path.Combine(autoStage, "sce_sys");
+                    Directory.CreateDirectory(stagedSceSys);
+                    foreach (var name in pngsToConvert)
+                    {
+                        var png = File.ReadAllBytes(Path.Combine(srcSceSys, name));
+                        var dds = ProsperoDdsEncoder.EncodePngToDds(png, opts.TemporaryDirectory ?? Path.GetTempPath());
+                        var ddsPath = Path.Combine(stagedSceSys, Path.ChangeExtension(name, ".dds"));
+                        if (File.Exists(ddsPath) || IsSymlink(ddsPath)) File.Delete(ddsPath);
+                        File.WriteAllBytes(ddsPath, dds);
+                        Console.Error.WriteLine($"  [icon] generated sce_sys/{Path.ChangeExtension(name, ".dds")} ({dds.Length:N0} B) from {name}");
+                    }
                 }
-                opts.SourceFolder = autoDdsStage;
+
+                // (b) Fake-sign raw ELFs. LibProsperoPkg's own MakeFself does the byte-
+                // faithful conversion; skips SELFs and non-ELFs.
+                if (elfsToSign.Length > 0)
+                {
+                    int signed = 0, skipped = 0;
+                    foreach (var relPath in elfsToSign)
+                    {
+                        var srcFile = Path.Combine(effectiveSource, relPath);
+                        var stagedFile = Path.Combine(autoStage, relPath);
+                        try
+                        {
+                            var bytes = File.ReadAllBytes(srcFile);
+                            if (!ProsperoFself.IsElf(bytes) || ProsperoFself.IsSelf(bytes)) { skipped++; continue; }
+                            var fself = ProsperoFself.MakeFself(bytes, new FselfOptions());
+                            // The staged file is a hardlink to the source — unlink it and
+                            // write the new bytes into the staged path so the source stays untouched.
+                            if (File.Exists(stagedFile) || IsSymlink(stagedFile)) File.Delete(stagedFile);
+                            Directory.CreateDirectory(Path.GetDirectoryName(stagedFile)!);
+                            File.WriteAllBytes(stagedFile, fself);
+                            signed++;
+                        }
+                        catch (Exception ex)
+                        {
+                            skipped++;
+                            Console.Error.WriteLine($"  [sign] skipped {relPath}: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                    Console.Error.WriteLine($"  [sign] fake-signed {signed} ELF(s); skipped {skipped} (already-SELF, non-ELF, or errors)");
+                }
+
+                opts.SourceFolder = autoStage;
             }
         }
         catch (Exception ex)
@@ -962,19 +1058,43 @@ internal static class Program
             var chain = ex.GetType().Name + ": " + ex.Message;
             for (var e = ex.InnerException; e != null; e = e.InnerException)
                 chain += "  <- " + e.GetType().Name + ": " + e.Message;
-            Console.Error.WriteLine("[warn] icon0.dds auto-generation failed (" + chain + ") — the .pkg will lack the DDS CNT entries the console needs to launch the app.");
+            Console.Error.WriteLine("[warn] source auto-stage failed (" + chain + "). The .pkg will be built from the source as-is, which may lack DDS CNT entries and/or unsigned executables.");
             if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
                 Console.Error.WriteLine(ex.ToString());
         }
 
-        Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"})");
+        Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"}, chunks={opts.PlayGoChunkCount}, fake-sign={autoFakeSign})");
         ProsperoBuildResult result;
         try { result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s)); }
-        finally { if (autoDdsStage != null && Directory.Exists(autoDdsStage)) { try { Directory.Delete(autoDdsStage, recursive: true); } catch { } } }
+        finally { if (autoStage != null && Directory.Exists(autoStage)) { try { Directory.Delete(autoStage, recursive: true); } catch { } } }
         Console.WriteLine($"OK — wrote {result.OutputPath} ({new FileInfo(result.OutputPath).Length:N0} B)");
         if (result.Warnings != null)
             foreach (var w in result.Warnings) Console.Error.WriteLine("[warn] " + w);
         return 0;
+    }
+
+    /// <summary>Return relative paths (from *root*) of every regular file whose first bytes
+    /// look like a raw ELF (magic 0x7F 'E' 'L' 'F'). Only files with plausible extensions
+    /// (eboot.bin, .elf, .prx, .sprx) are checked so a huge blob is not sniffed unnecessarily.</summary>
+    static string[] FindRawElfs(string root)
+    {
+        var result = new List<string>();
+        var head = new byte[4];
+        foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        {
+            var name = Path.GetFileName(f);
+            var ext = Path.GetExtension(f).ToLowerInvariant();
+            if (name != "eboot.bin" && ext != ".elf" && ext != ".prx" && ext != ".sprx") continue;
+            try
+            {
+                using var fs = File.OpenRead(f);
+                if (fs.Read(head, 0, 4) != 4) continue;
+                if (head[0] == 0x7F && head[1] == (byte)'E' && head[2] == (byte)'L' && head[3] == (byte)'F')
+                    result.Add(Path.GetRelativePath(root, f));
+            }
+            catch { }
+        }
+        return result.ToArray();
     }
 }
 

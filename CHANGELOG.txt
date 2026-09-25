@@ -3,7 +3,53 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.10  (current)
+  v1.1.11  (current)
+────────────────────────────────────────────────────────────────────────
+
+RETAIL-PERFECT fPKG BUILDS OUT OF THE BOX
+
+  After byte-comparing fPKGs from a retail reference title, another retail reference, and the
+  HomebrewTest, and cross-referencing the SvenGDK LibProsperoPkg
+  ps5-pkg-format spec, two more defaults were misaligned for retail
+  content. Both are now fixed in ffpfsc-pkg-tool with safe fallbacks:
+
+  • AUTO-FAKE-SIGN raw ELFs in the source (default ON).
+    LibProsperoPkg's own ProsperoFself.MakeFself converts each raw ELF
+    (eboot.bin, *.elf, *.prx, *.sprx) to a fake-self before packing.
+    Idempotent — already-SELF files and non-ELF files are skipped.
+    Original source folder is never modified: a hardlink mirror of the
+    source is created in --temp-dir, only the ELFs to convert are
+    unlinked and rewritten in the mirror, and the mirror is deleted
+    after the build. Opt out with the new --no-fake-sign flag if the
+    source ships pre-signed and you want exact byte-preservation.
+
+    Why this matters: retail game dumps carry unsigned ELFs. A PS5's
+    debug-image loader kills any package whose eboot is not fake-self
+    (short fan-spin, then CE-100096-6). Users had to run the separate
+    🖊 Sign job before Pack; now the builder handles it in-process.
+
+  • AUTO-DETECT PlayGoChunkCount from the source's sce_sys/playgo-chunk.dat.
+    If the source (a real game dump) declares a specific chunk count in
+    its own PlayGo table, the builder now respects that instead of
+    forcing the 1-chunk default set for HomebrewTest-scale content.
+    The --playgo-chunks N override still wins if the user pins it.
+
+    Log lines make the choice visible:
+        [playgo] source declares 5 chunk(s); using that (was default 1)
+        [sign]   fake-signed 6 ELF(s); skipped 2 (already-SELF, non-ELF, or errors)
+
+  • Single unified staging pass. The DDS-icon generation from 1.1.7,
+    the new fake-sign pass, and any future source pre-processing all
+    share ONE mirror in --temp-dir instead of stacking them, so a
+    100 GB game gets exactly one hardlink walk rather than N.
+
+  Verified: 92/92 pipeline tests pass, HomebrewTest builds byte-identically
+  to 1.1.10 (nothing regressed on a small homebrew whose eboot is already
+  fake-signed). Retail acceptance verified separately with the retail sample
+  [PPSA00003] built through the same pipeline.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.10
 ────────────────────────────────────────────────────────────────────────
 
 fPKG BUILDS FINALLY LAUNCH ON 11.60 (kstuff-lite 1.13+)

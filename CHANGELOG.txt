@@ -3,64 +3,69 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.12  (current)
+  v1.1.13  (current)
 ────────────────────────────────────────────────────────────────────────
 
-RETAIL fPKG BUILDS LAUNCH — VERIFIED ON A RETAIL PS5 (FW 11.60, kstuff-lite 1.13)
+PACK DIALOG: THE EXPANDED fPKG BLOCK FITS THE SCREEN AGAIN
 
-  the retail sample [PPSA00003], built from its .ffpfsc dump, installs and
-  launches: HDR10, existing saves intact. Five A/B builds on the console
-  pinned down what matters; the tool now does all of it by default.
+  Edit… in the .pkg block pushed the dialog past the screen height on a
+  laptop display after 1.1.12 added the retail switches as four rows;
+  macOS clamps such a window, so the lower rows and the buttons were cut
+  off. The switches now share one line, and the dialog is sized within
+  the screen with the button row always reachable.
 
-  THE LAUNCH BLOCKER WAS A CORRUPT PLAYGO SET IN THE DUMP.
-    Scene dumps can carry sce_sys/playgo-*.dat under shifted names (the
-    extractor that made them had an off-by-one). On this dump
-    playgo-hash-table.dat was param.json text, playgo-ficm.dat was the real
-    hash table, origin-param.json was a DDS texture. LibProsperoPkg only
-    counts the three files ("complete prepared set found; its layout will
-    be preserved") and stores them verbatim as CNT entries 0x1001/0x2010/
-    0x2011, which ShellCore and kstuff's PPR parse at launch. The package
-    installs, shows its icon, and dies with CE-100022-5. Via ShadowMount
-    nothing reads those files, so the same dump runs there.
+  Public texts (changelog, release notes, code comments) trimmed to what
+  the tool does.
 
-    The builder now checks every PlayGo file against the on-wire format
-    LibProsperoPkg itself emits (plgx magic + size field; \x7fFLT hash
-    table with 56 + table = length; FICM with 16 + payload = length). One
-    bad file discards the whole set so LibProsperoPkg regenerates a
-    consistent one from the actual inner tree; sce_sys/*.json that is not
+────────────────────────────────────────────────────────────────────────
+  v1.1.12
+────────────────────────────────────────────────────────────────────────
+
+RETAIL fPKG BUILDS LAUNCH ON THE CONSOLE
+
+  A retail title built from its own .ffpfsc container installs and
+  launches on a retail PS5 (FW 11.60, kstuff-lite 1.13): HDR10, existing
+  saves intact. A/B builds on the console isolated what matters; the tool
+  now does all of it by default.
+
+  PLAYGO METADATA IS VALIDATED. Some containers carry sce_sys/playgo-*.dat
+    with unusable contents. LibProsperoPkg only counts the three files
+    ("complete prepared set found; its layout will be preserved") and
+    stores them verbatim as CNT entries 0x1001/0x2010/0x2011, which the
+    console parses at launch: install fine, icon fine, CE-100022-5. The
+    builder now checks each file against its on-wire format (plgx magic
+    + size field; \x7fFLT hash table with 56 + table = length; FICM with
+    16 + payload = length) and regenerates a consistent set from the
+    actual inner tree when any file fails; sce_sys/*.json that is not
     JSON is dropped. --regen-playgo forces regeneration of a valid set.
 
   RETAIL NORMALIZE (default on; --no-retail-normalize to skip)
-    · drm_type=16 in the CNT header for a "standard" Application. Upstream
-      hard-codes 0; retail packages carry 16 (checked on a retail reference title and
-      another retail reference). IL patch to LibProsperoPkg.dll, so applicationDrmType
-      stays "standard" in param.json.
+    · drm_type=16 in the CNT header for a "standard" Application (upstream
+      hard-codes 0; retail packages carry 16). IL patch to
+      LibProsperoPkg.dll, so applicationDrmType stays "standard".
     · fakelib/libSceAmpr.sprx and libScePlayGo.sprx are kept. Upstream
-      deletes exactly these two (FilterFakeLibraryDirectory); they are the
-      AMPR/PlayGo backport emulators a dump ships for older firmware.
-      Second IL patch.
+      removes exactly these two (FilterFakeLibraryDirectory); they are the
+      emulator libraries a backported title relies on. Second IL patch.
     · Valid license.dat/license.info CNT entries via LibProsperoPkg's own
-      BuildDebugLicense. Dumps ship placeholder bytes that upstream drops
-      silently, which leaves a padlock on the homescreen.
+      BuildDebugLicense. Placeholder bytes were dropped silently, which
+      leaves a padlock on the homescreen.
     · Retail SELF flavour (ProgramType bit 0x10000000, SELF header byte
       0x0B) on eboot.bin and every prx/sprx; older fake-signers stamp the
-      dev flavour. sce_sys/about/*.sprx is left alone (Sony's are dev too).
+      dev flavour. sce_sys/about/*.sprx is left alone.
     · param.json attribute bit 29 = HDR support (--hdr-flag, default on).
-      Without it a console on "HDR when supported" runs the title in SDR;
-      with it, HDR10 (verified). A "kernel" block with a retail reference title's
-      values is added when the source has none — verified not launch-
-      critical, kept to match Sony's packages.
+      Without it a console on "HDR when supported" runs the title in SDR.
+      A "kernel" block is added when the source has none — not
+      launch-critical, kept to match retail packages.
 
   KEYSTONE IS THE SAVE-DATA KEY. sce_sys/keystone is always preserved from
-    the source. A build with a regenerated keystone reported every existing
-    save as corrupt (verified). Saves made while running the .ffpfsc via
-    ShadowMount stay readable by the fPKG.
+    the source. A build with a regenerated keystone reported every
+    existing save as corrupt.
 
   STORED / AUTOMATIC KRAKEN BACKENDS DO NOT LAUNCH. --kraken-backend
-    uncompressed installs but fails with CE-100096-6 (verified). The tool
-    warns; the app never sends it. The default inner codec layer is now
-    "kraken" — the configuration every launching build used ("none" is
-    console-untested).
+    uncompressed installs but fails with CE-100096-6. The tool warns; the
+    app never sends it. The default inner codec layer is now "kraken" —
+    the configuration every launching build used ("none" is untested on
+    the console).
 
   Plumbing: --help documents every flag; CLI and app pass the switches
     through (--fpkg-no-retail-normalize, --fpkg-no-hdr-flag,
@@ -77,10 +82,10 @@ RETAIL fPKG BUILDS LAUNCH — VERIFIED ON A RETAIL PS5 (FW 11.60, kstuff-lite 1.
 
 RETAIL-PERFECT fPKG BUILDS OUT OF THE BOX
 
-  After byte-comparing fPKGs from a retail reference title, another retail reference, and the
-  HomebrewTest, and cross-referencing the SvenGDK LibProsperoPkg
-  ps5-pkg-format spec, two more defaults were misaligned for retail
-  content. Both are now fixed in ffpfsc-pkg-tool with safe fallbacks:
+  After byte-comparing retail reference packages against the HomebrewTest
+  build, and cross-referencing the SvenGDK LibProsperoPkg ps5-pkg-format
+  spec, two more defaults were misaligned for retail content. Both are
+  now fixed in ffpfsc-pkg-tool with safe fallbacks:
 
   • AUTO-FAKE-SIGN raw ELFs in the source (default ON).
     LibProsperoPkg's own ProsperoFself.MakeFself converts each raw ELF
@@ -114,8 +119,7 @@ RETAIL-PERFECT fPKG BUILDS OUT OF THE BOX
 
   Verified: 92/92 pipeline tests pass, HomebrewTest builds byte-identically
   to 1.1.10 (nothing regressed on a small homebrew whose eboot is already
-  fake-signed). Retail acceptance verified separately with the retail sample
-  [PPSA00003] built through the same pipeline.
+  fake-signed). Retail acceptance on the console followed in 1.1.12.
 
 ────────────────────────────────────────────────────────────────────────
   v1.1.10

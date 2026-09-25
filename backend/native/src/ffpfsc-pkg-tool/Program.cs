@@ -1031,7 +1031,7 @@ internal static class Program
         // A "standard"-DRM retail dump needs four things LibProsperoPkg 1.2.0 does not do
         // on its own before a JB PS5 (FW 11.60, kstuff-lite 1.13+) launches the result.
         // All are applied in the staged mirror; the on-disk source is never modified.
-        // Verified 2026-09-25 on a retail PS5 with the retail sample (A/B builds L vs M):
+        // Verified 2026-09-25 on a retail PS5 with a retail title (A/B builds L vs M):
         //   - drm_type=16 in the CNT header. Upstream hard-codes 0 for any Application
         //     whose applicationDrmType is not "upgradable"; retail packages carry 16.
         //     Fixed upstream of this code by the IL patch in patches/ (no param.json
@@ -1047,7 +1047,7 @@ internal static class Program
         //     Build M (bit unset) launched fine but the console stayed in SDR; build L
         //     (bit set) launched in HDR10. Sony's own packages set it for HDR titles.
         //     Switch: --hdr-flag / --no-hdr-flag (default on).
-        //   Also injected: a "kernel" block with the retail reference's values when the source has none.
+        //   Also injected: a "kernel" block with a retail reference package's values when the source has none.
         //   Verified NOT launch-critical (build M had none and launched); kept because
         //   every Sony retail package carries one and L is the validated configuration.
         // Everything the loader actually rejected the launch on turned out to be the
@@ -1080,11 +1080,11 @@ internal static class Program
             // LibProsperoPkg only COUNTS sce_sys/playgo-{chunk,hash-table,ficm}.dat: 3/3
             // present → "complete prepared set found; its layout will be preserved" and the
             // bytes go verbatim into CNT entries 0x1001/0x2010/0x2011, which ShellCore and
-            // kstuff's PPR parse at install/launch. Scene dumps frequently carry these
-            // under the WRONG names (seen on the retail sample: hash-table.dat = param.json
-            // text, ficm.dat = the real hash table, origin-param.json = a DDS). Such a
-            // package installs and shows its icon but the launch dies with CE-100022-5,
-            // while the same dump runs via ShadowMount because nothing reads those files
+            // the console parses at install/launch. Some containers carry these under the
+            // WRONG names (seen in practice: hash-table.dat = param.json text, ficm.dat =
+            // the real hash table, origin-param.json = a DDS). Such a package installs
+            // and shows its icon but the launch dies with CE-100022-5, while the same
+            // content runs from a mounted image because nothing reads those files
             // there. Validate each file against the on-wire format LibProsperoPkg itself
             // emits (ProsperoPlayGo.BuildChunkDat/BuildHashTable/BuildFicm); if any present
             // file fails, drop the whole set from the staged mirror so the builder
@@ -1232,21 +1232,21 @@ internal static class Program
 
                     // (c.iii-a) Patch SELF headers of eboot.bin and every prx to the retail
                     //           SELF pattern Sony's own toolchain stamps. Diffed the SELF
-                    //           header (first 16 bytes) between a retail reference title retail eboot +
-                    //           libc.prx (both launch on FW 11.60 + kstuff-lite 1.13+) and
-                    //           the retail sample-source's eboot + prx (fail with CE-100022-5 post-icon):
-                    //             the retail reference eboot.bin + .prx:  ver=0x0110  ProgramType=0x10000101  info=0x05100530
-                    //             the retail sample  eboot.bin + .prx:  ver=0x0100  ProgramType=0x00000101  info=0x05100560
+                    //           header (first 16 bytes) between a retail reference package's
+                    //           eboot + libc.prx (launches on FW 11.60) and a source whose
+                    //           executables were fake-signed by an older tool (fails with
+                    //           CE-100022-5 post-icon):
+                    //             retail:  ver=0x0110  ProgramType=0x10000101  info=0x05100530
+                    //             source:  ver=0x0100  ProgramType=0x00000101  info=0x05100560
                     //           The ProgramType bit 0x10000000 is the "retail application"
-                    //           flag the console loader gates launch on. the retail sample-source's SELFs
-                    //           were fake-signed by an older tool that stamps dev-flavor
-                    //           headers (0x00000101). We patch to retail flavor in place —
-                    //           kstuff-lite bypasses the fake signature anyway, and the
-                    //           patched bytes stay within the SELF-header range the loader
-                    //           reads for its retail check. sce_sys/about/right.sprx keeps
-                    //           the dev pattern: Sony's own the retail reference has ProgramType=0x00000101
-                    //           on that one file too — it's a metadata SPRX that never
-                    //           executes, so the loader doesn't gate it on retail-bit.
+                    //           flag the console loader gates launch on. Older fake-signers
+                    //           stamp dev-flavor headers (0x00000101). We patch to retail
+                    //           flavor in place — the fake signature is not verified on the
+                    //           console anyway, and the patched bytes stay within the
+                    //           SELF-header range the loader reads for its retail check.
+                    //           sce_sys/about/right.sprx keeps the dev pattern: retail
+                    //           packages have ProgramType=0x00000101 on that one file too —
+                    //           it's a metadata SPRX that never executes.
                     // Surgical patch: only flip byte 0x0B (dev 0x00 → retail 0x10) to set
                     // ProgramType bit 0x10000000. Leaves HeaderSize/MetaSize + all other SELF
                     // header offsets untouched so the loader's parser reads exactly the
@@ -1292,8 +1292,8 @@ internal static class Program
                     //   (a) attribute |= 0x20000000 when --hdr-flag (default). Bit 29 is the
                     //       HDR support flag: with the console on "HDR when supported", the
                     //       build without it (M) ran in SDR, the build with it (L) in HDR10.
-                    //       the retail reference and the second retail reference (Sony-built) both carry it. Some dumps ship 0.
-                    //   (b) a "kernel" block (the retail reference's cpu/gpu page-table + flexible-memory
+                    //       Retail reference packages carry it; some sources ship 0.
+                    //   (b) a "kernel" block (a retail reference package's cpu/gpu page-table + flexible-memory
                     //       sizes) when the source has none. Not launch-critical (M had none
                     //       and launched), kept to match Sony retail packages and the
                     //       validated L configuration. A source's own block always wins.
@@ -1324,7 +1324,7 @@ internal static class Program
                                         {
                                             w.WriteStartObject("kernel");
                                             w.WriteNumber("cpuPageTableSize", 67108864);       // 64 MiB
-                                            w.WriteNumber("flexibleMemorySize", 272629760);    // ~260 MiB (the retail reference's value)
+                                            w.WriteNumber("flexibleMemorySize", 272629760);    // ~260 MiB (retail reference value)
                                             w.WriteNumber("gpuPageTableSize", 67108864);       // 64 MiB
                                             w.WriteEndObject();
                                             kernelWritten = true;
@@ -1398,7 +1398,7 @@ internal static class Program
     }
 
     // PlayGo on-wire formats, mirrored from LibProsperoPkg.ProsperoPlayGo (which is what
-    // Sony's publisher emits too — verified against an untouched a retail reference title retail pkg).
+    // Sony's publisher emits too — verified against an untouched retail package).
     static uint U32(byte[] b, int o) => (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
 
     /// <summary>playgo-chunk.dat: "plgx" magic, u32 total size at 0x10 equals the length.</summary>

@@ -193,8 +193,9 @@ def build(src_dir: Path, out_dir: Path,
     - hdr_flag: set param.json attribute bit 29 (HDR support). Off = the console runs
       the title in SDR when set to "HDR when supported". Default on.
     - regen_playgo: discard the source's sce_sys/playgo-*.dat even when they look valid.
-      A CORRUPT set (wrong on-wire format — scene dumps mislabel these files) is always
-      discarded and regenerated; that was the sole launch blocker on the retail sample.
+      A CORRUPT set (wrong on-wire format — some containers ship these files with
+      swapped contents) is always discarded and regenerated; that alone turned an
+      "installs but will not start" package into a launching one.
     - fake_sign: fake-sign raw ELFs found in the source (idempotent). Default on.
     - temp_dir: where LibProsperoPkg stages the inner image / CNT / outer image
       (defaults to $TMPDIR). Pass the app's fast temp drive for big games.

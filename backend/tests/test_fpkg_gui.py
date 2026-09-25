@@ -297,9 +297,9 @@ try:
     ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000].pkg"
        and Path(w.output_path).exists() and not dummy2.exists(), f"{found} {w.output_path}")
     ok("organize.title-cleanup", m.canonical_game_title("a large retail title™") == "a large retail title"
-       and m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA00001", "version": "01.200.007"}, ".ffpfsc")
-       == ("Example Quest Deluxe Edition [PPSA00001] [v01.200.007]", "Example Quest Deluxe Edition [PPSA00001] [v01.200].ffpfsc"),
-       str(m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA00001", "version": "01.200.007"}, ".ffpfsc")))
+       and m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")
+       == ("Example Quest Deluxe Edition [PPSA99098] [v01.200.007]", "Example Quest Deluxe Edition [PPSA99098] [v01.200].ffpfsc"),
+       str(m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")))
     # off: a single-archive folder whose parent is the output folder must not mirror into itself; elsewhere it still does
     conv = OUT / "convert"; conv.mkdir(exist_ok=True); shutil.copy2(ZP, conv / ZP.name)
     bi2 = m.GameItem.from_bundle(conv, conv / ZP.name, []); bi2.output_compressed = True; bi2.auto_organize = False; bi2.output_path = OUT

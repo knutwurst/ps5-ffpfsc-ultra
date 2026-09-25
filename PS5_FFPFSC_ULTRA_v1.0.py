@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.1.13"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4672,10 +4672,10 @@ class PackDialog(ctk.CTkToplevel):
         self._edit_btn = ctk.CTkButton(sline, text="✎  Edit…", width=92, fg_color=CARD2, hover_color=GREEN2,
                                        text_color=WHITE, command=self._toggle_advanced)
         self._edit_btn.pack(side="right", padx=(8, 0))
-        ctk.CTkLabel(srow_sum, text="These defaults give the smallest, most compatible package. Edit only for a game "
-                                    "folder without sce_sys/param.json, or to trade a little size for speed.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(0, 8))
+        self._sum_hint = ctk.CTkLabel(srow_sum, text="These defaults give the smallest, most compatible package. Edit only for a game "
+                                                    "folder without sce_sys/param.json, or to trade a little size for speed.",
+                                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left")
+        self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
 
         # Identity rows (packed by _layout_fpkg when revealed or required)
         self.irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
@@ -4724,23 +4724,21 @@ class PackDialog(ctk.CTkToplevel):
                                      "temp drive is used.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(4, 8))
-        # Retail options row (packed by _layout_fpkg when revealed)
+        # Retail options row (packed by _layout_fpkg when revealed). One line of switches
+        # plus one hint line: the expanded dialog has to stay within a laptop screen.
         self.orow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self.orow, text="Retail options:", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
-        def _opt(var, text, hint):
-            row = ctk.CTkFrame(self.orow, fg_color=PANEL); row.pack(fill="x", padx=10, pady=1)
-            ctk.CTkCheckBox(row, text=text, variable=var, width=150, checkbox_width=18, checkbox_height=18,
+        r4 = ctk.CTkFrame(self.orow, fg_color=PANEL); r4.pack(fill="x", padx=10, pady=(6, 2))
+        ctk.CTkLabel(r4, text="Retail options:", text_color=MUTED, width=110, anchor="w").pack(side="left")
+        for _var, _text in ((self.retail_var, "Retail fixes"), (self.hdr_var, "HDR flag"),
+                            (self.regen_var, "Rebuild PlayGo"), (self.sign_var, "Fake-sign ELFs")):
+            ctk.CTkCheckBox(r4, text=_text, variable=_var, checkbox_width=18, checkbox_height=18,
                             fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-                            font=ctk.CTkFont(size=11), command=self._update_summary).pack(side="left")
-            ctk.CTkLabel(row, text=hint, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
-        _opt(self.retail_var, "Retail fixes",       "license entries · retail SELF flavour · Sony-style param.json")
-        _opt(self.hdr_var,    "HDR flag",           "param.json attribute bit 29 · off = the console runs the title in SDR")
-        _opt(self.regen_var,  "Rebuild PlayGo",     "drop the dump's playgo-*.dat even if valid (a corrupt set is always rebuilt)")
-        _opt(self.sign_var,   "Fake-sign raw ELFs", "only files that are not SELF yet (idempotent)")
-        ctk.CTkLabel(self.orow, text="sce_sys/keystone is always kept — it is the save-data key.",
+                            font=ctk.CTkFont(size=11), command=self._update_summary).pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(self.orow, text="Defaults are the configuration verified on the console. HDR flag off = the title "
+                                     "runs in SDR · Rebuild PlayGo also drops a valid set (a corrupt one is always "
+                                     "rebuilt) · sce_sys/keystone, the save-data key, is always kept.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(2, 8))
+                      ).pack(anchor="w", padx=10, pady=(0, 8))
         for _v in (self.cid_var, self.tid_var):
             _v.trace_add("write", lambda *_: self._update_summary())
 
@@ -4864,17 +4862,34 @@ class PackDialog(ctk.CTkToplevel):
         self.irow.pack_forget(); self.crow.pack_forget(); self.orow.pack_forget()
         if show_ident:
             self.irow.pack(fill="x", pady=4)
+        self._sum_hint.pack_forget()              # the rows below say it; keep the height down
         if self._adv_shown:
             self.crow.pack(fill="x", pady=4)
             self.orow.pack(fill="x", pady=4)
+        else:
+            self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
         self._edit_btn.configure(text=("▲  Hide" if self._adv_shown else "✎  Edit…"))
         self._update_summary()
 
     def _fit(self) -> None:
-        """Size the window to its content — the fPKG rows come and go."""
+        """Size the window to its content — the fPKG rows come and go. Never taller than
+        the screen: macOS clamps an oversized window and the bottom rows (and the
+        buttons) simply disappear, which is what happened when the retail switches were
+        first added as four rows."""
         self.update_idletasks()
         req = self.winfo_reqheight()
-        self._height = max(self._MIN_HEIGHT, int(req) + 16)
+        want = max(self._MIN_HEIGHT, int(req) + 16)
+        try:
+            screen_h = int(self.winfo_screenheight())
+            top, bottom = 30, 80                     # menu bar; Dock + margin
+            self._height = min(want, max(self._MIN_HEIGHT, screen_h - top - bottom))
+            x, y = int(self.winfo_x()), int(self.winfo_y())
+            if y + self._height > screen_h - bottom:  # would run under the Dock: move up
+                y = max(top, screen_h - bottom - self._height)
+                self.geometry(f"700x{self._height}+{x}+{y}")
+                return
+        except Exception:
+            self._height = want
         self.geometry(f"700x{self._height}")
 
     def _update_summary(self) -> None:

@@ -42,7 +42,7 @@ using (var asm = AssemblyDefinition.ReadAssembly(dll, new ReaderParameters { Rea
 
     // ---- Patch 2: keep fakelib/libSceAmpr.sprx + libScePlayGo.sprx ------------------------
     // Upstream: local function FilterFakeLibraryDirectory() removes exactly these two files from
-    // fakelib/. They are the AMPR/PlayGo backport emulators a scene dump ships for older firmware;
+    // fakelib/. They are the AMPR/PlayGo emulators a backported title ships for older firmware;
     // without them the eboot's module imports fail at launch (CE-100022-5). Make it a no-op.
     var f = builder.Methods.FirstOrDefault(m => m.Name.Contains("FilterFakeLibraryDirectory") && m.HasBody);
     if (f == null) { Console.Error.WriteLine("[2] FAILED: FilterFakeLibraryDirectory not found (upstream changed?)"); return 3; }

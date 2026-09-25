@@ -30,10 +30,10 @@ drm_type = (VolumeType != Application || applicationDrmType == "upgradable") ? 1
 ```
 
 so a normal `"standard"`-DRM game gets `drm_type = 0` (free). Sony's
-publisher writes 16 for retail games (checked against untouched a retail reference title
-and another retail reference fPKGs); kstuff-lite 1.13's retail-DRM bypass expects 16.
-With 0 and real license records the homescreen shows a padlock and the
-launch fails with CE-100022-5.
+publisher writes 16 for retail games (checked against two untouched retail
+packages); the console's retail-DRM path expects 16. With 0 and real
+license records the homescreen shows a padlock and the launch fails with
+CE-100022-5.
 
 The IL is
 
@@ -60,10 +60,10 @@ exactly these two files from a source's `fakelib/` directory. They are the
 AMPR and PlayGo emulators a backported dump ships so the title runs on
 firmware older than the one it was built for; ShadowMountPlus overlays
 `/app0/fakelib` into the sandbox before spawn. Without them the eboot's
-module imports fail and the launch dies with CE-100022-5. Sony's own retail
-fPKGs carry other emulators in `fakelib/` (libSceAgc, libScePsml, …) and
-another retail reference even ships `ampr_emu.index`, so keeping the directory intact is
-the right shape.
+module imports fail and the launch dies with CE-100022-5. Retail packages
+built with Sony's own tools carry other emulators in `fakelib/` (libSceAgc,
+libScePsml, …) and some ship an `ampr_emu.index` too, so keeping the
+directory intact is the right shape.
 
 The patcher replaces the function body with a single `ret`.
 

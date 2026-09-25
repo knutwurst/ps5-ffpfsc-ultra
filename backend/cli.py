@@ -1347,10 +1347,11 @@ def main() -> None:
                         help="fPKG build: do NOT apply the retail fixes to a 'standard'-DRM "
                              "source (valid license entries, retail SELF flavour, Sony-style "
                              "param.json fields). Default is to apply them.")
-    parser.add_argument("--fpkg-no-hdr-flag", action="store_true",
-                        help="fPKG build: leave param.json 'attribute' as the source has it "
-                             "instead of setting bit 29 (HDR support). A console on 'HDR when "
-                             "supported' then runs the title in SDR.")
+    parser.add_argument("--fpkg-hdr-flag", type=str, default="auto", choices=("auto", "on", "off"),
+                        help="fPKG build: param.json attribute bit 29 (HDR support). 'auto' "
+                             "(default) keeps what the source declares; 'on' sets it, 'off' "
+                             "clears it. A console on 'HDR when supported' switches to HDR "
+                             "output for the title only when the bit is set.")
     parser.add_argument("--fpkg-regen-playgo", action="store_true",
                         help="fPKG build: discard the source's sce_sys/playgo-*.dat even when "
                              "they look valid and let the builder regenerate them. A corrupt "
@@ -1623,7 +1624,7 @@ def main() -> None:
                   f"  title {ident['title']!r}   (from {ident['source']})", flush=True)
 
             _opts = (f"retail-normalize {'off' if args.fpkg_no_retail_normalize else 'on'}, "
-                     f"HDR flag {'off' if args.fpkg_no_hdr_flag else 'on'}, "
+                     f"HDR flag {args.fpkg_hdr_flag}, "
                      f"PlayGo {'regenerate' if args.fpkg_regen_playgo else 'auto'}, "
                      f"fake-sign {'off' if args.fpkg_no_fake_sign else 'on'}")
             print(f"[INFO] fPKG build ({args.fpkg_inner}, {args.fpkg_kraken_backend}, level {args.compression_level}; {_opts}): "
@@ -1643,7 +1644,7 @@ def main() -> None:
                                  temp_dir=str(fpkg_temp),
                                  level=int(args.compression_level),
                                  retail_normalize=not args.fpkg_no_retail_normalize,
-                                 hdr_flag=not args.fpkg_no_hdr_flag,
+                                 hdr_flag=args.fpkg_hdr_flag,
                                  regen_playgo=bool(args.fpkg_regen_playgo),
                                  fake_sign=not args.fpkg_no_fake_sign,
                                  on_line=_gui_line)

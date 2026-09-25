@@ -3,7 +3,23 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.13  (current)
+  v1.1.14  (current)
+────────────────────────────────────────────────────────────────────────
+
+HDR FLAG: FOLLOW THE SOURCE BY DEFAULT
+
+  --hdr-flag auto|on|off (CLI --fpkg-hdr-flag; Pack dialog → Edit… →
+  Retail options). "auto" leaves param.json attribute bit 29 exactly as
+  the source declares it — that is the publisher's intent, and the one
+  source seen without it belongs to a title whose store page and reviews
+  list no HDR support, so forcing the bit only made the console switch
+  its output mode. "on" sets the bit, "off" clears it. The console
+  follows the bit when set to "HDR when supported"; nothing about it is
+  launch-critical. 1.1.12/1.1.13 forced it on for every retail source;
+  a remembered setting from those versions migrates to "auto".
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.13
 ────────────────────────────────────────────────────────────────────────
 
 PACK DIALOG: THE EXPANDED fPKG BLOCK FITS THE SCREEN AGAIN

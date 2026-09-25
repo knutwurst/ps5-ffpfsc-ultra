@@ -35,4 +35,12 @@
       <Link>runtimes\osx-arm64\native\Magick.Native-Q8-arm64.dll.dylib</Link>
     </None>
   </ItemGroup>
+  <!-- patches/CecilPatch is its own project (the LibProsperoPkg.dll patcher); keep the
+       SDK's default **/*.cs glob from pulling its sources and obj/ into this assembly. -->
+  <ItemGroup>
+    <Compile Remove="patches\**" />
+    <None Remove="patches\**" />
+    <Content Remove="patches\**" />
+    <EmbeddedResource Remove="patches\**" />
+  </ItemGroup>
 </Project>

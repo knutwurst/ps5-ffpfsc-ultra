@@ -190,7 +190,9 @@ try:
     ok("archive.payload-keeps-fpkg", arc.operation == "fpkg-build" and arc.path == HBT and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{arc.operation}")
     # 7b) sibling jobs from one archive share COMPRESSION only — never the first game's identity
     tpl = app._fpkg_compression_of(arc)
-    ok("compression-of.no-identity", set(tpl) == {"inner", "backend", "level", "dll"} and tpl["inner"] == arc.fpkg_inner_mode, str(tpl))
+    _build_opts = {"inner", "backend", "level", "dll", "retail_normalize", "hdr_flag", "regen_playgo", "fake_sign"}
+    ok("compression-of.no-identity", set(tpl) == _build_opts and tpl["inner"] == arc.fpkg_inner_mode
+       and not ({"content_id", "title_id", "title", "version"} & set(tpl)), str(tpl))
     # 7c) a scan-detected patch is dropped (with a WARN) when the bundle becomes an fPKG job; a .ffpfsc source is sized at 2x for the gate
     pi = m.GameItem(HBT); pi.patch_source = Path("/nonexistent/patch"); app._as_fpkg_job(pi, dict(app.fpkg_defaults))
     ok("as-fpkg.drops-patch", pi.patch_source is None and pi.operation == "fpkg-build", str(pi.patch_source))

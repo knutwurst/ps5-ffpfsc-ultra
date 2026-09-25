@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.11"
+APP_VERSION = "1.1.12"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4557,13 +4557,19 @@ class PackDialog(ctk.CTkToplevel):
         self.tid_var   = tk.StringVar(value=fp.get("title_id", "") or "")
         self.title_var = tk.StringVar(value=fp.get("title", "") or "")
         self.ver_var   = tk.StringVar(value=ver0)
-        self.inner_var = tk.StringVar(value=fp.get("inner") if fp.get("inner") in self._INNER else "none")
+        self.inner_var = tk.StringVar(value=fp.get("inner") if fp.get("inner") in self._INNER else "kraken")
         self.back_var  = tk.StringVar(value=fp.get("backend") if fp.get("backend") in self._BACKEND else "builtin")
         try:
             lvl = int(fp.get("level", 7))
         except Exception:
             lvl = 7
         self.speed_var = tk.StringVar(value="fast" if lvl < 0 else "normal")
+        # Retail switches — defaults are the configuration verified to launch on a retail
+        # PS5 (CHANGELOG 1.1.12). Off positions exist for byte-exact re-packs and A/B tests.
+        self.retail_var = tk.BooleanVar(value=bool(fp.get("retail_normalize", True)))
+        self.hdr_var    = tk.BooleanVar(value=bool(fp.get("hdr_flag", True)))
+        self.regen_var  = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
+        self.sign_var   = tk.BooleanVar(value=bool(fp.get("fake_sign", True)))
         self.back_hint = tk.StringVar()
         self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
         self.ident_head = tk.StringVar(value=self._IDENT_HEAD_FALLBACK)
@@ -4718,6 +4724,23 @@ class PackDialog(ctk.CTkToplevel):
                                      "temp drive is used.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(4, 8))
+        # Retail options row (packed by _layout_fpkg when revealed)
+        self.orow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
+        ctk.CTkLabel(self.orow, text="Retail options:", text_color=WHITE,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
+        def _opt(var, text, hint):
+            row = ctk.CTkFrame(self.orow, fg_color=PANEL); row.pack(fill="x", padx=10, pady=1)
+            ctk.CTkCheckBox(row, text=text, variable=var, width=150, checkbox_width=18, checkbox_height=18,
+                            fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
+                            font=ctk.CTkFont(size=11), command=self._update_summary).pack(side="left")
+            ctk.CTkLabel(row, text=hint, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        _opt(self.retail_var, "Retail fixes",       "license entries · retail SELF flavour · Sony-style param.json")
+        _opt(self.hdr_var,    "HDR flag",           "param.json attribute bit 29 · off = the console runs the title in SDR")
+        _opt(self.regen_var,  "Rebuild PlayGo",     "drop the dump's playgo-*.dat even if valid (a corrupt set is always rebuilt)")
+        _opt(self.sign_var,   "Fake-sign raw ELFs", "only files that are not SELF yet (idempotent)")
+        ctk.CTkLabel(self.orow, text="sce_sys/keystone is always kept — it is the save-data key.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      ).pack(anchor="w", padx=10, pady=(2, 8))
         for _v in (self.cid_var, self.tid_var):
             _v.trace_add("write", lambda *_: self._update_summary())
 
@@ -4838,11 +4861,12 @@ class PackDialog(ctk.CTkToplevel):
         """Pack the identity / compression rows for the current state, in order:
         summary → identity → compression. pack_forget + re-pack keeps the order stable."""
         show_ident = self._adv_shown or self._ident_forced
-        self.irow.pack_forget(); self.crow.pack_forget()
+        self.irow.pack_forget(); self.crow.pack_forget(); self.orow.pack_forget()
         if show_ident:
             self.irow.pack(fill="x", pady=4)
         if self._adv_shown:
             self.crow.pack(fill="x", pady=4)
+            self.orow.pack(fill="x", pady=4)
         self._edit_btn.configure(text=("▲  Hide" if self._adv_shown else "✎  Edit…"))
         self._update_summary()
 
@@ -4869,6 +4893,14 @@ class PackDialog(ctk.CTkToplevel):
         parts = [ident, f"codec layer {self.inner_var.get()}", f"Kraken {self.speed_var.get()}"]
         if self.back_var.get() == "publishingtools":
             parts.append("Sony DLL backend")
+        if not self.retail_var.get():
+            parts.append("retail fixes OFF")
+        if not self.hdr_var.get():
+            parts.append("HDR flag off")
+        if self.regen_var.get():
+            parts.append("PlayGo rebuilt")
+        if not self.sign_var.get():
+            parts.append("no fake-sign")
         self.sum_var.set("fPKG:  " + "  ·  ".join(parts))
 
     # ── pickers ──────────────────────────────────────────────────────────────
@@ -5073,7 +5105,9 @@ class PackDialog(ctk.CTkToplevel):
         level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)
         dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
         return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
-                "inner": inner, "backend": back, "level": level, "dll": dll}
+                "inner": inner, "backend": back, "level": level, "dll": dll,
+                "retail_normalize": bool(self.retail_var.get()), "hdr_flag": bool(self.hdr_var.get()),
+                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get())}
 
     # ── commit ───────────────────────────────────────────────────────────────
     def _add(self):
@@ -5112,7 +5146,10 @@ class PackDialog(ctk.CTkToplevel):
                 return
             # Remember the compression choice as the default for the next .pkg job (and for
             # dropped sources while .pkg is the remembered format). Identity is never remembered.
-            self.app.fpkg_defaults = {"inner": params["inner"], "backend": params["backend"], "level": params["level"]}
+            self.app.fpkg_defaults = {"inner": params["inner"], "backend": params["backend"], "level": params["level"],
+                                      "retail_normalize": params["retail_normalize"], "hdr_flag": params["hdr_flag"],
+                                      "regen_playgo": params["regen_playgo"], "fake_sign": params["fake_sign"],
+                                      "v1112": True}
             save_settings({"fpkg_defaults": self.app.fpkg_defaults})
 
         organize = bool(self.organize_var.get())
@@ -5219,7 +5256,8 @@ class PackDialog(ctk.CTkToplevel):
                 if was_fpkg:
                     it.operation = "pack"
                     for _a in ("fpkg_content_id", "fpkg_title_id", "fpkg_title", "fpkg_version",
-                               "fpkg_inner_mode", "fpkg_kraken_backend", "fpkg_pubtools_dll", "fpkg_level"):
+                               "fpkg_inner_mode", "fpkg_kraken_backend", "fpkg_pubtools_dll", "fpkg_level",
+                               "fpkg_retail_normalize", "fpkg_hdr_flag", "fpkg_regen_playgo", "fpkg_fake_sign"):
                         if _a in vars(it):
                             delattr(it, _a)
                 it.output_path = Path(outf)
@@ -6412,10 +6450,21 @@ class App:
             _fl = int(_fd.get("level", 7) if _fd.get("level") is not None else 7)
         except Exception:
             _fl = 7
+        _inner = _fd.get("inner") if _fd.get("inner") in ("none", "zlib", "kraken") else "kraken"
+        if _inner == "none" and not _fd.get("v1112"):
+            # Pre-1.1.12 remembered default. "none" was never verified on a console;
+            # "kraken" is the layer every launching build used. Migrated once — a
+            # "none" chosen after this (the settings then carry v1112) is respected.
+            _inner = "kraken"
         self.fpkg_defaults: dict = {
-            "inner":   _fd.get("inner") if _fd.get("inner") in ("none", "zlib", "kraken") else "none",
+            "inner":   _inner,
             "backend": _fd.get("backend") if _fd.get("backend") in ("builtin", "publishingtools") else "builtin",
             "level":   max(-4, min(9, _fl)),      # Kraken: <0 = fast preset, else normal (the tool's 0..9 are identical)
+            "retail_normalize": bool(_fd.get("retail_normalize", True)),
+            "hdr_flag":         bool(_fd.get("hdr_flag", True)),
+            "regen_playgo":     bool(_fd.get("regen_playgo", False)),
+            "fake_sign":        bool(_fd.get("fake_sign", True)),
+            "v1112":            True,
         }
         self._pending_fpkg_identity = None   # (source path, identity dict) handed from the dialog to the scan result
         # (legacy comment kept for context:) output_compressed_var persists the last choice
@@ -8724,18 +8773,23 @@ class App:
             "title_id":   getattr(item, "fpkg_title_id", "") or "",
             "title":      getattr(item, "fpkg_title", "") or "",
             "version":    getattr(item, "fpkg_version", "01.000.000") or "01.000.000",
-            "inner":      getattr(item, "fpkg_inner_mode", "none") or "none",
+            "inner":      getattr(item, "fpkg_inner_mode", "kraken") or "kraken",
             "backend":    getattr(item, "fpkg_kraken_backend", "builtin") or "builtin",
             "level":      max(-4, min(9, lvl)),     # -4..-1 = Kraken fast preset, 0..9 = normal
             "dll":        getattr(item, "fpkg_pubtools_dll", "") or "",
+            "retail_normalize": bool(getattr(item, "fpkg_retail_normalize", True)),
+            "hdr_flag":         bool(getattr(item, "fpkg_hdr_flag", True)),
+            "regen_playgo":     bool(getattr(item, "fpkg_regen_playgo", False)),
+            "fake_sign":        bool(getattr(item, "fpkg_fake_sign", True)),
         }
 
     def _fpkg_compression_of(self, item) -> dict:
-        """Only the compression part of an fPKG job's parameters (inner / backend / level /
-        dll) — what sibling jobs made from the same source share. Identity is never shared:
-        it is per game and read from each game's param.json at build time."""
+        """Only the build-option part of an fPKG job's parameters (inner / backend / level /
+        dll / retail switches) — what sibling jobs made from the same source share. Identity
+        is never shared: it is per game and read from each game's param.json at build time."""
         p = self._fpkg_params_of(item)
-        return {k: p[k] for k in ("inner", "backend", "level", "dll")}
+        return {k: p[k] for k in ("inner", "backend", "level", "dll",
+                                  "retail_normalize", "hdr_flag", "regen_playgo", "fake_sign")}
 
     def _apply_fpkg_params(self, item, params: dict) -> None:
         """Write a params dict (see _fpkg_params_of) onto *item*."""
@@ -8743,13 +8797,17 @@ class App:
         item.fpkg_title_id       = str(params.get("title_id", "") or "").strip().upper()
         item.fpkg_title          = str(params.get("title", "") or "").strip()
         item.fpkg_version        = str(params.get("version", "") or "").strip() or "01.000.000"
-        item.fpkg_inner_mode     = params.get("inner") if params.get("inner") in ("none", "zlib", "kraken") else "none"
+        item.fpkg_inner_mode     = params.get("inner") if params.get("inner") in ("none", "zlib", "kraken") else "kraken"
         item.fpkg_kraken_backend = params.get("backend") if params.get("backend") in ("builtin", "publishingtools") else "builtin"
         _lvl = params.get("level")
         try:
             item.fpkg_level = max(-4, min(9, int(_lvl) if _lvl is not None else 7))
         except Exception:
             item.fpkg_level = 7
+        item.fpkg_retail_normalize = bool(params.get("retail_normalize", True))
+        item.fpkg_hdr_flag         = bool(params.get("hdr_flag", True))
+        item.fpkg_regen_playgo     = bool(params.get("regen_playgo", False))
+        item.fpkg_fake_sign        = bool(params.get("fake_sign", True))
         dll = str(params.get("dll", "") or "").strip()
         if item.fpkg_kraken_backend == "publishingtools" and sys.platform != "win32":
             # Cannot work here (LibProsperoPkg: "requires 64-bit Windows", hard failure) —
@@ -9576,9 +9634,19 @@ class App:
                     else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
             cmd = head + [
                 "--fpkg-build", str(item.path),
-                "--fpkg-inner", str(getattr(item, "fpkg_inner_mode", "none") or "none"),
+                "--fpkg-inner", str(getattr(item, "fpkg_inner_mode", "kraken") or "kraken"),
                 "--fpkg-kraken-backend", str(getattr(item, "fpkg_kraken_backend", "builtin") or "builtin"),
             ]
+            # Retail switches (CHANGELOG 1.1.12). Only the non-default positions are passed;
+            # the backend's defaults are the console-verified configuration.
+            if not getattr(item, "fpkg_retail_normalize", True):
+                cmd += ["--fpkg-no-retail-normalize"]
+            if not getattr(item, "fpkg_hdr_flag", True):
+                cmd += ["--fpkg-no-hdr-flag"]
+            if getattr(item, "fpkg_regen_playgo", False):
+                cmd += ["--fpkg-regen-playgo"]
+            if not getattr(item, "fpkg_fake_sign", True):
+                cmd += ["--fpkg-no-fake-sign"]
             # Identity fields are FALLBACKS: the backend reads sce_sys/param.json of the
             # resolved source first (folder, unwrapped image, extracted archive alike) and
             # only uses these for what it lacks. Empty fields are simply not passed.

@@ -18,6 +18,14 @@ HDR FLAG: FOLLOW THE SOURCE BY DEFAULT
   launch-critical. 1.1.12/1.1.13 forced it on for every retail source;
   a remembered setting from those versions migrates to "auto".
 
+BUILD: THE fPKG TOOL REBUILDS FROM A CLEAN CLONE
+
+  The LibProsperoPkg 1.2.0 assembly — pristine and patched, with SHA-256
+  sums and a modification notice — now lives in the repository under
+  backend/native/src/ffpfsc-pkg-tool/lib/, and the remaining .NET
+  dependencies are pinned NuGet packages instead of hand-copied DLLs.
+  No change to the app itself.
+
 ────────────────────────────────────────────────────────────────────────
   v1.1.13
 ────────────────────────────────────────────────────────────────────────

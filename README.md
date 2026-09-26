@@ -175,7 +175,7 @@ xattr -dr com.apple.quarantine "PS5 FFPFSC ULTRA.app"
 This is not a fork. It bundles and builds on the work below, with thanks to the authors:
 
 - [ps5-ffpfs-cli](https://github.com/bizkut/ps5-ffpfs-cli) by Bizkut, the CLI and backend this GUI drives (MIT).
-- [MkPFS](https://github.com/PSBrew/MkPFS) by PSBrew, the PFS image builder used for packing and compression (bundled, 0.0.8).
+- [MkPFS](https://github.com/PSBrew/MkPFS) by PSBrew, the PFS image builder used for packing and compression (bundled, 1.0.0).
 - [LibProsperoPkg](https://github.com/drakmor/LibProsperoPkg) 1.2.0 by drakmor, the PS5 `.pkg` build/extract library the bundled `ffpfsc-pkg-tool` wraps (GPL-3, sourced from the a53-fpkg 0.5 release). Wrapper source under `backend/native/src/ffpfsc-pkg-tool/`.
 - `make_fself` from the ps5-payload-dev / flatz lineage, vendored for fake-signing (BSD-3).
 - UnRAR by RARLAB ([rarlab.com](https://www.rarlab.com/)), vendored as C++ source for the built-in RAR module under the UnRAR license (free for extraction; it may not be used to build a RAR-compatible compressor).
@@ -189,12 +189,12 @@ Python libraries used: customtkinter, py7zr, rarfile, tkinterdnd2, Pillow, psuti
 Full breakdown — including trademark and user-responsibility notes — is in [`NOTICES.md`](NOTICES.md). In short:
 
 - **Original source code authored here** (the Python GUI, the Python wrappers around the bundled tools, the C# wrapper around LibProsperoPkg, the tests and build scripts) — **MIT** (see [`LICENSE`](LICENSE)).
-- **Bundled MkPFS 0.0.8** by PSBrew — **GPL-3.0-or-later** ([`backend/mkpfs/LICENSE`](backend/mkpfs/LICENSE)).
+- **Bundled MkPFS 1.0.0** by PSBrew — **GPL-3.0-or-later** ([`backend/mkpfs/LICENSE`](backend/mkpfs/LICENSE)).
 - **Bundled LibProsperoPkg 1.2.0** by SvenGDK/drakmor — **GPL-3.0-or-later** ([`backend/native/LICENSE.LibProsperoPkg`](backend/native/LICENSE.LibProsperoPkg)).
 - **Bundled UnRAR sources** by RARLAB — **UnRAR license**; free for extraction, but **may not** be used to build a RAR-compatible compressor ([`backend/unrar/license.txt`](backend/unrar/license.txt)).
 - **Vendored `make_fself.py`** (Alex Free / flatz / ps5-payload-dev lineage) — **BSD-3-Clause**; attribution in the file header.
 - **Bizkut's `ps5-ffpfs-cli`** — no explicit upstream license; this project does not redistribute Bizkut's source or binary, only re-implements a compatible shell-out API. Credit stands in the credits section; see `NOTICES.md` for detail.
 
-**The compiled `.app` binary** statically embeds MkPFS and LibProsperoPkg and is therefore distributed as a **combined work under GPL-3.0-or-later** (GPL-3 section 5). All source needed to reproduce it lives in this repository; every bundled component's license is GPL-3 compatible.
+**The compiled `.app` binary** statically embeds MkPFS and LibProsperoPkg and is therefore distributed as a **combined work under GPL-3.0-or-later** (GPL-3 section 5). Everything needed to rebuild it is in this repository — the Python and C# sources, the pinned NuGet references, and the LibProsperoPkg 1.2.0 assembly (pristine and patched, with the patch tooling and a modification notice under `backend/native/src/ffpfsc-pkg-tool/lib/`); LibProsperoPkg's own source is upstream at [drakmor/LibProsperoPkg](https://github.com/drakmor/LibProsperoPkg). Every bundled component's license is GPL-3 compatible.
 
 **Not affiliated with Sony Interactive Entertainment Inc.** "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment; use here is nominative fair use to identify the format and console this tool interoperates with. This tool builds and processes PS5 package formats from files **you** supply — it does not decrypt, decode, or distribute any Sony-owned content, firmware, keys, or executables. You are responsible for having the legal right to any content you process with it (dumps of games you own, homebrew you have written or been licensed to redistribute). See `NOTICES.md` for the full statement.

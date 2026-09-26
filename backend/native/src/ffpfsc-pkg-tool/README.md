@@ -31,26 +31,18 @@ source is kept in the repo.
 ## Rebuilding
 
 1. Install a .NET SDK (9 or newer; 10.0.400 was used).
-2. Put the referenced libraries into `lib/` next to the project file. They are not in
-   the repo; take them, unmodified, from the a53-fpkg 0.5 release archive
-   (`fpkg-gui-0.5.zip`):
-   - `lib/LibProsperoPkg.dll` (v1.2.0)
-   - `lib/BCnEncoder.dll`
-   - `lib/CommunityToolkit.HighPerformance.dll`
-   - `lib/Magick.NET-Q8-AnyCPU.dll`
-   - `lib/Magick.NET.Core.dll`
-   - `lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib`
-   After extracting the native dylib, clear its quarantine flag and ad-hoc-sign it —
-   otherwise Gatekeeper blocks the extracted copy at run time:
-
-   ```bash
-   xattr -c lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib
-   codesign --force --sign - lib/runtimes/osx-arm64/native/Magick.Native-Q8-arm64.dll.dylib
-   ```
+2. Nothing to fetch. `lib/LibProsperoPkg.dll` is tracked in git and already carries the
+   two IL patches; `lib/LibProsperoPkg.dll.orig` is the pristine upstream assembly and
+   `lib/SHA256SUMS` proves both (`cd lib && shasum -a 256 -c SHA256SUMS`). To re-apply
+   the patches to a fresh copy of the pristine assembly, see `patches/README.md` — the
+   patcher is idempotent. Every other dependency is a NuGet package pinned in
+   `PkgTool.csproj` (BCnEncoder.Net 2.3.0, CommunityToolkit.HighPerformance 8.4.0,
+   Magick.NET-Q8-AnyCPU 14.15.0 including the native ImageMagick library); the publish
+   step restores them.
 3. Publish:
 
    ```bash
-   dotnet publish PkgTool.csproj -c Release -o out
+   dotnet publish PkgTool.csproj -c Release -r osx-arm64 --self-contained true -o out
    ```
 
 4. Copy `out/ffpfsc-pkg-tool` to `backend/native/ffpfsc-pkg-tool` (keep it executable).
@@ -60,7 +52,7 @@ source is kept in the repo.
    FFPFSC_PKG_TOOL=/path/to/out/ffpfsc-pkg-tool python backend/tests/test_fpkg_pipelines.py
    ```
 
-`lib/`, `bin/`, `obj/` and `out/` are ignored by git.
+`bin/`, `obj/` and `out/` are ignored by git; `lib/` is tracked.
 
 ## Browsing a package: `list-inner` and `extract-inner --members`
 

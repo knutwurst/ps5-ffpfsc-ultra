@@ -20,20 +20,21 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
   <ItemGroup>
+    <!-- LibProsperoPkg 1.2.0 (GPL-3.0-or-later) is the one dependency that is not
+         on NuGet. lib/ holds the pristine upstream assembly (LibProsperoPkg.dll.orig)
+         and the patched one the tool links against; see lib/README.md and
+         patches/README.md for the two IL patches and how to re-apply them. -->
     <Reference Include="LibProsperoPkg"><HintPath>lib\LibProsperoPkg.dll</HintPath></Reference>
-    <Reference Include="BCnEncoder"><HintPath>lib\BCnEncoder.dll</HintPath></Reference>
-    <Reference Include="CommunityToolkit.HighPerformance"><HintPath>lib\CommunityToolkit.HighPerformance.dll</HintPath></Reference>
+    <!-- The remaining dependencies are the exact NuGet versions LibProsperoPkg 1.2.0
+         was compiled against (assembly versions 2.3.0 / 8.4.0 / 14.15.0). -->
+    <PackageReference Include="BCnEncoder.Net" Version="2.3.0" />
+    <PackageReference Include="CommunityToolkit.HighPerformance" Version="8.4.0" />
     <!-- Magick.NET is what converts sce_sys/icon0.png to the sce_sys/icon0.dds
          CNT entry the console needs to launch the app (verified against a
          reference package that starts on FW 11.60). LibProsperoPkg fails
          silently if the assembly is absent — the .pkg builds, installs, but
-         does not launch. Ships as ~30 MB of the tool. -->
-    <Reference Include="Magick.NET-Q8-AnyCPU"><HintPath>lib\Magick.NET-Q8-AnyCPU.dll</HintPath></Reference>
-    <Reference Include="Magick.NET.Core"><HintPath>lib\Magick.NET.Core.dll</HintPath></Reference>
-    <None Include="lib\runtimes\osx-arm64\native\Magick.Native-Q8-arm64.dll.dylib">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>runtimes\osx-arm64\native\Magick.Native-Q8-arm64.dll.dylib</Link>
-    </None>
+         does not launch. Ships as ~30 MB of the tool (managed + native). -->
+    <PackageReference Include="Magick.NET-Q8-AnyCPU" Version="14.15.0" />
   </ItemGroup>
   <!-- patches/CecilPatch is its own project (the LibProsperoPkg.dll patcher); keep the
        SDK's default **/*.cs glob from pulling its sources and obj/ into this assembly. -->

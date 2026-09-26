@@ -1,9 +1,13 @@
 # LibProsperoPkg.dll patches
 
-`ffpfsc-pkg-tool` links against drakmor's LibProsperoPkg 1.2.0 (BSD-3, taken
-compiled from the a53-fpkg 0.5 drop; `lib/` is not in git). Two of its
-behaviours keep a retail-shape package from launching on a jailbroken PS5.
-Both are fixed by rewriting IL in the assembly before the tool is compiled.
+`ffpfsc-pkg-tool` links against drakmor's LibProsperoPkg 1.2.0
+(GPL-3.0-or-later). Both the pristine upstream assembly
+(`lib/LibProsperoPkg.dll.orig`) and the patched one the tool links against
+(`lib/LibProsperoPkg.dll`) are tracked in git, with SHA-256 sums in
+`lib/SHA256SUMS`; `lib/README.md` records the provenance and the
+modification notice. Two upstream behaviours keep a retail-shape package
+from launching on a jailbroken PS5. Both are fixed by rewriting IL in the
+assembly before the tool is compiled.
 
 ## Applying
 

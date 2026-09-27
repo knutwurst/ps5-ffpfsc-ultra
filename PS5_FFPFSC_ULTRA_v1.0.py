@@ -10283,8 +10283,14 @@ class App:
         (_ffpfsc_inner) is never touched here; its lifecycle is _cleanup_inner_image."""
         self._ampr_cleanup(item)   # restore a direct source folder we injected emu files into
         roots, seen = [], set()
-        out_str = self.output_var.get().strip()
+        _jo = self._job_output_dir(item)
+        out_str = str(_jo) if _jo else ""
         out_spool = (str(Path(out_str) / "_ffpfsc_temp") if out_str else None)
+        # A build cancelled or killed mid-pass-2 leaves the backend's swap file
+        # "<name>.ffpfsc.partial" (and its .tmp) in the output folder: reclaim those too.
+        _w = getattr(self, "worker", None)
+        _partial_dir = Path(str(getattr(_w, "output_dir", "") or "")) if _w is not None else None
+        _partial_since = float(getattr(_w, "start_time", 0) or 0) - 2.0
         for cand in (getattr(item, "_build_temp", None), self.temp_var.get().strip(), out_spool):
             if not cand:
                 continue
@@ -10296,7 +10302,7 @@ class App:
             if key not in seen and r.exists():
                 seen.add(key)
                 roots.append(r)
-        if not roots and self._extract_dir_for_item(item) is None:
+        if not roots and self._extract_dir_for_item(item) is None and _partial_dir is None:
             return
 
         _tp = (self.temp_var.get() or "").strip()   # snapshot on the main thread
@@ -10309,6 +10315,17 @@ class App:
                                            or (not keep_source and p.name == "_ffpfsc_inner")):
                             sz = get_folder_size(p)
                             shutil.rmtree(str(p), ignore_errors=True)
+                            freed += sz
+                except Exception:
+                    pass
+            if _partial_dir is not None and _partial_dir.is_dir():
+                try:
+                    for p in _partial_dir.iterdir():
+                        n = p.name.lower()
+                        if p.is_file() and (n.endswith(".partial") or n.endswith(".partial.tmp")) \
+                                and p.stat().st_mtime >= _partial_since:
+                            sz = p.stat().st_size
+                            p.unlink()
                             freed += sz
                 except Exception:
                     pass

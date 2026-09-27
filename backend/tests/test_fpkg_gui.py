@@ -8,10 +8,12 @@ badges/details, double-click dispatch, dialog sizing, and queue persistence.
 
   /tmp/ps5venv/bin/python backend/tests/test_fpkg_gui.py [--work DIR]
 
-Needs the GUI deps (customtkinter, tkinterdnd2, pillow, psutil) and a display; the
-user's settings.json is snapshotted before and restored after the run.
+Needs the GUI deps (customtkinter, tkinterdnd2, pillow, psutil) and a display. The driver
+points PS5_FFPFSC_APP_DIR at a folder inside its work dir before the GUI module loads, so
+the real profile is never touched; the settings.json snapshot/restore stays as a second
+safety net.
 """
-import sys, importlib.util, traceback, argparse, shutil, subprocess, tempfile, time, zipfile, json, re
+import sys, os, importlib.util, traceback, argparse, shutil, subprocess, tempfile, time, zipfile, json, re
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -21,6 +23,9 @@ ap = argparse.ArgumentParser(); ap.add_argument("--work", type=Path, default=Pat
 a = ap.parse_args(); S = a.work
 if S.exists(): shutil.rmtree(S)
 S.mkdir(parents=True)
+# Isolate the app profile: the GUI honours PS5_FFPFSC_APP_DIR (APP_DIR = that path). It must
+# be set BEFORE the module loads, because APP_DIR is computed at import time.
+os.environ["PS5_FFPFSC_APP_DIR"] = str(S / "app_dir")
 HBT = fetch_hbt(S / "hbt"); OUT = S / "gui_drive_out"; OUT.mkdir()
 # seed artefacts: one .ffpfsc (image-source path), one .pkg (extract path), one .zip (archive path)
 subprocess.run([sys.executable, "-u", str(CLI), str(HBT), str(S / "c2_ffpfsc"), "--pack", "--overwrite"], capture_output=True, timeout=300)
@@ -30,7 +35,7 @@ ZP = S / "HomebrewTest.zip"
 with zipfile.ZipFile(ZP, "w") as z:
     for f in HBT.rglob("*"):
         if f.is_file(): z.write(f, f"HomebrewTest/{f.relative_to(HBT)}")
-import os; os.chdir(REPO)
+os.chdir(REPO)
 spec = importlib.util.spec_from_file_location("ultra", str(REPO / "PS5_FFPFSC_ULTRA_v1.0.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 errors = []
@@ -70,6 +75,8 @@ def close_toplevels():
             if isinstance(w, m.ctk.CTkToplevel): w.destroy()
         except Exception: pass
 try:
+    # 0) the profile dir is the isolated one (needs the GUI's PS5_FFPFSC_APP_DIR support)
+    ok("driver.app-dir-isolated", Path(m.APP_DIR).resolve() == (S / "app_dir").resolve(), f"APP_DIR={m.APP_DIR}")
     # 1) build_command for an fpkg-build item (folder) — identity fields ride along as fallbacks
     it = m.GameItem.from_fpkg_build(HBT, output_path=str(OUT), content_id="UP9000-PPSA99099_00-PROSPERO00000000",
                                     title_id="PPSA99099", title="HBT", inner_mode="kraken", kraken_backend="builtin", level=5)

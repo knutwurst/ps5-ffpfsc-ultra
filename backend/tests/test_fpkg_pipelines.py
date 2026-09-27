@@ -24,16 +24,19 @@ CNT merge, mkpfs pack, mkpfs unpack, fpkg-build, fpkg-validate) went wrong.
 from __future__ import annotations
 
 import argparse
+import binascii
 import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -135,6 +138,19 @@ def fetch_hbt(dst: Path) -> Path:
     return dst
 
 
+def make_png_1x1_rgb() -> bytes:
+    """A well-formed 1x1 RGB PNG: IHDR/IDAT/IEND with real CRCs and a valid zlib stream.
+    The tool converts icon0.png to DDS while staging the source, so the fixture must
+    decode (a hand-typed sample used here before had a truncated IDAT chunk, the
+    conversion threw, and every synthesized build silently fell back to the raw source)."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", binascii.crc32(tag + data) & 0xFFFFFFFF))
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)     # 1x1, 8 bits/channel, colour type 2 = RGB
+    idat = zlib.compress(b"\x00" + b"\xff\xff\xff")          # filter byte 0 + one white pixel
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
 def make_synth_folder(dst: Path, *,
                      with_icon: bool = True,
                      with_param: bool = True,
@@ -153,15 +169,8 @@ def make_synth_folder(dst: Path, *,
             "applicationDrmType": "free",
         }))
     if with_icon:
-        # 1x1 transparent PNG (65 bytes, canonical Wikipedia sample)
-        png = bytes.fromhex(
-            "89504e470d0a1a0a"                                 # signature
-            "0000000d49484452000000010000000108060000001f15c489"  # IHDR 1x1 RGBA
-            "0000000a49444154789c6300010000000500010d0a2db4"       # IDAT
-            "0000000049454e44ae426082"                             # IEND
-        )
         (dst / "sce_sys").mkdir(exist_ok=True)
-        (dst / "sce_sys" / "icon0.png").write_bytes(png)
+        (dst / "sce_sys" / "icon0.png").write_bytes(make_png_1x1_rgb())
     if with_eboot:
         # Minimal ELF stub — 4 bytes of ELF magic + padding
         (dst / "eboot.bin").write_bytes(b"\x7FELF" + b"\x00" * 60)
@@ -317,25 +326,39 @@ def test_chain3_pkg_folder_ffpfsc(r: Runner):
 
 
 def test_negative_missing_param_json(r: Runner):
-    """The builder MUST refuse when there is no param.json — never crash."""
-    src = make_synth_folder(r.work / "neg_no_param", with_param=False)
+    """No sce_sys/param.json but --content-id/--title-id given: the tool generates a
+    minimal param.json from the supplied identity (LibProsperoPkg's
+    GenerateParamJsonIfMissing default) and the build succeeds with a green
+    auto-validate. Without identity flags it refuses instead (identity.none.reject).
+    The sample's eboot is used because the builder rejects the 64-byte ELF stub
+    ("Only 64-bit ELF modules are supported"), which would mask this behaviour."""
+    hbt = fetch_hbt(r.work / "hbt")
+    src = make_synth_folder(r.work / "neg_no_param", with_param=False, with_eboot=False)
+    shutil.copy2(hbt / "eboot.bin", src / "eboot.bin")
     out = r.work / "neg_no_param_out"; out.mkdir(exist_ok=True)
     rc, log = r.run_cli([str(src), str(out),
                          "--fpkg-build", str(src),
                          "--content-id", "UP9000-PPSA99099_00-PROSPERO00000000",
                          "--title-id", "PPSA99099",
                          "--fpkg-inner", "none", "--fpkg-kraken-backend", "builtin"])
-    # Behaviour: LibProsperoPkg's GenerateParamJsonIfMissing=True default is
-    # supposed to generate a minimal param.json when missing. If it doesn't,
-    # we expect a graceful error, not a crash.
+    pkg = next(out.glob("*.pkg"), None)
     r.check("negative.missing-param.exit",
-            rc in (0, 1),
-            f"terminated cleanly (rc={rc})",
-            f"crash-like exit {rc}; last log: " + log[-300:])
+            rc == 0 and pkg is not None,
+            f"rc=0, {pkg.name if pkg else ''} built from a generated param.json",
+            f"rc={rc}, pkg={pkg}; last log: " + log[-300:])
+    r.check("negative.missing-param.generated",
+            "param.json not found - generating a minimal one" in log,
+            "tool reported the generated param.json",
+            "no 'generating a minimal one' line: " + log[-300:])
+    r.check("negative.missing-param.validate",
+            "[FAIL]" not in log and re.search(r"summary: \d+ passed, \d+ warned, 0 failed", log) is not None,
+            "auto-validate green on the generated identity",
+            "auto-validate not green: " + "\n".join(x for x in log.splitlines() if "[FAIL]" in x or "summary:" in x))
 
 
 def test_negative_missing_eboot(r: Runner):
-    """No eboot.bin should either warn or fail cleanly."""
+    """No eboot.bin: the builder does not refuse. The package is written (rc 0) and the
+    CLI's auto-validate is what flags it, as its single failure ('[FAIL] inner.eboot')."""
     src = make_synth_folder(r.work / "neg_no_eboot", with_eboot=False)
     out = r.work / "neg_no_eboot_out"; out.mkdir(exist_ok=True)
     rc, log = r.run_cli([str(src), str(out),
@@ -343,10 +366,23 @@ def test_negative_missing_eboot(r: Runner):
                          "--content-id", "UP9000-PPSA99099_00-PROSPERO00000000",
                          "--title-id", "PPSA99099",
                          "--fpkg-inner", "none", "--fpkg-kraken-backend", "builtin"])
+    pkg = next(out.glob("*.pkg"), None)
     r.check("negative.missing-eboot.exit",
-            rc in (0, 1),
-            f"exit {rc}; validator will catch missing eboot afterwards",
-            f"crash-like exit {rc}")
+            rc == 0 and pkg is not None,
+            f"rc=0, {pkg.name if pkg else ''} written without an eboot",
+            f"rc={rc}, pkg={pkg}; last log: " + log[-300:])
+    r.check("negative.missing-eboot.validate-flags-it",
+            "[FAIL]" in log and "inner.eboot" in log and "eboot.bin not present in inner PFS" in log
+            and re.search(r"summary: \d+ passed, \d+ warned, 1 failed", log) is not None,
+            "auto-validate reported the missing eboot as its single failure",
+            "auto-validate did not flag it: " + "\n".join(x for x in log.splitlines() if "[FAIL]" in x or "summary:" in x))
+    # The synthesized fixture (generated icon0.png) must pass the tool's staging step:
+    # a PNG the DDS converter cannot decode makes the tool fall back to the raw source.
+    r.check("synth.auto-stage.ok",
+            "[stage] mirrored source into" in log and "[warn] source auto-stage failed" not in log,
+            "source staged (icon0.png converted to DDS, no auto-stage fallback)",
+            "staging line missing or auto-stage fallback hit: "
+            + "\n".join(x for x in log.splitlines() if "[stage]" in x or "[warn]" in x or "[icon]" in x))
 
 
 def test_negative_bad_content_id(r: Runner):
@@ -509,32 +545,57 @@ def test_no_eboot_caught_by_validate(r: Runner):
 
 
 def test_tool_path_resolution(r: Runner):
-    """backend/fpkg.py must find the binary via env override, native/, and _MEIPASS."""
+    """backend/fpkg.py resolves the binary as: FFPFSC_PKG_TOOL override first, then
+    backend/native/, then the PyInstaller _MEIPASS copies (first existing executable
+    wins). An override that does not exist must fall through to backend/native/; an
+    existing one must win; with nothing found, tool_path() raises FileNotFoundError
+    naming the override variable and is_available() is False."""
     import importlib
     fpkg = importlib.import_module("fpkg")
+    native = BACKEND / "native" / fpkg._TOOL_NAME
     r.check("path.native-exists",
             fpkg.is_available() and TOOL.samefile(fpkg.tool_path()),
             f"{fpkg.tool_path()}",
             "backend/fpkg.py couldn't locate the native tool")
-    # env override
-    fake = r.work / "fake"; fake.mkdir(exist_ok=True); (fake / "fake").write_bytes(b"")
     prev = os.environ.get("FFPFSC_PKG_TOOL")     # restore afterwards — a variant run relies on it
-    os.environ["FFPFSC_PKG_TOOL"] = str(fake / "does-not-exist")
+    bogus = str(r.work / "does-not-exist" / fpkg._TOOL_NAME)
     try:
+        # 1) an override that does not exist is skipped; backend/native/ resolves the tool
+        os.environ["FFPFSC_PKG_TOOL"] = bogus
         try:
-            fpkg.tool_path(); found = True
-        except FileNotFoundError:
-            # the fallback native/ still exists, so it should be found there
-            found = TOOL.exists()
+            resolved, err = fpkg.tool_path(), ""
+        except FileNotFoundError as e:
+            resolved, err = None, str(e)
+        r.check("path.env-fallback",
+                resolved is not None and resolved.samefile(native),
+                f"missing override ignored, resolved {resolved}",
+                f"expected {native}, got {resolved if resolved is not None else err[:200]!r}")
+        # 2) an override that exists wins over backend/native/
+        os.environ["FFPFSC_PKG_TOOL"] = sys.executable
+        r.check("path.env-override-wins",
+                fpkg.tool_path().samefile(Path(sys.executable)),
+                "existing override returned first",
+                f"got {fpkg.tool_path()}")
+        # 3) nothing found anywhere: FileNotFoundError naming FFPFSC_PKG_TOOL, is_available() False
+        os.environ["FFPFSC_PKG_TOOL"] = bogus
+        real_name = fpkg._TOOL_NAME
+        fpkg._TOOL_NAME = "ffpfsc-pkg-tool-that-does-not-exist"
+        try:
+            try:
+                fpkg.tool_path(); raised = ""
+            except FileNotFoundError as e:
+                raised = str(e)
+            r.check("path.none-found",
+                    "FFPFSC_PKG_TOOL" in raised and not fpkg.is_available(),
+                    "FileNotFoundError raised, is_available() False",
+                    f"no FileNotFoundError ({raised[:120]!r}) or is_available() still True")
+        finally:
+            fpkg._TOOL_NAME = real_name
     finally:
         if prev is None:
             os.environ.pop("FFPFSC_PKG_TOOL", None)
         else:
             os.environ["FFPFSC_PKG_TOOL"] = prev
-    r.check("path.env-fallback",
-            found,
-            "env override doesn't exist but native/ resolves the tool",
-            "resolution stack broken")
 
 
 def test_chain4_image_to_fpkg_oneclick(r: Runner):

@@ -25,16 +25,28 @@ SOFTWARE.
 Scope
 -----
 
-This MIT license covers the original source code authored for this project:
+This MIT license covers the source code authored for this project:
 
   * PS5_FFPFSC_ULTRA_v1.0.py                     (the GUI application)
-  * backend/cli.py, backend/fpkg.py,             (Python wrappers around the
-    backend/copy_job.py, backend/fake_sign.py     bundled tools)
+  * backend/fpkg.py, backend/copy_job.py,        (Python wrappers around the
+    backend/fake_sign.py                          bundled tools)
+  * backend/cli.py                               (this project's own
+                                                  contributions; see below)
   * backend/native/src/ffpfsc-pkg-tool/**        (the C# wrapper around
                                                   LibProsperoPkg)
   * All Python test suites under backend/tests/
-  * The build scripts (BUILD_MACOS_APP.sh, BUILD_EXE.bat, PyInstaller specs)
+  * The build inputs (BUILD_MACOS_APP.sh, requirements-build.txt, the
+    PyInstaller spec)
   * Everything under images/ authored for this project
+
+backend/cli.py started as the backend wrapper of Bizkut's ps5-ffpfs-cli (it
+came in with this repository's first commit) and has been rewritten
+extensively since. Upstream publishes no license file, so no license is
+claimed here for whatever remains of the upstream code; the MIT license above
+applies to this project's own contributions to the file. The UnRAR Python
+binding under backend/unrar/ (rarfile.py, which mirrors a subset of the
+rarfile API that tool used, plus _unrar.cpp and setup.py) came in with the
+same import and is likewise not claimed as original work. See NOTICES.md.
 
 Bundled third-party components keep their own licenses. See NOTICES.md at the
 repository root for the full list of bundled components, their upstream

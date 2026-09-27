@@ -43,22 +43,53 @@ Their upstream authors and licenses:
 | **.NET 9 runtime** | [dotnet/runtime](https://github.com/dotnet/runtime) | **MIT** | self-contained inside `backend/native/ffpfsc-pkg-tool` |
 | **UnRAR** sources | [rarlab.com](https://www.rarlab.com/) by Alexander Roshal / RARLAB | **UnRAR license** (free for extraction; **may not** be used to reverse-engineer the RAR compression algorithm or to build a RAR-compatible compressor) | `backend/unrar/src/` (LICENSE: `backend/unrar/license.txt`) |
 | **make_fself** | Alex Free's [ps5-make-fself-recursive](https://github.com/alex-free/ps5-make-fself-recursive), which redistributes `make_fself.py` from the [ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk), originally by flatz | **BSD-3-Clause** | `backend/make_fself.py` (attribution in the file header) |
-| **Bizkut's ps5-ffpfs-cli** (backend API + shell-out compatibility) | [bizkut/ps5-ffpfs-cli](https://github.com/bizkut/ps5-ffpfs-cli) | **No explicit license upstream.** This project does not redistribute the upstream binary; it re-implements a compatible CLI shell-out API around a vendored, patched fork of MkPFS. Bizkut is credited in the README as the originator of the backend design. If you are Bizkut and want a specific licensing statement or attribution change, please open an issue. | (design credit only; no upstream source or binary bundled) |
+| **Bizkut's ps5-ffpfs-cli** (the backend wrapper `backend/cli.py` grew out of) | [bizkut/ps5-ffpfs-cli](https://github.com/bizkut/ps5-ffpfs-cli) | **No license file upstream.** No license is claimed here for whatever remains of the upstream code; this project's own contributions are MIT (see the scope block in `LICENSE`). If you are Bizkut and want a specific licensing statement or attribution change, please open an issue. | `backend/cli.py` started as that tool's backend wrapper (imported with this repository's first commit) and has been rewritten extensively since. The UnRAR Python binding under `backend/unrar/` (`rarfile.py`, which mirrors the subset of the `rarfile` API that tool used, `_unrar.cpp`, `setup.py`) came in with the same import. |
 
-## Runtime dependencies (loaded at runtime, not redistributed here)
+## Bundled runtime libraries (inside the .app)
 
-* **Python** and its standard library — Python Software Foundation License (PSF-2.0).
-* **customtkinter** — MIT.
-* **tkinterdnd2** — MIT.
-* **Pillow** — HPND (permissive).
+The compiled `.app` carries its own Python runtime and every Python library
+the program imports (macOS system frameworks and optional command-line tools
+such as `7z` are used from the system). Licenses are as declared by each
+project in its package metadata or license file, checked 2026-09-27 against
+the build environment and the contents of the built bundle. The LGPL
+components are used unmodified; their compiled extension modules ship as
+separate shared libraries inside the bundle.
+
+* **Python 3.13** runtime and standard library — PSF-2.0. With its native
+  helpers: **OpenSSL 3** (`libcrypto`, `libssl`) — Apache-2.0; **mpdecimal**
+  (`libmpdec`) — BSD-2-Clause.
+* **Tcl/Tk 9** (`libtcl9`, `libtcl9tk9`, the `_tkinter` module) — Tcl/Tk
+  license (BSD-style); **libtommath** (bundled with Tcl) — public domain
+  (Unlicense).
+* **customtkinter** — MIT. **darkdetect** (its dependency) — BSD-3-Clause.
+* **tkinterdnd2** — MIT, with the **TkDnD** Tcl extension it ships —
+  BSD-style (Tcl license terms).
+* **Pillow** — MIT-CMU (the license formerly listed as HPND). With the native
+  libraries its wheel ships: **libjpeg-turbo** — IJG license, BSD-3-Clause
+  and zlib; **libtiff** — libtiff license (BSD-style); **libwebp** (incl.
+  `libsharpyuv`, `libwebpmux`, `libwebpdemux`) — BSD-3-Clause; **OpenJPEG**
+  — BSD-2-Clause; **Little-CMS 2** — MIT; **libavif** — BSD-2-Clause;
+  **liblzma** (xz) — 0BSD (older parts public domain); **zlib-ng** — zlib
+  license; **libxcb** and **libXau** — MIT (X11 style).
 * **psutil** — BSD-3-Clause.
-* **py7zr** — LGPL-2.1-or-later.
+* **py7zr** — LGPL-2.1-or-later. With its helper packages: **pybcj**,
+  **inflate64**, **pyppmd**, **multivolumefile** — LGPL-2.1-or-later;
+  **backports.zstd** — PSF-2.0; **brotli** — MIT; **pycryptodomex** —
+  BSD-2-Clause and public domain.
 * **rarfile** — ISC.
-* **cryptography** — Apache-2.0 / BSD-3-Clause.
-* **.NET 9 runtime** (embedded into `ffpfsc-pkg-tool`) — MIT.
-* **Magick.NET-Q8-AnyCPU** (used by `ffpfsc-pkg-tool` for PNG→DDS) — Apache-2.0.
-* **BCnEncoder.NET** (transitive of Magick.NET) — MIT.
-* **CommunityToolkit.HighPerformance** (transitive) — MIT.
+* **cryptography** — Apache-2.0 OR BSD-3-Clause. With **cffi** — MIT-0 (as
+  declared by cffi 2.x) and **pycparser** — BSD-3-Clause.
+* **pyobjc** (`objc`, `Foundation`, `CoreFoundation`, `AppKit` wrappers) —
+  MIT.
+* **setuptools** — MIT. **packaging** — Apache-2.0 OR BSD-2-Clause.
+
+Inside `ffpfsc-pkg-tool` (see `backend/native/NOTICE.fpkg`):
+
+* **.NET 9 runtime** (self-contained) — MIT.
+* **Magick.NET-Q8-AnyCPU** and **Magick.NET.Core** (PNG→DDS) — Apache-2.0;
+  the embedded native ImageMagick library — ImageMagick License.
+* **BCnEncoder.NET** (dependency of LibProsperoPkg) — MIT OR Unlicense.
+* **CommunityToolkit.HighPerformance** — MIT.
 
 All of the above are compatible with the GPL-3-or-later that governs the
 combined compiled binary.

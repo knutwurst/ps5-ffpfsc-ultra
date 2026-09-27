@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/macOS-first-22c55e?style=for-the-badge&logo=apple&logoColor=white" alt="macOS-first">
+  <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-22c55e?style=for-the-badge&logo=apple&logoColor=white" alt="macOS (Apple Silicon)">
   <img src="https://img.shields.io/badge/PS5%20fPKG-native-22c55e?style=for-the-badge" alt="PS5 fPKG native">
   <img src="https://img.shields.io/badge/FW%2011.60-verified-22c55e?style=for-the-badge" alt="FW 11.60 verified">
   <img src="https://img.shields.io/badge/MkPFS-1.0.0-3a3a3a?style=for-the-badge" alt="MkPFS 1.0.0">
@@ -45,7 +45,7 @@ The firmware ceiling on any given day is the console-side jailbreak stack, not t
 
 A desktop app that turns a PS5 game dump into a `.ffpfsc` container for ShadowMountPlus and MicroMount, or a debug `.pkg` for direct install on a jailbroken PS5. Give it a game folder, a disk image (`.exfat` / `.ffpkg`), an existing `.ffpfs` / `.ffpfsc`, a third-party archive (ZIP / RAR / 7z, multi-part and password-protected included), or a finalized `.pkg`. It picks the right pipeline, routes the build across your drives, and hands you a mountable container or an installable package.
 
-Built by Knutwurst on the Bizkut `ps5-ffpfs-cli` backend with PSBrew MkPFS. macOS is the primary, tested platform; also runs on Windows and Linux from source.
+Built by Knutwurst on a backend that grew out of Bizkut's `ps5-ffpfs-cli`, with PSBrew MkPFS. Builds and releases are macOS (Apple Silicon) only. The Python sources are portable in principle, but nothing other than macOS is tested.
 
 ## Screenshots
 
@@ -134,15 +134,12 @@ It detects SSD versus HDD per drive, including USB SSDs that report no flash fla
 
 ## Requirements
 
+- macOS on Apple Silicon. Builds and releases exist for nothing else; the Python sources are portable in principle but untested on other systems.
 - Python 3.10 or newer, to run from source or to build.
-- A C++ compiler for the bundled UnRAR module, needed only when building: Xcode Command Line Tools on macOS, `build-essential` on Linux, MSVC on Windows.
+- A C++ compiler for the bundled UnRAR module (Xcode Command Line Tools), needed only when building.
 - Optional but recommended for fast 7z: a native 7-Zip CLI on `PATH` (`brew install sevenzip`, or `p7zip`). Without it, `.7z` extraction falls back to the slower pure-Python path.
 
 ## Run from source
-
-Windows: double-click `RUN.bat`.
-
-macOS and Linux:
 
 ```bash
 python3 -m pip install customtkinter pillow tkinterdnd2 py7zr rarfile psutil cryptography
@@ -152,19 +149,14 @@ python3 PS5_FFPFSC_ULTRA_v1.0.py
 
 ## Build a standalone app
 
-macOS, produces `dist/PS5 FFPFSC ULTRA.app`:
+Run the build script from the repository root inside an activated virtual environment (it refuses to run outside one and installs the pinned inputs from `requirements-build.txt`). It produces `dist/PS5 FFPFSC ULTRA.app`, the release archive `dist/PS5-FFPFSC-ULTRA-<version>-macos-arm64.zip` and its `.sha256`:
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate
 ./BUILD_MACOS_APP.sh
 ```
 
-Windows, produces `dist\PS5_FFPFSC_ULTRA.exe`:
-
-```bat
-BUILD_EXE.bat
-```
-
-The macOS app is ad-hoc signed. On a Mac other than the one it was built on, clear the quarantine flag before the first launch:
+The app is ad-hoc signed. On a Mac other than the one it was built on, clear the quarantine flag before the first launch:
 
 ```bash
 xattr -dr com.apple.quarantine "PS5 FFPFSC ULTRA.app"
@@ -174,7 +166,7 @@ xattr -dr com.apple.quarantine "PS5 FFPFSC ULTRA.app"
 
 This is not a fork. It bundles and builds on the work below, with thanks to the authors:
 
-- [ps5-ffpfs-cli](https://github.com/bizkut/ps5-ffpfs-cli) by Bizkut, the CLI and backend this GUI drives (MIT).
+- [ps5-ffpfs-cli](https://github.com/bizkut/ps5-ffpfs-cli) by Bizkut, the backend wrapper that `backend/cli.py` grew out of (no license file upstream; see `NOTICES.md`).
 - [MkPFS](https://github.com/PSBrew/MkPFS) by PSBrew, the PFS image builder used for packing and compression (bundled, 1.0.0).
 - [LibProsperoPkg](https://github.com/drakmor/LibProsperoPkg) 1.2.0 by drakmor, the PS5 `.pkg` build/extract library the bundled `ffpfsc-pkg-tool` wraps (GPL-3, sourced from the a53-fpkg 0.5 release). Wrapper source under `backend/native/src/ffpfsc-pkg-tool/`.
 - `make_fself` from the ps5-payload-dev / flatz lineage, vendored for fake-signing (BSD-3).
@@ -188,12 +180,12 @@ Python libraries used: customtkinter, py7zr, rarfile, tkinterdnd2, Pillow, psuti
 
 Full breakdown — including trademark and user-responsibility notes — is in [`NOTICES.md`](NOTICES.md). In short:
 
-- **Original source code authored here** (the Python GUI, the Python wrappers around the bundled tools, the C# wrapper around LibProsperoPkg, the tests and build scripts) — **MIT** (see [`LICENSE`](LICENSE)).
+- **Source code authored here** (the Python GUI, the Python wrappers around the bundled tools, the C# wrapper around LibProsperoPkg, the tests and build inputs; for `backend/cli.py` this project's own contributions, see below) — **MIT** (see [`LICENSE`](LICENSE)).
 - **Bundled MkPFS 1.0.0** by PSBrew — **GPL-3.0-or-later** ([`backend/mkpfs/LICENSE`](backend/mkpfs/LICENSE)).
 - **Bundled LibProsperoPkg 1.2.0** by SvenGDK/drakmor — **GPL-3.0-or-later** ([`backend/native/LICENSE.LibProsperoPkg`](backend/native/LICENSE.LibProsperoPkg)).
 - **Bundled UnRAR sources** by RARLAB — **UnRAR license**; free for extraction, but **may not** be used to build a RAR-compatible compressor ([`backend/unrar/license.txt`](backend/unrar/license.txt)).
 - **Vendored `make_fself.py`** (Alex Free / flatz / ps5-payload-dev lineage) — **BSD-3-Clause**; attribution in the file header.
-- **Bizkut's `ps5-ffpfs-cli`** — no explicit upstream license; this project does not redistribute Bizkut's source or binary, only re-implements a compatible shell-out API. Credit stands in the credits section; see `NOTICES.md` for detail.
+- **Bizkut's `ps5-ffpfs-cli`** — no license file upstream. `backend/cli.py` started as that tool's backend wrapper and has been rewritten extensively here; `backend/unrar/rarfile.py` mirrors a subset of the `rarfile` API it used. No license is claimed for what remains of the upstream code; MIT applies to this project's own contributions. Detail in `NOTICES.md`.
 
 **The compiled `.app` binary** statically embeds MkPFS and LibProsperoPkg and is therefore distributed as a **combined work under GPL-3.0-or-later** (GPL-3 section 5). Everything needed to rebuild it is in this repository — the Python and C# sources, the pinned NuGet references, and the LibProsperoPkg 1.2.0 assembly (pristine and patched, with the patch tooling and a modification notice under `backend/native/src/ffpfsc-pkg-tool/lib/`); LibProsperoPkg's own source is upstream at [drakmor/LibProsperoPkg](https://github.com/drakmor/LibProsperoPkg). Every bundled component's license is GPL-3 compatible.
 

@@ -481,72 +481,100 @@ def estimate_output_space_needed(game_size: int, compressed: bool = True,
     return min(est, worst)
 
 
-def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
-    """True only if the chosen placement can complete.
+def _space_requirements(item, temp_dir: Path, out_dir: Path) -> list[tuple[str, Path, int]]:
+    """What the chosen placement needs, drive by drive: [(label, folder, bytes needed)].
 
-    Two shapes, driven by how _resolve_extract_root placed this run:
-      • Split (item._image_only_on_temp): only the inner image lives on temp_dir (the SSD);
-        the pass-2 spool is routed adaptively by the backend (temp if it still fits beside
-        the image, else the output drive) and the source/final live on the output drive. So
-        the SSD only needs the image, and the output drive needs source(when extracted
-        there) + final + a spool fallback (only when temp can't also hold the spool).
-      • One-drive: the whole scratch (source + image + spool) sits on temp_dir; the output
-        drive only needs the final container (skipped when it's the same volume)."""
+    The single source of truth for the pre-flight gate (_space_preflight_ok) and the
+    Drive Space Diagnostics dialog, so the dialog never warns about a run the gate lets
+    through or the other way round. Shapes, driven by how _resolve_extract_root placed
+    the run:
+      • copy          — same drive is a rename (nothing); cross-drive needs the size.
+      • single-pass   — a disk image compressed directly: only the output drive.
+      • pool split    — inner image on one SSD, extracted source on another, final out.
+      • image on temp — inner image on the SSD; source (archives) + final on the output.
+      • one drive     — the whole scratch on temp; the final on the output drive.
+    Pass 2 streams (MkPFS writes no spool for this app's options), so no spool term.
+    An unknown size returns [] — placement used the larger drive, the backend asserts."""
     temp_dir, out_dir = Path(temp_dir), Path(out_dir)
     size = _build_size_of(item)
     if size <= 0:
-        return True   # unknown size — placement used the larger drive; the backend asserts
-    # Output-drive reservation reflects the chosen output format (compressed → realistic,
-    # uncompressed → full size) and, for archives, the known compressed source-set size.
+        return []
     comp  = bool(getattr(item, "_output_compressed", True))
     known = int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0
+    out_final = estimate_output_space_needed(size, comp, known)
     if getattr(item, "operation", "pack") == "copy":
-        # Copy: same-drive is a rename (0 bytes). Cross-drive writes source_size bytes
-        # (streamed through a .copy-tmp then os.replace — no doubling). 1.02x slack for
-        # filesystem overhead; the source drive doesn't need anything free.
         try:
             src = Path(str(getattr(item, "path", "") or ""))
-            src_dir = src.parent if src.exists() else Path()
+            src_dir = src.parent if src.exists() else None
         except Exception:
-            src_dir = Path()
-        if src_dir and same_drive(src_dir, out_dir):
-            return True
-        return get_free_space(out_dir) >= int(size * 1.02)
+            src_dir = None
+        if src_dir is not None and same_drive(src_dir, out_dir):
+            return []
+        # Streamed through a .copy-tmp then os.replace (no doubling); 1.02x slack.
+        return [("Output drive", out_dir, int(size * 1.02))]
     if _item_is_single_pass(item):
-        # Single-pass: mkpfs compresses the disk image directly — no inner image on temp,
-        # no spool. Only the output drive needs space for the final .ffpfsc.
-        return get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
+        return [("Output drive", out_dir, out_final)]
     if getattr(item, "_extract_on_pool", False):
-        # Two-fast-drive split: inner image on _build_temp (one SSD), extracted source on
-        # _build_root (another SSD), final on the output drive. Check each independently.
-        # No pass-2 spool term: our config (--inode-bits 32, --block-size 65536, unsigned)
-        # streams pass 2 directly to the image with NO spool, so the image drive needs only
-        # the image (~1.2x) and the extract drive only the source (~1x) — matching the
-        # router's stage-2 placement test. (The backend's pre-pass-2 assert is the backstop.)
         image_dir   = Path(getattr(item, "_build_temp", temp_dir))
         extract_dir = Path(getattr(item, "_build_root", image_dir))
-        return (get_free_space(image_dir)   >= estimate_image_space_needed(size)
-                and get_free_space(extract_dir) >= int(size)
-                and get_free_space(out_dir)  >= estimate_output_space_needed(size, comp, known))
+        return [("Inner image drive", image_dir, estimate_image_space_needed(size)),
+                ("Extracted source drive", extract_dir, int(size)),
+                ("Output drive", out_dir, out_final)]
     if getattr(item, "_image_only_on_temp", False):
-        temp_free = get_free_space(temp_dir)
-        image_need = estimate_image_space_needed(size)
-        image_ok = temp_free >= image_need
-        spool_need = int(size * 1.10)
-        spool_fits_temp = (temp_free - image_need) >= spool_need
         # The source copy is reserved only before extraction (archive); afterwards it is
         # already on the output drive and counted in its free space.
         src_on_out = size if getattr(item, "source_kind", "") == "archive" else 0
-        out_need = src_on_out + estimate_output_space_needed(size, comp, known) + (0 if spool_fits_temp else spool_need)
-        return image_ok and get_free_space(out_dir) >= out_need
+        return [("Temp drive (inner image)", temp_dir, estimate_image_space_needed(size)),
+                ("Output drive", out_dir, src_on_out + out_final)]
     same = same_drive(temp_dir, out_dir)
-    factor = _peak_factor_for(item)
     # On a same-drive-OK drive (SSD) skip the extra final-image padding — matches the
     # router's leaner one-drive estimate so a single fast SSD isn't false-skipped.
     same_pad = same and not getattr(item, "_same_drive_ok", False)
-    temp_ok = get_free_space(temp_dir) >= estimate_peak_space_needed(size, factor, same_pad)
-    out_ok = same or get_free_space(out_dir) >= estimate_output_space_needed(size, comp, known)
-    return temp_ok and out_ok
+    needs = [("Temp drive (whole scratch)", temp_dir,
+              estimate_peak_space_needed(size, _peak_factor_for(item), same_pad))]
+    if not same:
+        needs.append(("Output drive", out_dir, out_final))
+    return needs
+
+
+def _space_preflight_ok(item, temp_dir: Path, out_dir: Path) -> bool:
+    """True only if every drive the chosen placement uses has the room it needs."""
+    return all(get_free_space(d) >= need for _label, d, need in _space_requirements(item, temp_dir, out_dir))
+
+
+def _fs_status(fs):
+    """Filesystem hint for the diagnostics rows: FAT/exFAT warn, NTFS ok, else neutral."""
+    if fs in ("exFAT", "FAT32", "FAT"):
+        return "warn"
+    if fs == "NTFS":
+        return "ok"
+    return None
+
+
+def _space_report(item, temp_dir, out_dir, temp_fs="", out_fs=""):
+    """(rows, space_ok, banner) for the Drive Space Diagnostics dialog, built from
+    _space_requirements — the numbers the pre-flight gate uses. Tk-free, so it is tested
+    without opening a window. rows: [(label, value, status)] with status ok/warn/None."""
+    rows = [("Game Size", format_size(display_size(item)), None)]
+    short = None
+    reqs = _space_requirements(item, Path(temp_dir), Path(out_dir))
+    for label, d, need in reqs:
+        free = get_free_space(d)
+        ok = free >= need
+        if not ok and short is None:
+            short = label
+        rows.append((f"{label} needs", format_size(need), None))
+        rows.append((f"{label} free", format_size(free), "ok" if ok else "warn"))
+    if not reqs:
+        rows.append(("Space needed", "size unknown — checked during the run", None))
+    bsize = _build_size_of(item)
+    if bsize > 0:
+        rows.append(("Est. Final Output", f"~{format_size(int(bsize * 0.55))} – {format_size(bsize)}", None))
+    rows.append(("Temp Filesystem", temp_fs or "—", _fs_status(temp_fs)))
+    rows.append(("Output Filesystem", out_fs or "—", _fs_status(out_fs)))
+    if short is None:
+        return rows, True, "✓  Enough space to proceed."
+    return rows, False, f"⚠  {short}: not enough free space — the run would fail."
 
 
 def get_folder_size(path: Path) -> int:
@@ -1715,6 +1743,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         self._countdown  = 0
         self._proceed_btn = None   # set in _build
         self._build(item, temp_dir, out_dir)
+        self.geometry(f"520x{300 + 28 * getattr(self, '_row_count', 8)}")
         # Keep dialog above the main window on all platforms
         self.transient(parent)
         self.lift()
@@ -1735,48 +1764,18 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         panel = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
         panel.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        # ── Fast values (no blocking) ──────────────────────────────────────────
-        temp_free   = get_free_space(temp_dir)
-        out_free    = get_free_space(out_dir)
-        same        = same_drive(temp_dir, out_dir)
-        bsize       = _build_size_of(item)
-        peak_needed = estimate_peak_space_needed(bsize, _peak_factor_for(item), same)
-        out_needed  = estimate_output_space_needed(
-            bsize, bool(getattr(item, "_output_compressed", True)),
-            int(getattr(item, "size", 0) or 0) if getattr(item, "source_kind", "") == "archive" else 0)
-        final_est   = int(bsize * 0.55)
-        temp_fs     = get_filesystem_type(temp_dir)   # fast ctypes call
-        out_fs      = get_filesystem_type(out_dir)
-
-        def _fs_status(fs):
-            if fs in ("exFAT", "FAT32", "FAT"): return "warn"
-            if fs == "NTFS": return "ok"
-            return None
+        # ── Needs per drive: the same numbers the pre-flight gate decides on ────
+        temp_fs = get_filesystem_type(temp_dir)   # fast ctypes call
+        out_fs  = get_filesystem_type(out_dir)
 
         def _color(status):
             if status == "ok":   return ("#1a7a40", "#4ade80")
             if status == "warn": return YELLOW
             return WHITE
 
-        temp_ok  = temp_free >= peak_needed
-        out_ok   = same or out_free >= out_needed
-        space_ok = temp_ok and out_ok
+        static_rows, space_ok, result_text = _space_report(item, temp_dir, out_dir, temp_fs, out_fs)
 
-        static_rows = [
-            ("Game Size",          format_size(display_size(item)),         None),
-            ("Temp Drive Free",    format_size(temp_free),
-             "ok" if temp_ok else "warn"),
-            ("Temp Needs (image)", format_size(peak_needed),                None),
-            ("Output Drive Free",  format_size(out_free),
-             None if same else ("ok" if out_ok else "warn")),
-            ("Output Needs (≈full)",
-             "— (= temp drive)" if same else format_size(out_needed),
-             None if same else ("ok" if out_ok else "warn")),
-            ("Est. Final Output",  f"~{format_size(final_est)} – {format_size(item.size)}", None),
-            ("Temp Filesystem",    temp_fs,    _fs_status(temp_fs)),
-            ("Output Filesystem",  out_fs,     _fs_status(out_fs)),
-        ]
-
+        self._row_count = len(static_rows)
         for lbl, val, st in static_rows:
             row = ctk.CTkFrame(panel, fg_color=PANEL)
             row.pack(fill="x", padx=14, pady=2)
@@ -1797,12 +1796,6 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         self._dt_label.grid(row=0, column=1, sticky="e")
 
         # ── Space result banner ────────────────────────────────────────────────
-        if space_ok:
-            result_text = "✓  Enough space to proceed."
-        elif not temp_ok:
-            result_text = "⚠  Temp drive low — packing may fail mid-run."
-        else:
-            result_text = "⚠  Output drive low — the final .ffpfsc may not fit (≈full size at 0% gain)."
         result_color = ("#1a7a40", "#4ade80") if space_ok else YELLOW
         ctk.CTkLabel(panel, text=result_text, text_color=result_color,
                       font=ctk.CTkFont(size=13, weight="bold")

@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.PKG;
@@ -19,15 +20,16 @@ namespace PkgTool;
 // instead:
 //
 //   package file
-//     -> ProsperoOuterPfsDecryptReader   (AES-XTS per 64 KiB outer block, on demand)
+//     -> plain SubStream, or ProsperoOuterPfsDecryptReader (AES-XTS per 64 KiB outer block)
 //     -> PfsReader (outer)               (finds pfs_image.dat + naps_pkg_layout.dat)
-//     -> ProsperoNapsImage.DecompressRange (Kraken/stored NAPS spans, only the touched ones)
-//     -> NapsBlockReader                 (aligned block cache, IMemoryReader)
+//     -> NapsBlockReader                 (NAPS plan built once; Kraken/stored spans decoded on
+//                                         demand through the library's DecodeSpan; LRU cache)
 //     -> PfsReader (inner)               (the /app0 tree: names, sizes, offsets)
 //
-// Note: DecodePlaintextInnerPfsRange exists in the library but refuses every package this
-// tool builds — the builder always encrypts the outer PFS (mode 0x000D with a real seed), and
-// that method demands the plaintext/no-auth marker. Both layouts are handled here.
+// Both outer layouts are handled: PlaintextNoAuth (mode 0x000D with the "PPPLAIN-NOAUTH!" seed
+// marker — what this tool builds since 1.1.10, read straight from the file) and the encrypted
+// one (mode 0x000D with a real seed, decrypted block by block). The library's own
+// DecodePlaintextInnerPfsRange covers only the former.
 internal sealed class InnerImage : IDisposable
 {
     public const int OuterBlockSize = 65536;
@@ -113,7 +115,7 @@ internal sealed class InnerImage : IDisposable
             _plan = ProsperoNapsImage.BuildPlan(_layout);
             _imageView = imageFile.GetView();
             _pfsImage = new StreamWrapper(_imageView, imageFile.size);
-            _blocks = new NapsBlockReader(_pfsImage, _layout, _plan.UncompressedSize, cacheBlockSize, cacheBlocks);
+            _blocks = new NapsBlockReader(_pfsImage, _layout, _plan, cacheBlockSize, cacheBlocks);
 
             SuperblockOffset = LocateInnerSuperblock();
             if (SuperblockOffset < 0)
@@ -194,9 +196,10 @@ internal sealed class InnerImage : IDisposable
     /// Writes the logical (decompressed) content of <paramref name="file"/> to <paramref name="dest"/>,
     /// exactly as the library's File.Save(path, decompress: true) would. Contiguous plain files
     /// (every file a PPR direct-offset image holds) take a chunked fast path straight through
-    /// DecompressRange so the per-call NAPS plan rebuild is amortized over 4 MiB instead of 64 KiB.
+    /// DecompressRange, 32 MiB at a time, so a large file never has to fit in RAM and the
+    /// per-call overhead stays negligible; the 1 MiB LRU blocks are for metadata random access.
     /// </summary>
-    public void CopyFile(PfsReader.File file, Stream dest, Action<long>? progress = null, int chunkSize = 4 << 20)
+    public void CopyFile(PfsReader.File file, Stream dest, Action<long>? progress = null, int chunkSize = 32 << 20)
     {
         bool compressed = file.flags.HasFlag(InodeFlags.compressed);
         if (compressed || file.blocks != null)
@@ -232,33 +235,89 @@ internal sealed class InnerImage : IDisposable
 
 /// <summary>
 /// IMemoryReader over the NAPS-decoded logical inner image. Serves reads from an LRU cache of
-/// aligned blocks; each miss decodes exactly one block through ProsperoNapsImage.DecompressRange,
-/// so directory walks touch a few hundred KiB of a multi-GB image.
+/// aligned blocks; each miss decodes exactly the spans one block touches, so directory walks
+/// touch a few hundred KiB of a multi-GB image.
+///
+/// The library's ProsperoNapsImage.DecompressRange rebuilds the whole NAPS plan on every call
+/// and scans every span linearly (about 80 ms per call on a 100 GB image). Here the plan is
+/// built once, the overlapping spans are found by binary search and decoded with the library's
+/// own span decoder (its private DecodeSpan, bound once by reflection — the same code its
+/// DecompressRange runs per span). If that method cannot be bound, the library path is used.
 /// </summary>
 internal sealed class NapsBlockReader : IMemoryReader
 {
     readonly Stream _pfsImage;
     readonly NapsLayoutDocument _layout;
+    readonly ProsperoNapsPlan _plan;
     readonly long _total;
     readonly int _blockSize;
     readonly int _capacity;
     readonly Dictionary<long, LinkedListNode<(long index, byte[] data)>> _map = new();
     readonly LinkedList<(long index, byte[] data)> _lru = new();
 
+    static readonly Func<Stream, NapsLayoutDocument, ProsperoNapsSpan, byte[]>? s_decodeSpan = BindDecodeSpan();
+
+    static Func<Stream, NapsLayoutDocument, ProsperoNapsSpan, byte[]>? BindDecodeSpan()
+    {
+        try
+        {
+            var m = typeof(ProsperoNapsImage).GetMethod("DecodeSpan", BindingFlags.NonPublic | BindingFlags.Static, null,
+                                                        new[] { typeof(Stream), typeof(NapsLayoutDocument), typeof(ProsperoNapsSpan) }, null);
+            if (m == null || m.ReturnType != typeof(byte[])) return null;
+            return (Func<Stream, NapsLayoutDocument, ProsperoNapsSpan, byte[]>)Delegate.CreateDelegate(
+                typeof(Func<Stream, NapsLayoutDocument, ProsperoNapsSpan, byte[]>), m);
+        }
+        catch { return null; }
+    }
+
+    /// <summary>True when spans are decoded through the bound DecodeSpan (diagnostics).</summary>
+    public static bool UsesSpanDecoder => s_decodeSpan != null;
+
     public int RangeCalls { get; private set; }
     public long RangeBytes { get; private set; }
 
-    public NapsBlockReader(Stream pfsImage, NapsLayoutDocument layout, long total, int blockSize, int capacity)
+    public NapsBlockReader(Stream pfsImage, NapsLayoutDocument layout, ProsperoNapsPlan plan, int blockSize, int capacity)
     {
         if (blockSize <= 0 || (blockSize & (blockSize - 1)) != 0) throw new ArgumentOutOfRangeException(nameof(blockSize), "power of two required");
-        _pfsImage = pfsImage; _layout = layout; _total = total; _blockSize = blockSize; _capacity = Math.Max(1, capacity);
+        _pfsImage = pfsImage; _layout = layout; _plan = plan; _total = plan.UncompressedSize; _blockSize = blockSize; _capacity = Math.Max(1, capacity);
     }
 
     public byte[] DecompressRange(long offset, int length)
     {
-        if (offset < 0 || offset + length > _total) throw new EndOfStreamException("read past the end of the inner image.");
+        if (offset < 0 || length < 0 || offset + length > _total) throw new EndOfStreamException("read past the end of the inner image.");
         RangeCalls++; RangeBytes += length;
-        return ProsperoNapsImage.DecompressRange(_pfsImage, _layout, offset, length);
+        if (s_decodeSpan == null) return ProsperoNapsImage.DecompressRange(_pfsImage, _layout, offset, length);
+        if (length == 0) return Array.Empty<byte>();
+
+        // Spans are ascending in UncompressedOffset and cover the image contiguously (BuildPlan
+        // validates both). Binary search for the first span that ends past `offset`.
+        var spans = _plan.Spans;
+        long end = offset + length;
+        int lo = 0, hi = spans.Count - 1, first = spans.Count;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            var s = spans[mid];
+            if (s.UncompressedOffset + s.UncompressedLength > offset) { first = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        var result = new byte[length];
+        int decoded = 0;
+        for (int i = first; i < spans.Count; i++)
+        {
+            var span = spans[i];
+            if (span.UncompressedOffset >= end) break;
+            long from = Math.Max(offset, span.UncompressedOffset);
+            long to = Math.Min(end, span.UncompressedOffset + span.UncompressedLength);
+            if (from >= to) continue;
+            var data = s_decodeSpan(_pfsImage, _layout, span);
+            int n = (int)(to - from);
+            Buffer.BlockCopy(data, (int)(from - span.UncompressedOffset), result, (int)(from - offset), n);
+            decoded += n;
+        }
+        if (decoded != length)
+            throw new InvalidDataException($"NAPS range [0x{offset:x},+0x{length:x}) has only 0x{decoded:x} decoded bytes.");
+        return result;
     }
 
     byte[] Block(long index)

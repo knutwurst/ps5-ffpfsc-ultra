@@ -154,6 +154,9 @@ RETAIL-PERFECT fPKG BUILDS OUT OF THE BOX
   to 1.1.10 (nothing regressed on a small homebrew whose eboot is already
   fake-signed). Retail acceptance on the console followed in 1.1.12.
 
+  • LICENSE, NOTICES.md and the license texts of MkPFS and UnRAR were added
+    to the repository with this version (LibProsperoPkg's shipped since 1.1.1).
+
 ────────────────────────────────────────────────────────────────────────
   v1.1.10
 ────────────────────────────────────────────────────────────────────────

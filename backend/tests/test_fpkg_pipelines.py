@@ -237,11 +237,20 @@ def test_chain1_folder_pkg_folder(r: Runner):
             "all source files present in extract",
             f"missing: {missing}")
 
+    # icon0.png must be an 8-bit RGB PNG; the upstream sample ships RGBA, so the builder
+    # flattens it (the only presentation-media change allowed here).
+    icon = "sce_sys/icon0.png"
+    src_icon_ok = png_colour(hbt / icon) == 2
+    got_icon = png_colour(out_ext / icon) if (out_ext / icon).is_file() else None
+    r.check("chain1.icon0.rgb", got_icon == 2,
+            "icon0.png is 8-bit RGB" + ("" if src_icon_ok else " (source RGBA, flattened)"),
+            f"icon0.png colour type {got_icon}")
+    allowed = ("eboot.bin", "param.json") + (() if src_icon_ok else (icon,))
     identical = [k for k in src if k in got and src[k] == got[k]]
     r.check("chain1.roundtrip.preserved-data",
-            all(k in identical for k in src if not k.endswith("param.json") and not k.endswith("eboot.bin")),
-            "README/icon0/other files byte-identical",
-            f"unexpected diffs: {[k for k in src if k not in identical and not k.endswith(('eboot.bin', 'param.json'))]}")
+            all(k in identical for k in src if not k.endswith(allowed)),
+            "README/other files byte-identical",
+            f"unexpected diffs: {[k for k in src if k not in identical and not k.endswith(allowed)]}")
 
     # eboot must have been fake-signed
     if "eboot.bin" in src:
@@ -249,6 +258,14 @@ def test_chain1_folder_pkg_folder(r: Runner):
                 got.get("eboot.bin") != src["eboot.bin"],
                 "eboot.bin fake-signed (magic transformed)",
                 "eboot.bin came through unchanged — fake-sign step missed")
+
+
+def png_colour(p: Path) -> int | None:
+    """PNG colour type of an 8-bit PNG (2 RGB, 6 RGBA), else None."""
+    h = p.read_bytes()[:26]
+    if len(h) == 26 and h[:8] == b"\x89PNG\r\n\x1a\n" and h[12:16] == b"IHDR" and h[24] == 8:
+        return h[25]
+    return None
 
 
 def test_chain2_folder_ffpfsc_folder_pkg(r: Runner):
@@ -844,6 +861,111 @@ def test_list_and_selective_extract(r: Runner):
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
+def make_png_1x1(colour: int, interlace: int = 0) -> bytes:
+    """1x1 PNG, 8-bit, colour type 2 (RGB) or 6 (RGBA). For one pixel the Adam7 data is
+    the same as the plain data, so interlace=1 still yields a valid interlaced PNG."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", binascii.crc32(tag + data) & 0xFFFFFFFF))
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, colour, 0, 0, interlace)
+    idat = zlib.compress(b"\x00" + (b"\x10\x20\x30" if colour == 2 else b"\x10\x20\x30\x80"))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def make_bc7_dds(width: int, height: int) -> bytes:
+    """A DX10/BC7 DDS header for width x height plus zeroed block data (one mip)."""
+    head = bytearray(148)
+    head[0:4] = b"DDS "
+    struct.pack_into("<IIII", head, 4, 124, 0x1007, height, width)
+    struct.pack_into("<I", head, 76, 32)             # pixel-format size
+    struct.pack_into("<I", head, 80, 0x4)            # DDPF_FOURCC
+    head[84:88] = b"DX10"
+    struct.pack_into("<IIIII", head, 128, 98, 3, 0, 1, 0)
+    return bytes(head) + bytes(((width + 3) // 4) * ((height + 3) // 4) * 16)
+
+
+def test_publishing_rules(r: Runner):
+    """Rules from the publishing tools' requirements that the builder enforces while staging
+    (never in the source): presentation-image form and icon0 size, DDS/PNG agreement, PlayGo
+    set vs. the packed tree, and refusals for a non-JSON param.json and an empty eboot."""
+    hbt = fetch_hbt(r.work / "hbt")
+    cid, tid = "UP9000-PPSA99099_00-PROSPERO00000000", "PPSA99099"
+
+    def base(name: str) -> Path:
+        d = r.work / name
+        if d.exists(): shutil.rmtree(d)
+        shutil.copytree(hbt, d)
+        return d
+
+    def build(src: Path, out_name: str):
+        out = r.work / out_name
+        if out.exists(): shutil.rmtree(out)
+        out.mkdir()
+        rc, log = r.run_cli([str(src), str(out), "--fpkg-build", str(src), "--content-id", cid,
+                             "--title-id", tid, "--fpkg-inner", "none", "--fpkg-kraken-backend", "builtin"])
+        return rc, log, next(out.glob("*.pkg"), None)
+
+    # 1. icon0.png interlaced 1x1 RGBA + a stale 256x256 icon0.dds
+    src = base("rules_icon")
+    bad_png = make_png_1x1(6, interlace=1)
+    (src / "sce_sys" / "icon0.png").write_bytes(bad_png)
+    (src / "sce_sys" / "icon0.dds").write_bytes(make_bc7_dds(256, 256))
+    rc, log, pkg = build(src, "rules_icon_out")
+    r.check("rules.icon0.converted",
+            "[media] converted sce_sys/icon0.png to 8-bit RGB" in log and "interlaced" in log and "needs 512x512" in log,
+            "icon0.png: RGBA, interlaced, 1x1 → 8-bit RGB 512x512",
+            "\n".join(l for l in log.splitlines() if "[media]" in l or "[warn]" in l) or log[-300:])
+    r.check("rules.icon0.stale-dds-regenerated",
+            "the shipped one: 256x256, the PNG is 512x512" in log,
+            "a DDS of the wrong size is generated again from the PNG",
+            "\n".join(l for l in log.splitlines() if "[icon]" in l) or log[-300:])
+    r.check("rules.icon0.validate", rc == 0 and pkg is not None and "image.icon0.dds" in log
+            and re.search(r"summary: \d+ passed, \d+ warned, 0 failed", log) is not None,
+            "validate checks icon0.png and icon0.dds and passes",
+            "\n".join(l for l in log.splitlines() if "[FAIL]" in l or "summary:" in l) or log[-300:])
+    r.check("rules.icon0.source-untouched", (src / "sce_sys" / "icon0.png").read_bytes() == bad_png,
+            "source icon0.png unchanged", "the source was modified")
+    if pkg is None:
+        return
+    x = r.work / "rules_pg_x"
+    if x.exists(): shutil.rmtree(x)
+    rc_x, _ = r.run_tool(["extract-inner", str(pkg), str(x)])
+    ic = (x / "sce_sys" / "icon0.png").read_bytes()[:29] if (x / "sce_sys" / "icon0.png").is_file() else b""
+    dd = (x / "sce_sys" / "icon0.dds").read_bytes()[:148] if (x / "sce_sys" / "icon0.dds").is_file() else b""
+    r.check("rules.icon0.packed-form",
+            rc_x == 0 and len(ic) == 29 and struct.unpack(">II", ic[16:24]) == (512, 512) and ic[24:26] == b"\x08\x02" and ic[28] == 0
+            and len(dd) == 148 and struct.unpack("<II", dd[12:20]) == (512, 512) and struct.unpack("<I", dd[128:132])[0] == 98,
+            "package: icon0.png 512x512 8-bit RGB non-interlaced, icon0.dds 512x512 BC7",
+            f"icon0.png IHDR {ic[16:29].hex()} icon0.dds {dd[12:20].hex()}")
+
+    # 2. PlayGo: the set the builder made for this tree is kept on a rebuild of the unpacked
+    #    folder; after a file is added it no longer matches and is regenerated.
+    rc, log, _ = build(x, "rules_pg_same")
+    r.check("rules.playgo.matching-set-kept", rc == 0 and "[playgo] prepared set matches the packed files" in log,
+            "a set that describes the packed files is kept",
+            "\n".join(l for l in log.splitlines() if "[playgo]" in l) or log[-300:])
+    (x / "extra-data.bin").write_bytes(b"x" * 100)
+    rc, log, _ = build(x, "rules_pg_changed")
+    r.check("rules.playgo.stale-set-regenerated",
+            rc == 0 and "[playgo] prepared set does not match the packed files (1 packed file(s) missing from its hash table" in log,
+            "a set made for another tree is regenerated",
+            "\n".join(l for l in log.splitlines() if "[playgo]" in l) or log[-300:])
+
+    # 3. A param.json that is not JSON is refused (a generic one would lose the settings).
+    src = base("rules_badparam")
+    (src / "sce_sys" / "param.json").write_bytes(b"\x89PNG\r\n\x1a\n not json")
+    rc, log, pkg = build(src, "rules_badparam_out")
+    r.check("rules.param-not-json.refused", rc != 0 and pkg is None and "param.json is not valid JSON" in log,
+            "build refused with a clear message", f"rc={rc} pkg={pkg}: " + log[-300:])
+
+    # 4. An empty eboot.bin is refused.
+    src = base("rules_empty_eboot")
+    (src / "eboot.bin").write_bytes(b"")
+    rc, log, pkg = build(src, "rules_empty_eboot_out")
+    r.check("rules.eboot-empty.refused", rc != 0 and pkg is None and "truncated or empty" in log,
+            "build refused with a clear message", f"rc={rc} pkg={pkg}: " + log[-300:])
+
+
 def main():
     ap = argparse.ArgumentParser(description="fPKG pipeline end-to-end tests")
     ap.add_argument("--work", type=Path, default=Path(tempfile.gettempdir()) / "ffpfsc-fpkg-tests",
@@ -880,6 +1002,7 @@ def main():
         ("determinism: byte-identical",     test_deterministic_build),
         ("list-inner + selective extract",  test_list_and_selective_extract),
         ("ampr index rebuilt in staging",   test_ampr_index_rebuilt),
+        ("publishing rules in staging",     test_publishing_rules),
     ]:
         if args.only and args.only.lower() not in name.lower():
             continue

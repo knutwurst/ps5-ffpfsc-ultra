@@ -34,9 +34,10 @@
 
 - **Any source** → `.pkg`: game folder, parent folder (scanned), third-party archive, disk image (`.exfat` / `.ffpkg`), an existing `.ffpfs` or `.ffpfsc` (unwrapped on the temp drive first).
 - **Identity from the game itself.** Content id, title id, version, title read from the source's own `sce_sys/param.json` at build time. The dialog's identity fields are fallbacks for game folders that lack a `param.json`.
-- **19-point validate checklist** runs after every build. If the console rejects the package the log tells you which invariant failed.
+- **Validate checklist** runs after every build: container, metadata signature, PlayGo set, presentation images and their DDS, license, NP files, sound, param.json identity, titles, versions, firmware and the eboot. If the console rejects the package the log tells you which invariant failed.
+- **Damaged dumps are repaired in the staging copy, never in the source.** A presentation image in the wrong form is converted (icon0 to 512×512 RGB, pic2 RGBA), one that is no image at all is rebuilt from its DDS, a stale DDS is regenerated, and a PlayGo set that does not describe the packed files is rebuilt. A `param.json` that is not JSON or an empty `eboot.bin` stops the build with a clear message.
 - **Auto-organize** names the result `<Title> [TITLEID] [vXX.YYY].pkg` in a per-title folder, straight from `param.json`.
-- **fPKG⇢** goes the other direction: extract a finalized `.pkg` into a `/app0`-style folder (inner PFS + all `sce_sys` CNT metadata merged), ready to pack, patch, or turn back into a `.pkg`.
+- **fPKG⇢** goes the other direction: extract a finalized `.pkg` into a `/app0`-style folder (inner PFS + all `sce_sys` CNT metadata merged), ready to pack, patch, or turn back into a `.pkg`. Package → folder → package is a fixed point: a deterministic build of the extracted folder gives the same bytes.
 - **Browse** a `.pkg` without extracting the rest: the tree, plus surgical extract of a single file or folder. Decodes only the blocks it touches.
 
 The firmware ceiling on any given day is the console-side jailbreak stack, not this builder. As newer `kstuff` variants land for 11.7x / 12.xx, packages built here are expected to launch there too — the format hasn't changed, only how far the jailbreak reaches.
@@ -132,7 +133,7 @@ It detects SSD versus HDD per drive, including USB SSDs that report no flash fla
 ## Special titles
 
 - **PlayGo / APR titles**: the app detects `playgo-chunk.dat`, injects the fakelib `.sprx` and an `AMPRIDX3` index, and signs before indexing so the index records the right sizes.
-- **HDR**: whether a game supports HDR is declared by its publisher in `sce_sys/param.json` (`attribute` bit 29); the console switches the TV to HDR only for titles that set it. fPKG builds keep that declaration by default (`--fpkg-hdr-flag auto|on|off`). To see it for a whole library: `python3 backend/cli.py --param-report <folder>` lists every folder, `.ffpfsc`, `.ffpfs` and `.pkg` with its title id, version and HDR flag, reading only the one file per game.
+- **HDR**: whether a game supports HDR is declared by its publisher in `sce_sys/param.json` (`attribute` bit 29); the console switches the TV to HDR only for titles that set it. fPKG builds keep that declaration by default (`--fpkg-hdr-flag auto|on|off`). To see it for a whole library: `python3 backend/cli.py --param-report <folder>` lists every folder, `.ffpfsc`, `.ffpfs` and `.pkg` with its title id, version, HDR flag, required system software and SDK version, reading only the one file per game.
 - **Fake-sign**: a vendored, pure-Python `make_fself` (no keys, no native dependency) re-signs `eboot.bin`, `.elf`, `.prx`, and `.sprx` in place. Already-signed files are skipped, so a repeat run is safe.
 
 ## Requirements

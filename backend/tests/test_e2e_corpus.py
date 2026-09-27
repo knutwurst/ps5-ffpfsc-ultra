@@ -13,13 +13,16 @@ the game size. Paths (each result is compared against the reference folder R):
   C3       R → .ffpfs (uncompressed) → unpack                          == R  (byte for byte)
   C4       extract of C1 → .ffpfsc → unpack                            == extract of C1
   C5       .pkg built from R vs .pkg built from the container, both --fpkg-deterministic: same bytes
+  C6       extract of a deterministic .pkg → deterministic .pkg        == that .pkg (byte for byte)
 
 "Expected changes" in a package are exactly what the builder does on purpose and nothing
 else: raw ELFs become fake-signed SELFs (and SELFs get the retail flag byte), sce_sys/
 param.json is canonicalised, placeholder license files and non-JSON *.json in sce_sys are
-dropped, a corrupt PlayGo set is regenerated, DDS icons are added, and ampr_emu.index is
-rebuilt when the AMPR emulator ships. Every other file must be byte-identical and present.
-sce_sys/keystone (the save-data key) must always be identical.
+dropped (a debug license is issued), a corrupt PlayGo set is regenerated, a presentation PNG
+that is not an 8-bit PNG in its required mode is rebuilt from its DDS, DDS icons are added,
+and ampr_emu.index is rebuilt when the AMPR emulator ships. Every other file must be
+byte-identical and present after extraction — including the sce_sys files the package keeps
+in its metadata table. sce_sys/keystone (the save-data key) must always be identical.
 
 The report is written to <work>/e2e-report.json and printed; exit code 0 = all passed.
 With --app the frozen app's backend (…/Contents/MacOS/…) is used instead of backend/cli.py.
@@ -41,6 +44,7 @@ CLI = REPO / "backend" / "cli.py"
 SELF_MAGIC = b"\x54\x14\xF5\xEE"
 ELF_MAGIC = b"\x7fELF"
 EXEC_SUFFIXES = (".bin", ".elf", ".prx", ".sprx", ".self")
+PRESENTATION_MODE = {"icon0": 2, "pic0": 2, "pic1": 2, "pic2": 6}   # PNG colour type: 2 RGB, 6 RGBA
 SCE_SYS_DROPPABLE = {"license.dat", "license.info", "origin-param.json",
                      "playgo-chunk.dat", "playgo-hash-table.dat", "playgo-ficm.dat"}
 
@@ -99,6 +103,19 @@ class E2E:
         with open(p, "rb") as f:
             return f.read(n)
 
+    @staticmethod
+    def png_mode_ok(rel: str, p: Path) -> bool | None:
+        """None if rel is no presentation PNG; else whether p is an 8-bit PNG in the required mode."""
+        stem = rel.lower().rsplit("/", 1)[-1].removesuffix(".png")
+        if not rel.lower().startswith("sce_sys/") or not rel.lower().endswith(".png"):
+            return None
+        base = stem[:-3] if len(stem) > 3 and stem[-3] == "_" and stem[-2:].isdigit() else stem
+        want = PRESENTATION_MODE.get(base)
+        if want is None:
+            return None
+        h = E2E.head(p, 26)
+        return len(h) == 26 and h[:8] == b"\x89PNG\r\n\x1a\n" and h[12:16] == b"IHDR" and h[24] == 8 and h[25] == want
+
     def app0_in(self, root: Path) -> Path | None:
         hits = sorted((p.parent for p in root.rglob("sce_sys") if p.is_dir()), key=lambda p: len(p.parts))
         return hits[0] if hits else None
@@ -112,15 +129,7 @@ class E2E:
         self.check(f"{name}.byte-identical", not (missing or extra or differ),
                    f"{len(a)} files; missing={missing[:5]} extra={extra[:5]} differ={differ[:5]}")
 
-    def cnt_entries(self, pkg: Path) -> dict[str, int]:
-        """name -> size of the package's CNT entries (sce_sys metadata lives there)."""
-        r = subprocess.run([str(self.tool()), "inspect", str(pkg), "--json"], capture_output=True, text=True)
-        try:
-            return {e["name"]: int(e["size"]) for e in json.loads(r.stdout).get("entries") or []}
-        except Exception:
-            return {}
-
-    def expected_changes_only(self, name: str, ref: Path, got: Path, ampr: bool, cnt: dict[str, int]) -> None:
+    def expected_changes_only(self, name: str, ref: Path, got: Path, ampr: bool) -> None:
         a, b = self.tree(ref), self.tree(got)
         problems, changed = [], []
         for rel, rp in sorted(a.items()):
@@ -134,11 +143,7 @@ class E2E:
                 if low == "sce_sys/ext_info.dat":
                     changed.append("dropped sce_sys/ext_info.dat (install sidecar; working packages leave it out)")
                     continue
-                in_cnt = cnt.get(rel[len("sce_sys/"):]) if low.startswith("sce_sys/") else None
-                if in_cnt is not None and (in_cnt == rp.stat().st_size or low.endswith(".dds")):
-                    changed.append(f"in package metadata (CNT): {rel}")
-                    continue
-                problems.append(f"missing {rel}" + (f" (CNT size {in_cnt} != {rp.stat().st_size})" if in_cnt is not None else ""))
+                problems.append(f"missing {rel}")
                 continue
             if rp.stat().st_size == gp.stat().st_size and self.sha(rp) == self.sha(gp):
                 continue
@@ -155,6 +160,10 @@ class E2E:
                 (changed if same else problems).append("param.json canonicalised" if same else "param.json identity changed")
             elif low.startswith("sce_sys/playgo-"):
                 changed.append(f"regenerated {rel}")
+            elif low in ("sce_sys/license.dat", "sce_sys/license.info"):
+                changed.append(f"debug license issued: {rel}")
+            elif self.png_mode_ok(rel, rp) is False and self.png_mode_ok(rel, gp):
+                changed.append(f"presentation image rebuilt: {rel}")
             elif ampr and low == "ampr_emu.index" and self.head(gp, 8) == b"AMPRIDX3":
                 changed.append("ampr_emu.index rebuilt")
             else:
@@ -210,7 +219,7 @@ def main() -> int:
         x = subprocess.run([str(tool), "extract-inner", str(pkg), str(work / "C1x")], capture_output=True, text=True, errors="replace")
         (work / "C1-extract.log").write_text((x.stdout or "") + (x.stderr or ""), encoding="utf-8")
         if e.check("C1.extract", x.returncode == 0, (x.stderr or "")[-300:]):
-            e.expected_changes_only("C1", ref, work / "C1x", ampr, e.cnt_entries(pkg))
+            e.expected_changes_only("C1", ref, work / "C1x", ampr)
 
     # C2 — R → .ffpfsc → unpack
     rc, log = e.backend([str(ref), str(work / "C2"), "--pack", "--overwrite", "--temp-dir", str(tmp)], "C2-pack")
@@ -243,20 +252,36 @@ def main() -> int:
     # C5 — deterministic .pkg from the folder and from the container are the same bytes
     if not src.is_dir():
         shas = []
+        c5a = None
         for tag, s in (("C5a", ref), ("C5b", src)):
             rc, log = e.backend([str(s), str(work / tag), "--fpkg-build", str(s), "--fpkg-inner", "kraken",
                                  "--fpkg-kraken-backend", "builtin", "--compression-level", "7",
                                  "--fpkg-deterministic", "--temp-dir", str(tmp)], f"{tag}-build")
             p = next((work / tag).glob("*.pkg"), None)
             shas.append(E2E.sha(p) if (rc == 0 and p) else f"failed:{tag}")
+            if tag == "C5a" and rc == 0:
+                c5a = p
         e.check("C5.folder-vs-container-identical", shas[0] == shas[1], f"{shas[0][:16]} vs {shas[1][:16]}")
+
+        # C6 — package → folder → package is a fixed point: extracting a deterministic package and
+        # building it again (same options) must give the same bytes, so nothing is lost or re-invented.
+        if c5a is not None:
+            x = subprocess.run([str(e.tool()), "extract-inner", str(c5a), str(work / "C6x")],
+                               capture_output=True, text=True, errors="replace")
+            if e.check("C6.extract", x.returncode == 0, (x.stderr or "")[-300:]):
+                rc, log = e.backend([str(work / "C6x"), str(work / "C6"), "--fpkg-build", str(work / "C6x"),
+                                     "--fpkg-inner", "kraken", "--fpkg-kraken-backend", "builtin",
+                                     "--compression-level", "7", "--fpkg-deterministic", "--temp-dir", str(tmp)], "C6-build")
+                p6 = next((work / "C6").glob("*.pkg"), None)
+                s6 = E2E.sha(p6) if (rc == 0 and p6) else "failed:C6"
+                e.check("C6.pkg-folder-pkg-fixed-point", s6 == shas[0], f"{shas[0][:16]} vs {s6[:16]}")
 
     report = {"source": str(src), "passed": sum(r["ok"] for r in e.results),
               "failed": sum(not r["ok"] for r in e.results), "results": e.results}
     (work / "e2e-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"\n{report['passed']} passed, {report['failed']} failed — report: {work / 'e2e-report.json'}")
     if not a.keep:
-        for d in ("C2", "C2u", "C3", "C3u", "C4", "C4u", "C5a", "C5b", "tmp"):
+        for d in ("C2", "C2u", "C3", "C3u", "C4", "C4u", "C5a", "C5b", "C6", "C6x", "tmp"):
             shutil.rmtree(work / d, ignore_errors=True)
     return 0 if report["failed"] == 0 else 1
 

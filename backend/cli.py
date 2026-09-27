@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import json
 import re
+import unicodedata
 import shlex
 import shutil
 import struct
@@ -283,6 +284,13 @@ def _read_param_json(src: Path) -> dict | None:
         return json.loads(pj.read_text(encoding="utf-8", errors="replace")) if pj.is_file() else None
 
 
+def _firmware_text(v) -> str:
+    """param.json version "0x0910000000000000" → "9.10" (system software / SDK); "" if absent
+    or malformed. The console refuses to start a title that needs newer system software."""
+    m = re.match(r"^(?:0x)?([0-9a-fA-F]{2})([0-9a-fA-F]{2})[0-9a-fA-F]{12}$", str(v or ""))
+    return f"{int(m.group(1), 16):X}.{m.group(2)}" if m else ""
+
+
 def _param_title(param: dict) -> str:
     loc = param.get("localizedParameters") or {}
     lang = loc.get("defaultLanguage") or "en-US"
@@ -329,10 +337,14 @@ def param_report(root: Path) -> int:
         hdr = bool(attr & PARAM_HDR_BIT)
         yes += hdr
         rows.append(("yes" if hdr else "no", param.get("titleId", ""), param.get("contentVersion", ""),
-                     _param_title(param), src.name))
-    print(f"{'HDR':4} {'TITLE ID':10} {'VERSION':10} TITLE  (SOURCE)")
-    for hdr, tid, ver, title, name in rows:
-        print(f"{hdr:4} {tid:10} {ver:10} {title}  ({name})")
+                     _firmware_text(param.get("requiredSystemSoftwareVersion")),
+                     _firmware_text(param.get("sdkVersion")), _param_title(param), src.name))
+    print(f"{'HDR':4} {'TITLE ID':10} {'VERSION':10} {'FW':6} {'SDK':6} TITLE  (SOURCE)")
+    for r in rows:
+        if len(r) == 5:
+            r = (r[0], r[1], r[2], "", "", r[3], r[4])
+        hdr, tid, ver, fw, sdk, title, name = r
+        print(f"{hdr:4} {tid:10} {ver:10} {fw:6} {sdk:6} {title}  ({name})")
     print(f"\n{len(rows)} game(s): {yes} declare HDR, {sum(r[0] == 'no' for r in rows)} do not, "
           f"{sum(r[0] == '?' for r in rows)} unreadable.")
     return 0
@@ -931,6 +943,23 @@ _FPKG_TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
 _FPKG_VER_RE = re.compile(r"^\d{2}\.\d{2,3}(\.\d{3})?$")
 
 
+def _content_version(v: str) -> str:
+    """A version in the package's xx.xxx.xxx form: "01.03" (a masterVersion) and "01.003"
+    become "01.003.000"; anything already xx.xxx.xxx, or empty, is returned as is."""
+    m = re.match(r"^(\d{2})\.(\d{2,3})(?:\.(\d{3}))?$", v or "")
+    if not m:
+        return v
+    return f"{m.group(1)}.{int(m.group(2)):03d}.{m.group(3) or '000'}"
+
+
+def _clean_title(t: str) -> str:
+    """A titleName the console shows cleanly: no BOM or control characters, no leading or
+    trailing spaces, inner runs of whitespace collapsed."""
+    t = "".join(" " if ch.isspace() else ch for ch in (t or "")
+                if ch != "\ufeff" and (ch.isspace() or not unicodedata.category(ch).startswith("C")))
+    return " ".join(t.split())
+
+
 def _fpkg_param_title(d: dict) -> str:
     """The display title from a param.json dict (Sony layout: localizedParameters →
     defaultLanguage block → titleName; any language as fallback; legacy top-level)."""
@@ -992,7 +1021,8 @@ def _resolve_fpkg_identity(build_src: Path, args) -> dict:
     passed_ver = args.fpkg_version if args.fpkg_version != "01.000.000" else ""
     ver, _ = _pick("version", passed_ver,
                    str(d.get("contentVersion") or d.get("masterVersion") or ""), _FPKG_VER_RE.match)
-    title = _fpkg_param_title(d) or (args.fpkg_title or "")
+    ver = _content_version(ver)
+    title = _clean_title(_fpkg_param_title(d) or (args.fpkg_title or ""))
     if cid and not tid:
         tid = cid[7:16]          # UP9000-PPSA99099_00-… → PPSA99099
     if cid and tid and tid not in cid:

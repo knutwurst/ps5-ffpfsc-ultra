@@ -32,6 +32,18 @@ internal static class AmprIndex
         "thumbs.db", "ehthumbs.db", "desktop.ini", "$recycle.bin", "system volume information",
     };
 
+    /// <summary>sce_sys files a package build must not index: the builder never packs
+    /// ext_info.dat, and it (re)creates the PlayGo set and the license at package time, so their
+    /// final bytes are not known when the index is written. Leaving them out makes the index
+    /// the same whether the source carried them or not; the emulator serves game data, never
+    /// these.</summary>
+    static readonly HashSet<string> PackageTimeFiles = new(StringComparer.Ordinal)
+    {
+        "/app0/sce_sys/ext_info.dat", "/app0/sce_sys/license.dat", "/app0/sce_sys/license.info",
+        "/app0/sce_sys/playgo-chunk.dat", "/app0/sce_sys/playgo-ficm.dat",
+        "/app0/sce_sys/playgo-hash-table.dat", "/app0/sce_sys/playgo-manifest.xml",
+    };
+
     static bool IsIgnored(string name) =>
         name.StartsWith("._", StringComparison.Ordinal) || IgnoredNames.Contains(name.ToLowerInvariant());
 
@@ -66,15 +78,18 @@ internal static class AmprIndex
     /// (0 = nothing indexed, no file written).
     /// <paramref name="fixedMtime"/>: record this mtime for every file instead of the file's
     /// own. A package gives every file the same inode time (the build timestamp), so that is
-    /// what the console reports for the installed files — and it keeps builds reproducible.</summary>
-    public static int Write(string root, long? fixedMtime = null)
+    /// what the console reports for the installed files — and it keeps builds reproducible.
+    /// <paramref name="packageView"/>: index the folder as the package will present it (skip
+    /// <see cref="PackageTimeFiles"/>); off for a plain folder, which then matches the reference
+    /// builder byte for byte.</summary>
+    public static int Write(string root, long? fixedMtime = null, bool packageView = false)
     {
         root = Path.GetFullPath(root);
         var output = Path.Combine(root, FileName);
         var tmp = output + ".tmp";
         var rows = new List<Row>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        Walk(root, root, rows, seen, output, tmp);
+        Walk(root, root, rows, seen, output, tmp, packageView);
         if (rows.Count == 0) return 0;
         if (fixedMtime is long fm)
             for (int i = 0; i < rows.Count; i++) rows[i] = rows[i] with { Mtime = fm };
@@ -88,7 +103,7 @@ internal static class AmprIndex
             foreach (var r in rows)
             {
                 var enc = Encoding.UTF8.GetBytes(r.Path);
-                if (blob.Length > uint.MaxValue || enc.Length > uint.MaxValue)
+                if (blob.Length + enc.Length > uint.MaxValue)
                     throw new InvalidDataException("AMPR index path blob is too large");
                 rw.Write((uint)blob.Length);
                 rw.Write((uint)enc.Length);
@@ -151,7 +166,7 @@ internal static class AmprIndex
 
     // Top-down, like os.walk: this directory's files (sorted by key), then each
     // subdirectory (sorted by key) in turn. Directory symlinks are not followed.
-    static void Walk(string root, string dir, List<Row> rows, HashSet<string> seen, string output, string tmp)
+    static void Walk(string root, string dir, List<Row> rows, HashSet<string> seen, string output, string tmp, bool packageView)
     {
         var files = new List<string>();
         var dirs = new List<string>();
@@ -176,6 +191,7 @@ internal static class AmprIndex
             string indexed = "/app0/" + rel;
             string lower = indexed.ToLowerInvariant();
             if (lower == "/app0/ampr_commands.bin" || lower == "/app0/apr_emu.log") continue;
+            if (packageView && PackageTimeFiles.Contains(lower)) continue;
             if (indexed.IndexOfAny(new[] { '\t', '\n', '\r' }) >= 0) continue;
             FileInfo fi;
             try
@@ -197,6 +213,6 @@ internal static class AmprIndex
             long mtime = new DateTimeOffset(fi.LastWriteTimeUtc).ToUnixTimeSeconds();
             rows.Add(new Row(fi.Length, mtime, indexed, key));
         }
-        foreach (var d in dirs) Walk(root, d, rows, seen, output, tmp);
+        foreach (var d in dirs) Walk(root, d, rows, seen, output, tmp, packageView);
     }
 }

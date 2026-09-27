@@ -3,7 +3,72 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.16  (current)
+  v1.1.17  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG: THE PUBLISHING RULES FOR sce_sys, APPLIED WHILE STAGING
+
+  The builder now checks the sce_sys content against the requirements
+  of the official publishing tools and repairs what a damaged dump gets
+  wrong. Everything happens in the staging copy; the source is never
+  touched, and every change is logged.
+    • Presentation images must be 8-bit, non-interlaced PNGs: icon0,
+      pic0 and pic1 (and their _NN variants) RGB, pic2 (the foreground
+      image shown while the application starts) RGBA, icon0 512×512.
+      A readable PNG in another form is converted (RGB flattens
+      transparency onto black). One that is no image at all is rebuilt
+      from its DDS, or left out with a warning when there is none.
+    • A DDS that is not DX10/BC7 or not the size of its PNG (a stale or
+      mislabeled file) is generated again from the PNG.
+    • A PlayGo set that does not describe the packed files — its hash
+      table lists other paths, or its file map covers another count —
+      is rebuilt; the builder used to keep any well-formed set as it
+      was. A set that matches is kept.
+    • A title without an applicationDrmType (also a generated
+      param.json) becomes "standard"; it now gets the debug license too,
+      so it no longer shows a padlock.
+    • A param.json that is not JSON stops the build: the builder would
+      otherwise write a generic one and lose the title's settings. An
+      empty eboot.bin stops it too; an empty module gets a warning.
+  Repaired images carry no time stamps, so deterministic builds stay
+  byte-identical.
+
+fPKG: A LONGER VALIDATE CHECKLIST
+
+  After every build the checklist now also covers: each presentation
+  image and its DDS (a missing or broken icon0.dds is a failure — such a
+  package installs but never starts), both license entries for a
+  standard or upgradable title, the NP title and binding files, the
+  snd0.at9 format, the default-language title, the contentVersion and
+  masterVersion formats, the required system software, and a truncated
+  eboot.bin.
+
+fPKG: UNPACKING A PACKAGE GIVES THE WHOLE sce_sys BACK
+
+  A package keeps most sce_sys files in its metadata table, not in the
+  file image. Unpacking lifted only ten of them; the DDS images, pic2,
+  sound, trophy and uds data, nptitle and the license were lost. Now
+  every named metadata entry comes back, in the full extract, the
+  selective extract and the listing. Only the package's own bookkeeping
+  entries stay out.
+
+fPKG: PACKAGE → FOLDER → PACKAGE IS A FIXED POINT
+
+  A deterministic build of an unpacked package gives the same bytes as
+  the package. For that, the AMPR emulator index is written over the
+  files as the package presents them: param.json after the builder's
+  own rewrite, and without the files the builder creates at package
+  time (PlayGo set, license) or never packs (ext_info.dat).
+
+MORE
+
+  --param-report also shows each title's required system software and
+  SDK version. A version taken from masterVersion ("01.03") is written
+  as a content version ("01.003.000"), and a title passed on the
+  command line is cleaned of control characters and stray spaces.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.16
 ────────────────────────────────────────────────────────────────────────
 
 fPKG: THE AMPR EMULATOR INDEX MATCHES THE PACKED FILES

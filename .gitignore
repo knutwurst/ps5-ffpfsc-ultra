@@ -38,3 +38,6 @@ backend/native/src/ffpfsc-pkg-tool/patches/CecilPatch/obj/
 
 backend/native/src/ffpfsc-pkg-tool/publish.log
 /*.pkg
+
+# Local console-test builds
+/local-build/

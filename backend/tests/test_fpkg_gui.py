@@ -26,6 +26,9 @@ S.mkdir(parents=True)
 # Isolate the app profile: the GUI honours PS5_FFPFSC_APP_DIR (APP_DIR = that path). It must
 # be set BEFORE the module loads, because APP_DIR is computed at import time.
 os.environ["PS5_FFPFSC_APP_DIR"] = str(S / "app_dir")
+# A profile that has been through first-run setup, so no setup wizard pops up on screen.
+(S / "app_dir").mkdir(parents=True, exist_ok=True)
+(S / "app_dir" / "settings.json").write_text('{"first_run_done": true, "show_space_dialog": false}', encoding="utf-8")
 HBT = fetch_hbt(S / "hbt"); OUT = S / "gui_drive_out"; OUT.mkdir()
 # seed artefacts: one .ffpfsc (image-source path), one .pkg (extract path), one .zip (archive path)
 subprocess.run([sys.executable, "-u", str(CLI), str(HBT), str(S / "c2_ffpfsc"), "--pack", "--overwrite"], capture_output=True, timeout=300)
@@ -55,12 +58,15 @@ m.ensure_app_dir()
 root = m._CTkDnD(); root.withdraw()
 app = m.App(root)
 app.queue.clear()
+res = []   # (re-initialised below; this early copy only carries the wizard check)
+_no_wizard = not app._is_first_run
 # Never touch the user's drives: every job in this driver uses scratch temp/output folders.
 (S / "temp").mkdir(parents=True, exist_ok=True)
 app.temp_var.set(str(S / "temp")); app.output_var.set(str(OUT))
 res = []
 def ok(name, cond, detail=""):
     res.append((name, bool(cond), detail))
+ok("driver.no-first-run-wizard", _no_wizard, "the isolated profile is a finished setup, so no wizard window opens")
 def pump(cond, timeout=20.0):
     """Run the Tk loop (after-callbacks included: the scan_q consumer) until cond() or timeout."""
     t0 = time.monotonic()

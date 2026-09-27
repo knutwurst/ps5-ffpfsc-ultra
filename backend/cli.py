@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import json
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -495,43 +496,104 @@ def _locate_mkpfs() -> tuple[list[str], str | None]:
         print("[INFO] Running in packaged/frozen environment. Using internal MkPFS bundle.")
         return [sys.executable, "--mkpfs-internal"], None
 
-    # Bundled package next to this script (backend/mkpfs/)
+    # Bundled package next to this script (backend/mkpfs/). It always ships with the
+    # app; there is deliberately no fallback to a sibling checkout, the PATH or a pip
+    # install — those could adopt a foreign mkpfs (different image bytes) or mutate
+    # the interpreter at runtime.
     if os.path.isfile(_BUNDLED_MKPFS):
         print(f"[INFO] Using bundled MkPFS package at {_CLI_DIR}")
         return [sys.executable, "-m", "mkpfs"], _CLI_DIR
 
-    # Sibling workspace (legacy detection)
-    parent_dir = Path(__file__).resolve().parent.parent
-    try:
-        for sibling in sorted(parent_dir.iterdir()):
-            if sibling.is_dir() and (sibling / "mkpfs" / "__main__.py").is_file():
-                print(f"[INFO] Using local workspace directory at {sibling}")
-                return [sys.executable, "-m", "mkpfs"], str(sibling)
-    except Exception:
-        pass
-
-    # System PATH
-    if shutil.which("mkpfs"):
-        print("[INFO] Using system mkpfs from PATH.")
-        return ["mkpfs"], None
-
-    # Auto-install via pip
-    print("[INFO] MkPFS not found. Installing automatically via pip...")
-    res = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "mkpfs==1.0.0"],
-        capture_output=True, text=True,
-    )
-    if res.returncode != 0:
-        print("[ERROR] Failed to install mkpfs. Please install it manually: pip install mkpfs")
-        print(res.stderr)
-        sys.exit(1)
-    print("[OK] MkPFS 1.0.0 installed successfully.")
-    return [sys.executable, "-m", "mkpfs"], None
+    print(f"[ERROR] Bundled MkPFS package not found at {_BUNDLED_MKPFS} — the installation is incomplete.",
+          flush=True)
+    sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MkPFS wrappers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _unlink_quiet(path) -> None:
+    """Remove *path* if it is a file; never raises."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _discard_stale_pass1_output(temp_pfs: Path) -> None:
+    """Drop a leftover pass-1 image (plus mkpfs's '.tmp' for it) right before pass 1
+    regenerates it. mkpfs `pack folder` asks "Overwrite? [Y/n]" on stdin when its
+    output already exists; the GUI runs the backend with stdin closed, so an image a
+    crash left behind turned that prompt into an EOFError and made every retry of the
+    same title fail. This only ever touches the pass-1 OUTPUT we are about to write —
+    never a user-supplied image (an OOM resume hands the inner .ffpfs in as the SOURCE
+    and takes the single-file route, which does not come through here)."""
+    _unlink_quiet(temp_pfs)
+    _unlink_quiet(str(temp_pfs) + ".tmp")
+
+
+def _stage_build_output(final_path: Path, replace_existing: bool) -> Path:
+    """Where mkpfs should write an image whose final name is *final_path*.
+
+    When the destination already exists and the caller wants it replaced, mkpfs builds
+    into a sibling '<name>.partial' (leftovers of an earlier attempt removed first) and
+    `_commit_build_output` swaps it onto the final name only after mkpfs returned 0. A
+    failed build — ENOSPC, OOM kill, cancel, unplugged drive — therefore never costs
+    the user the previous file, which is exactly what unlinking the old image up front
+    used to do. (That unlink existed because `mkpfs pack` has no --overwrite and
+    prompts interactively when its output exists; the sibling name sidesteps the
+    prompt instead.) Returns *final_path* itself when nothing needs replacing."""
+    if replace_existing and final_path.exists():
+        partial = final_path.with_name(final_path.name + ".partial")
+        _unlink_quiet(partial)
+        _unlink_quiet(str(partial) + ".tmp")
+        return partial
+    return final_path
+
+
+def _commit_build_output(build_path: Path, final_path: Path) -> None:
+    """Move a finished '.partial' build onto its final name (atomic, same directory).
+    No-op when mkpfs wrote the final name directly."""
+    if build_path != final_path:
+        os.replace(build_path, final_path)
+
+
+def _discard_build_output(build_path: Path, final_path: Path) -> None:
+    """After a failed build: remove the '.partial' (and mkpfs's '.tmp' for it) so only
+    the untouched previous file remains under the final name."""
+    if build_path != final_path:
+        _unlink_quiet(build_path)
+        _unlink_quiet(str(build_path) + ".tmp")
+
+
+def _free_sibling_name(path: Path) -> Path:
+    """*path* if nothing sits there yet, else the first free '<stem> (N)<suffix>'
+    next to it (N = 2, 3, ...)."""
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _is_same_file(a: Path, b: Path) -> bool:
+    """True when *a* and *b* name the same file: by inode when both exist (this also
+    catches a differently-cased spelling on a case-insensitive macOS volume), else by
+    resolved path."""
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
 
 def _assert_pass2_spool_space(image_path, temp_dir) -> None:
     """Before pass-2 PFSC compression — which spools roughly the image size into
@@ -905,6 +967,7 @@ def pack_folder_uncompressed(
     block_size: str = "auto",
     verbose: bool = False,
     temp_folder: Path | None = None,
+    replace_existing: bool = False,
 ) -> None:
     # Never pack OS metadata junk (._*, .DS_Store, Spotlight/Trash dirs, …) into the
     # image. Done here so EVERY folder-pack path (normal pack + patch repack) is covered.
@@ -912,6 +975,8 @@ def pack_folder_uncompressed(
     if _stripped:
         print(f"[INFO] Removed {_stripped} macOS/Windows junk file(s)/folder(s) before packing.", flush=True)
     print(f"[INFO] Packing folder {game_folder.name} to uncompressed PFS image {pfs_path.name}...")
+    # An existing output is replaced only by a FINISHED build (see _stage_build_output).
+    build_path = _stage_build_output(pfs_path, replace_existing)
     cmd = mkpfs_cmd_base + [
         "pack", "folder",
         # MkPFS 1.0.0: `pack folder` now DEFAULTS to wrapping the folder in an exFAT image
@@ -943,12 +1008,19 @@ def pack_folder_uncompressed(
         # internal structure check in the compress pass.
         print("[INFO] Post-pack verify is off (enable 'Verify Output' to check against the source). Skipping it.", flush=True)
         cmd.append("--no-verify-structure")
-    cmd += [str(game_folder), str(pfs_path)]
-    print(f"[INFO] Running: {' '.join(cmd)}", flush=True)
+    cmd += [str(game_folder), str(build_path)]
+    print(f"[INFO] Running: {shlex.join(cmd)}", flush=True)
     try:
         subprocess.run(cmd, cwd=mkpfs_cwd, check=True)
     except subprocess.CalledProcessError as e:
+        _discard_build_output(build_path, pfs_path)
         _mkpfs_error_hint(e, pfs_path)
+        sys.exit(1)
+    try:
+        _commit_build_output(build_path, pfs_path)
+    except OSError as e:
+        _discard_build_output(build_path, pfs_path)
+        print(f"[ERROR] Could not replace the existing output file {pfs_path}: {e}", flush=True)
         sys.exit(1)
     print(f"[OK] Uncompressed PFS creation complete: {pfs_path}")
 
@@ -1077,8 +1149,11 @@ def compress_file_to_ffpfsc(
     block_size: str = "auto",
     verbose: bool = False,
     temp_folder: Path | None = None,
+    replace_existing: bool = False,
 ) -> None:
     print(f"[INFO] Compressing {source_file.name} to outer container {ffpfsc_path.name} using MkPFS...")
+    # An existing output is replaced only by a FINISHED build (see _stage_build_output).
+    build_path = _stage_build_output(ffpfsc_path, replace_existing)
     cmd = mkpfs_cmd_base + [
         "pack", "file",
         "--compress",
@@ -1098,12 +1173,23 @@ def compress_file_to_ffpfsc(
         cmd += ["--temp-folder", str(temp_folder)]
     if verbose:
         cmd.append("--verbose")
-    cmd += [str(source_file), str(ffpfsc_path)]
-    print(f"[INFO] Running: {' '.join(cmd)}", flush=True)
+    if build_path != ffpfsc_path:
+        # mkpfs would otherwise "fix" the staging name's suffix (.partial -> .ffpfsc)
+        # and write straight over the file we are protecting.
+        cmd.append("--no-adjust-output-file-extension")
+    cmd += [str(source_file), str(build_path)]
+    print(f"[INFO] Running: {shlex.join(cmd)}", flush=True)
     try:
         subprocess.run(cmd, cwd=mkpfs_cwd, check=True)
     except subprocess.CalledProcessError as e:
+        _discard_build_output(build_path, ffpfsc_path)
         _mkpfs_error_hint(e, ffpfsc_path)
+        sys.exit(1)
+    try:
+        _commit_build_output(build_path, ffpfsc_path)
+    except OSError as e:
+        _discard_build_output(build_path, ffpfsc_path)
+        print(f"[ERROR] Could not replace the existing output file {ffpfsc_path}: {e}", flush=True)
         sys.exit(1)
     print(f"[OK] Compression complete: {ffpfsc_path}")
 
@@ -1135,7 +1221,7 @@ def unpack_pfs_image(
     cmd = mkpfs_cmd_base + ["unpack", str(image_file), str(output_dir)]
     if overwrite:
         cmd.append("--overwrite")
-    print(f"[INFO] Running: {' '.join(cmd)}", flush=True)
+    print(f"[INFO] Running: {shlex.join(cmd)}", flush=True)
     # mkpfs unpack emits no incremental progress, so a big extraction (e.g. the inner image
     # of a 100+ GB game) looks frozen in the GUI for many minutes. Run it via Popen and,
     # while it works, poll the destination size and emit a GUI-parsable progress bar
@@ -1231,6 +1317,30 @@ def _fake_sign_tree(folder) -> dict:
         sys.path.insert(0, _CLI_DIR)
     from fake_sign import fake_sign_tree
     return fake_sign_tree(str(folder), log=lambda m: print(m, flush=True))
+
+
+@contextlib.contextmanager
+def _extracted_zip_source(path: Path, *, temp_root=None, password: str | None = None):
+    """Extract a ZIP source into a temporary folder and yield that folder.
+
+    Only the extraction sits inside the try: the body that runs while the folder is
+    yielded (the whole pack pipeline) must never have its own RuntimeError reported
+    as "ZIP extraction failed"."""
+    with tempfile.TemporaryDirectory(dir=temp_root) as tmpdir:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                for member in zf.infolist():
+                    dest = Path(tmpdir) / member.filename
+                    try:
+                        dest.resolve().relative_to(Path(tmpdir).resolve())
+                    except ValueError:
+                        print(f"[ERROR] ZIP path traversal detected: {member.filename}")
+                        sys.exit(1)
+                zf.extractall(tmpdir, pwd=password.encode() if password else None)
+        except (zipfile.BadZipFile, RuntimeError) as exc:
+            print(f"[ERROR] ZIP extraction failed: {exc}")
+            sys.exit(1)
+        yield Path(tmpdir)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1654,19 +1764,25 @@ def main() -> None:
                     print(f"[INFO] Removed unwrap scratch {staged}", flush=True)
             if rc != 0:
                 print(f"\n[ERROR] fPKG build failed (rc={rc}).", flush=True); sys.exit(1)
-            print("\n[SUCCESS] fPKG built.", flush=True)
             built = sorted(out_dir.glob("*.pkg"), key=lambda x: x.stat().st_mtime)
-            if built:
-                print(f"[OK] fPKG complete: {built[-1]}", flush=True)
-            # Run the diagnostic checklist so a bad build is visible right in the log
-            # (not only after a console-install failure).
+            # Run the diagnostic checklist BEFORE announcing the result so a bad build is
+            # visible right in the log (not only after a console-install failure) and its
+            # verdict lands next to the success line. The exit code stays 0 either way:
+            # the package was built; the checklist is advice about installing it.
+            validate_rc = 0
             try:
                 if built:
                     print(f"\n[INFO] Auto-validating: {built[-1].name}", flush=True)
                     _set_phase("Verifying Output")
-                    _fpkg.validate(built[-1], on_line=_gui_line)
+                    validate_rc = _fpkg.validate(built[-1], on_line=_gui_line)
             except Exception as ve:
                 print(f"[warn] Auto-validate skipped: {ve}", flush=True)
+            print("\n[SUCCESS] fPKG built.", flush=True)
+            if built:
+                print(f"[OK] fPKG complete: {built[-1]}", flush=True)
+            if validate_rc:
+                print("[WARN] Validation reported failures — check the checklist above before installing.",
+                      flush=True)
             return
 
     # fpkg-validate (a diagnostic — no build/extract)
@@ -1725,21 +1841,8 @@ def main() -> None:
     @contextlib.contextmanager
     def prepare_source_path(path: Path):
         if _is_zip(path):
-            with tempfile.TemporaryDirectory(dir=user_temp) as tmpdir:
-                try:
-                    with zipfile.ZipFile(path) as zf:
-                        for member in zf.infolist():
-                            dest = Path(tmpdir) / member.filename
-                            try:
-                                dest.resolve().relative_to(Path(tmpdir).resolve())
-                            except ValueError:
-                                print(f"[ERROR] ZIP path traversal detected: {member.filename}")
-                                sys.exit(1)
-                        zf.extractall(tmpdir, pwd=args.password.encode() if args.password else None)
-                    yield Path(tmpdir)
-                except (zipfile.BadZipFile, RuntimeError) as exc:
-                    print(f"[ERROR] ZIP extraction failed: {exc}")
-                    sys.exit(1)
+            with _extracted_zip_source(path, temp_root=user_temp, password=args.password) as src_dir:
+                yield src_dir
         elif _is_rar(path):
             # Multi-volume sets must be opened on the FIRST volume. The bundled
             # rarfile.extractall() already guards against path traversal, and the
@@ -1759,7 +1862,6 @@ def main() -> None:
                     from unrar import rarfile
                     with rarfile.RarFile(first, pwd=args.password or None) as rf:
                         rf.extractall(tmpdir)
-                    yield Path(tmpdir)
                 except rarfile.RarWrongPassword as exc:
                     print(f"[ERROR] RAR extraction failed: wrong or missing password ({exc})")
                     sys.exit(1)
@@ -1767,6 +1869,9 @@ def main() -> None:
                     print(f"[ERROR] RAR extraction failed: {exc} "
                           "(for a multi-part RAR, ensure all .partN.rar / .rNN files are present)")
                     sys.exit(1)
+                # Yield OUTSIDE the try: an exception from the pack body is not an
+                # extraction failure and must surface as itself.
+                yield Path(tmpdir)
         else:
             yield path
 
@@ -1889,6 +1994,7 @@ def main() -> None:
             title_id = _patch_dir_title_id(game_root) or "patched"
             with tempfile.TemporaryDirectory(dir=user_temp) as td2:
                 temp_pfs = Path(td2) / f"{title_id}.ffpfs"
+                _discard_stale_pass1_output(temp_pfs)
                 _phase("Creating Temp PFS")
                 pack_folder_uncompressed(
                     game_root, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
@@ -1905,18 +2011,17 @@ def main() -> None:
                 if pass2_kwargs.get("compression_level", 7) > 0 and _looks_incompressible(temp_pfs):
                     print("[INFO] Patched image sampled as incompressible — storing without compression.", flush=True)
                     pass2_kwargs["compression_level"] = 0
-                if ffpfs_path.exists() and args.overwrite:
-                    try:
-                        ffpfs_path.unlink()
-                    except Exception:
-                        pass
+                # An existing output (--overwrite was verified above) is NOT removed here:
+                # pass 2 builds beside it and swaps the finished file in, so a failed
+                # compression (ENOSPC, OOM kill, cancel, unplugged drive) never loses the
+                # previous image.
                 _phase("Compressing")
                 spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, td2, ffpfs_path, spill_base=user_spill)
                 try:
                     _assert_pass2_spool_space(temp_pfs, spool_dir)
                     compress_file_to_ffpfsc(
                         temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                        temp_folder=spool_dir, **pass2_kwargs,
+                        temp_folder=spool_dir, replace_existing=bool(args.overwrite), **pass2_kwargs,
                     )
                 finally:
                     if spool_ctx is not None:
@@ -2013,14 +2118,20 @@ def main() -> None:
             if args.batch:
                 print(f"\n[INFO] --- Processing batch item: {title_id} ({item.name}) ---")
 
+            # Refuse to build onto the source itself — checked BEFORE anything below may
+            # touch the destination. (With --overwrite the old flow removed the "existing
+            # output" first, i.e. the user's own image, and then failed.)
+            if _is_same_file(item, current_ffpfs_path):
+                print(f"[ERROR] Output path is the source itself: {current_ffpfs_path}", flush=True)
+                sys.exit(1)
+
+            # An existing output is no longer removed up front. Every build route below
+            # writes beside it and swaps the FINISHED file in (replace_existing), so a
+            # failed pass 2 leaves the previous image untouched.
+            replace_existing = bool(args.overwrite)
             if current_ffpfs_path.exists():
                 if args.overwrite:
                     print(f"[WARN] Output file already exists. Overwriting: {current_ffpfs_path}")
-                    try:
-                        current_ffpfs_path.unlink()
-                    except Exception as e:
-                        print(f"[ERROR] Failed to remove existing output file: {e}")
-                        sys.exit(1)
                 else:
                     print(f"[WARN] Output file already exists: {current_ffpfs_path}")
                     try:
@@ -2035,11 +2146,7 @@ def main() -> None:
                     if response not in ('y', 'yes'):
                         print(f"[INFO] Skipping: {current_ffpfs_path.name}")
                         continue
-                    try:
-                        current_ffpfs_path.unlink()
-                    except Exception as e:
-                        print(f"[ERROR] Failed to remove existing output file: {e}")
-                        sys.exit(1)
+                    replace_existing = True
 
             # Pull third-party / non-game extras (a _bundle_-style group folder, loose
             # .nfo/.sfv, …) OUT of the dump so they are never packed into the image, and
@@ -2066,7 +2173,7 @@ def main() -> None:
                             print("[INFO] Compressing exFAT image -> .ffpfsc...", flush=True)
                             compress_file_to_ffpfsc(
                                 exfat_img, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                                temp_folder=spool_dir, **pack_kwargs,
+                                temp_folder=spool_dir, replace_existing=replace_existing, **pack_kwargs,
                             )
                         finally:
                             if spool_ctx is not None:
@@ -2077,11 +2184,19 @@ def main() -> None:
             if uncompressed and item.is_file() and item.suffix.lower() == '.ffpfs':
                 # Uncompressed output + already a PFS image → emit the .ffpfs directly (copy;
                 # no compression, no temp). Re-pack of a .ffpfs to a faster uncompressed copy.
-                if item.resolve() != current_ffpfs_path.resolve():
-                    print(f"[INFO] Uncompressed output — copying {item.name} -> {current_ffpfs_path.name}", flush=True)
-                    shutil.copy2(item, current_ffpfs_path)
-                else:
-                    print("[INFO] Source already IS the requested .ffpfs output — nothing to do.", flush=True)
+                # (Source == output was refused above.) Copy beside an existing output and
+                # swap on success — same rule as the mkpfs routes — so an interrupted copy
+                # never truncates the previous file.
+                print(f"[INFO] Uncompressed output — copying {item.name} -> {current_ffpfs_path.name}", flush=True)
+                build_path = _stage_build_output(current_ffpfs_path, replace_existing)
+                try:
+                    current_ffpfs_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, build_path)
+                    _commit_build_output(build_path, current_ffpfs_path)
+                except OSError as e:
+                    _discard_build_output(build_path, current_ffpfs_path)
+                    print(f"[ERROR] Could not copy {item.name} to {current_ffpfs_path}: {e}", flush=True)
+                    sys.exit(1)
             elif item.is_file() and item.suffix.lower() in ('.exfat', '.ffpkg', '.ffpfs'):
                 # Direct image (.exfat / .ffpkg / .ffpfs) → .ffpfsc (single-file streaming
                 # path). A .ffpfs is re-wrapped into its native compressed container. The
@@ -2091,7 +2206,7 @@ def main() -> None:
                 try:
                     compress_file_to_ffpfsc(
                         item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                        temp_folder=spool_dir,
+                        temp_folder=spool_dir, replace_existing=replace_existing,
                         **pack_kwargs,
                     )
                 finally:
@@ -2117,6 +2232,7 @@ def main() -> None:
                         item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                         verify_enabled=args.verify,
                         temp_folder=Path(user_temp) if user_temp else None,
+                        replace_existing=replace_existing,
                         **pack_kwargs,
                     )
                     continue   # done with this item — no pass 2
@@ -2131,6 +2247,11 @@ def main() -> None:
                 inner_dir = (Path(user_temp) if user_temp else Path(tempfile.gettempdir())) / "_ffpfsc_inner"
                 inner_dir.mkdir(parents=True, exist_ok=True)
                 temp_pfs = inner_dir / f"{title_id}.ffpfs"
+                # We are rebuilding pass 1 from the source folder, so any inner image a
+                # crashed run left under this name is stale (a resume never comes this
+                # way — it passes that image in as the source). Drop it, or mkpfs stops
+                # at its interactive overwrite prompt.
+                _discard_stale_pass1_output(temp_pfs)
 
                 pack_folder_uncompressed(
                     item, temp_pfs, mkpfs_cmd_base, mkpfs_cwd,
@@ -2163,7 +2284,7 @@ def main() -> None:
                     _assert_pass2_spool_space(temp_pfs, spool_dir)
                     compress_file_to_ffpfsc(
                         temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
-                        temp_folder=spool_dir,
+                        temp_folder=spool_dir, replace_existing=replace_existing,
                         **pass2_kwargs,
                     )
                 finally:
@@ -2172,6 +2293,12 @@ def main() -> None:
 
                 if args.keep_pfs:
                     saved = current_ffpfs_path.parent / f"{title_id}.ffpfs"
+                    if saved.exists():
+                        # Never clobber what is already there (an earlier kept image or a
+                        # user's own .ffpfs) — take the next free name instead.
+                        saved = _free_sibling_name(saved)
+                        print(f"[INFO] {title_id}.ffpfs already exists next to the output — "
+                              f"keeping the intermediate image as {saved.name} instead.", flush=True)
                     print(f"[INFO] Saving intermediate PFS image to {saved}...")
                     # move (not copy): pass 2 already consumed temp_pfs; relocating frees the
                     # SSD copy instead of leaving it for the success cleanup below to wipe.

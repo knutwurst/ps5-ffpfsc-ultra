@@ -1454,13 +1454,15 @@ class FirstRunWizard(ctk.CTkToplevel):
             lines = []
             tp = self.temp_path.get().strip()
             op = self.output_path.get().strip()
+            temp_label = None
+            tfree = 0
             if tp:
                 tpath = Path(tp)
-                ttype = get_drive_type(tpath)
                 tfree = get_free_space(tpath)
-                lines.append(f"Temp Drive:    {format_size(tfree)} free  |  Type: {ttype}")
-                if ttype == "HDD":
-                    lines.append("  ⚠  Temp folder is on a mechanical HDD.\n     Large games may process significantly slower.\n     SSD/NVMe recommended.")
+                # The SSD/HDD probe may shell out (diskutil / PowerShell) for seconds, so
+                # it runs off the UI thread and fills in this label — plus the HDD
+                # warning — when done (see _probe_temp_drive_type).
+                lines.append(f"Temp Drive:    {format_size(tfree)} free  |  Type: detecting…")
             if op:
                 opath = Path(op)
                 ofree = get_free_space(opath)
@@ -1469,9 +1471,14 @@ class FirstRunWizard(ctk.CTkToplevel):
                 lines.append("No paths selected. Go back and select folders.")
             for line in lines:
                 color = YELLOW if "⚠" in line else WHITE
-                ctk.CTkLabel(self.body, text=line, text_color=color, anchor="w",
-                              font=ctk.CTkFont(family="Consolas", size=12),
-                              justify="left").pack(anchor="w", padx=14, pady=3)
+                lbl = ctk.CTkLabel(self.body, text=line, text_color=color, anchor="w",
+                                   font=ctk.CTkFont(family="Consolas", size=12),
+                                   justify="left")
+                lbl.pack(anchor="w", padx=14, pady=3)
+                if temp_label is None and line.startswith("Temp Drive:"):
+                    temp_label = lbl
+            if tp and temp_label is not None:
+                self._probe_temp_drive_type(Path(tp), temp_label, tfree)
 
         elif n == 3:
             self.header.configure(text="Step 4 — Ready!")
@@ -1486,6 +1493,34 @@ class FirstRunWizard(ctk.CTkToplevel):
             for line in summary:
                 ctk.CTkLabel(self.body, text=line, text_color=WHITE, anchor="w",
                               font=ctk.CTkFont(family="Consolas", size=12)).pack(anchor="w", padx=14, pady=2)
+
+    def _probe_temp_drive_type(self, tpath: Path, label, tfree: int) -> None:
+        """Detect SSD/HDD for the temp drive on a worker thread (get_drive_type may block
+        on diskutil / PowerShell) and update the step-3 label — plus the HDD warning —
+        once known. The result is dropped if the user has already left the step."""
+        def _apply(dt: str) -> None:
+            try:
+                if not (self.winfo_exists() and label.winfo_exists()):
+                    return
+                label.configure(text=f"Temp Drive:    {format_size(tfree)} free  |  Type: {dt}")
+                if dt == "HDD":
+                    ctk.CTkLabel(self.body,
+                                 text="  ⚠  Temp folder is on a mechanical HDD.\n     Large games may "
+                                      "process significantly slower.\n     SSD/NVMe recommended.",
+                                 text_color=YELLOW, anchor="w",
+                                 font=ctk.CTkFont(family="Consolas", size=12),
+                                 justify="left").pack(anchor="w", padx=14, pady=3, after=label)
+            except Exception:
+                pass
+
+        def _detect() -> None:
+            dt = get_drive_type(tpath)
+            try:
+                self.after(0, lambda: _apply(dt))
+            except Exception:
+                pass
+
+        threading.Thread(target=_detect, daemon=True).start()
 
     def _browse_temp(self):
         p = filedialog.askdirectory(title="Select Temp Folder")
@@ -1868,6 +1903,26 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
 
 # ─── Export Diagnostic Package ─────────────────────────────────────────────────
 
+def _redact_settings_for_export(data):
+    """Copy of the settings with the secrets removed before they leave the machine:
+    the saved archive-password list is dropped and every other key that mentions
+    'password' (the one-off field, a per-queue-item override, …) is blanked — a
+    non-empty value becomes '<redacted>' so the reader can still tell one was set."""
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if isinstance(k, str) and "password" in k.lower():
+                if k == "archive_passwords" or isinstance(v, (list, tuple, dict)):
+                    continue
+                out[k] = "<redacted>" if v else ""
+            else:
+                out[k] = _redact_settings_for_export(v)
+        return out
+    if isinstance(data, list):
+        return [_redact_settings_for_export(v) for v in data]
+    return data
+
+
 def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | None:
     ensure_app_dir()
     zip_path = APP_DIR / f"diagnostic_{time.strftime('%Y%m%d_%H%M%S')}.zip"
@@ -1876,7 +1931,13 @@ def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | No
             if RAW_LOG_FILE.exists():
                 zf.write(RAW_LOG_FILE, "raw.log")
             if SETTINGS_FILE.exists():
-                zf.write(SETTINGS_FILE, "settings.json")
+                # Never the raw file: it holds the saved archive passwords in plain text.
+                try:
+                    redacted = _redact_settings_for_export(
+                        json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+                except Exception as e:
+                    redacted = {"_note": f"settings.json could not be parsed for redaction: {e}"}
+                zf.writestr("settings.json", json.dumps(redacted, indent=2))
             if FINAL_REPORT_FILE.exists():
                 zf.write(FINAL_REPORT_FILE, "last_result_report.txt")
             def _drive_info(p: str) -> str:
@@ -1884,8 +1945,10 @@ def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | No
                     return "—"
                 try:
                     pp = Path(p)
+                    # Cached probe only — this runs on the UI thread and get_drive_type()
+                    # may shell out for seconds. 'Unknown' = not probed yet.
                     return (f"{get_filesystem_type(pp)} | "
-                            f"{get_drive_type(pp)} | "
+                            f"{drive_type_cached(pp)} | "
                             f"Free: {format_size(get_free_space(pp))}")
                 except Exception:
                     return "—"
@@ -2041,7 +2104,8 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(comp, text="Saved Archive Passwords (auto-tried, one per line):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
         ctk.CTkLabel(comp, text="Every password here is tried automatically, in order — handy for a "
-                                "queue of differently-protected archives. EXAMPLE-PASSWORD is pre-added.",
+                                "queue of differently-protected archives. The list is empty until "
+                                "you add passwords.",
                       text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left").pack(
             anchor="w", padx=14)
         self._pw_list_box = ctk.CTkTextbox(comp, height=110, fg_color=CARD,
@@ -2339,16 +2403,40 @@ class ArchiveExtractionCancelled(RuntimeError):
     """Raised when the user cancels an archive extraction."""
 
 
+class ArchivePasswordError(RuntimeError):
+    """An extractor reported a wrong or missing archive password. Its own type so
+    extract_with_passwords() moves on to the next candidate instead of surfacing
+    it as a generic failure."""
+
+
+class ArchiveToolError(RuntimeError):
+    """A CLI extractor exited non-zero for a reason other than the password. The exit
+    status is kept so callers can tell 'could not run at all' (7-Zip exit 7 = command
+    line error) from a data error inside the archive."""
+
+    def __init__(self, message: str, returncode: int = 1):
+        super().__init__(message)
+        self.returncode = returncode
+
+
 class ArchiveExtractor:
     """Extract ZIP / RAR / 7z to a temp subfolder and return the game root Path.
 
     Libraries used (all optional — falls back to CLI tools if missing):
-      • ZIP  — zipfile (stdlib, always available)
+      • ZIP  — zipfile (stdlib, always available); AES-encrypted zips need the 7-Zip CLI
       • RAR  — rarfile  (pip install rarfile)
       • 7z   — py7zr    (pip install py7zr)  or  7z / 7za CLI on PATH
     """
 
     SUPPORTED = {".zip", ".rar", ".7z"}
+
+    # How the CLI tools word a wrong or missing password. 7-Zip: "Cannot open encrypted
+    # archive. Wrong password?", "Data Error in encrypted file. Wrong password?",
+    # "ERROR: Wrong password : <file>"; a bare "Enter password" prompt means it asked
+    # for one we did not pass. UnRAR: "Incorrect password for <archive>", "The specified
+    # password is incorrect.", "(password incorrect ?)", "Corrupt file or wrong password."
+    _CLI_PASSWORD_RE = re.compile(
+        r"wrong password|enter password|incorrect password|password (?:is )?incorrect", re.I)
 
     @staticmethod
     def extract(archive: Path, dest_root: Path, log_fn=None, progress_fn=None,
@@ -2391,7 +2479,7 @@ class ArchiveExtractor:
                 f"Archive extraction produced no files: {archive.name}\n\n"
                 "The archive may be empty, encrypted with a wrong password, or the required macOS extractor failed."
             )
-        game_root = ArchiveExtractor._find_root(dest)
+        game_root = ArchiveExtractor._find_root(dest, log_fn=log_fn)
         if log_fn:
             log_fn("OK", f"Extracted to: {game_root}")
         return game_root
@@ -2409,6 +2497,8 @@ class ArchiveExtractor:
         # Letting it fall through to the message regex below means a password-mentioning
         # error still counts, but a genuine FS error surfaces correctly instead of being
         # mislabelled "wrong password" (which would also burn every saved password).
+        if isinstance(e, ArchivePasswordError):
+            return True     # a CLI / py7zr verdict the extractor already classified
         if type(e).__name__ in ("RarWrongPassword", "PasswordRequired",
                                  "WrongPassword", "BadPassword", "PasswordError"):
             return True
@@ -2572,19 +2662,53 @@ class ArchiveExtractor:
     @staticmethod
     def _zip(archive: Path, dest: Path, log_fn, progress_fn=None, password: str = "",
              cancel_event: threading.Event | None = None):
+        # WinZip/7-Zip AES encryption (method 99 — what 7-Zip and WinZip produce for a
+        # password-protected zip) is beyond the stdlib, which only knows ZipCrypto:
+        # zipfile raises NotImplementedError even with the right password. Such archives
+        # go through the native 7-Zip CLI, with the same progress/cancel/password
+        # plumbing as .7z.
+        with zipfile.ZipFile(archive, "r") as zf:
+            aes = any(getattr(zi, "compress_type", 0) == 99 for zi in zf.infolist())
+        if aes:
+            ArchiveExtractor._zip_via_native_7z(archive, dest, log_fn, progress_fn, password,
+                                                cancel_event, reason="AES-encrypted ZIP")
+            return
         pwd_bytes = password.encode() if password else None
         with zipfile.ZipFile(archive, "r") as zf:
             names = zf.namelist()
             total = len(names)
             for i, name in enumerate(names):
                 ArchiveExtractor._check_cancel(cancel_event)
-                zf.extract(name, dest, pwd=pwd_bytes)
+                try:
+                    zf.extract(name, dest, pwd=pwd_bytes)
+                except NotImplementedError as e:
+                    # A method the header scan did not flag (Deflate64, PPMd, an AES
+                    # member without the method-99 marker, …): same native route.
+                    ArchiveExtractor._zip_via_native_7z(
+                        archive, dest, log_fn, progress_fn, password, cancel_event,
+                        reason=f"ZIP with a method the built-in extractor cannot read ({e})")
+                    return
                 ArchiveExtractor._check_cancel(cancel_event)
                 pct = int((i + 1) / total * 100) if total else 0
                 if progress_fn:
                     progress_fn(pct, name)
                 elif log_fn and total > 0 and i % max(1, total // 20) == 0:
                     log_fn("INFO", f"  {pct}%  {name}")
+
+    @staticmethod
+    def _zip_via_native_7z(archive: Path, dest: Path, log_fn, progress_fn, password: str,
+                           cancel_event, reason: str) -> None:
+        """Hand a zip the stdlib cannot read to the native 7-Zip CLI (the .7z route)."""
+        exe = ArchiveExtractor._find_native_7z()
+        if not exe:
+            raise RuntimeError(
+                f"{reason} — install 7-Zip (7zz) to extract it: {archive.name}\n"
+                "  macOS:    brew install sevenzip\n"
+                "  Windows:  https://www.7-zip.org/  (put 7z.exe on PATH)")
+        if log_fn:
+            log_fn("INFO", f"  zip: {reason} — using native {os.path.basename(exe)}.")
+        ArchiveExtractor._run_native_7z(exe, archive, dest, log_fn=log_fn, progress_fn=progress_fn,
+                                        password=password, cancel_event=cancel_event)
 
     @staticmethod
     def _find_rar_tool(log_fn=None) -> str | None:
@@ -2634,10 +2758,39 @@ class ArchiveExtractor:
         return None
 
     @staticmethod
+    def _cli_tail_lines(tail) -> list[str]:
+        """The retained CLI output as readable lines: \\r / backspace progress redraws
+        are flattened, blank and repeated segments dropped."""
+        out: list[str] = []
+        for raw in tail:
+            for seg in str(raw).split("\r"):
+                seg = re.sub(r"\s*\x08+\s*", " ", seg).strip()
+                if seg and (not out or out[-1] != seg):
+                    out.append(seg)
+        return out
+
+    @staticmethod
+    def _cli_excerpt(lines: list[str], limit: int = 8) -> str:
+        """Short excerpt for an error message: the lines that name a problem, else the
+        last few. Empty when there is nothing to show."""
+        hits = [l for l in lines
+                if re.search(r"error|warn|wrong|password|cannot|can't|unsupported|missing", l, re.I)]
+        shown = (hits or lines)[-limit:]
+        return ("\n  " + "\n  ".join(shown)) if shown else ""
+
+    @staticmethod
     def _run_extract_process(cmd: list[str], tool_name: str, log_fn=None, progress_fn=None,
                              cancel_event: threading.Event | None = None) -> None:
+        """Run a CLI extractor, streaming its progress; raise on a non-zero exit.
+        The last lines of its output are kept so the failure names the reason: a
+        wrong/missing password raises ArchivePasswordError, anything else
+        ArchiveToolError (carrying the exit code) — callers key their fallback on it."""
+        from collections import deque
         proc = subprocess.Popen(
             cmd,
+            # Closed stdin: an encrypted archive we passed no password for makes the tool
+            # prompt ("Enter password:") — it must fail, not wait for a keyboard.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2646,6 +2799,7 @@ class ArchiveExtractor:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         lines: queue.Queue[str] = queue.Queue()
+        tail: deque[str] = deque(maxlen=20)   # what the tool said last — for the error
 
         def _reader():
             try:
@@ -2665,6 +2819,7 @@ class ArchiveExtractor:
             nonlocal last_log_t
             if not line:
                 return
+            tail.append(line)
             if log_fn and (time.time() - last_log_t >= 5 or "error" in line.lower()):
                 log_fn("INFO", f"  extract: {line}")
                 last_log_t = time.time()
@@ -2698,7 +2853,14 @@ class ArchiveExtractor:
 
         code = proc.wait()
         if code != 0:
-            raise RuntimeError(f"{tool_name} exited with code {code} — extraction failed.")
+            readable = ArchiveExtractor._cli_tail_lines(tail)
+            excerpt = ArchiveExtractor._cli_excerpt(readable)
+            if ArchiveExtractor._CLI_PASSWORD_RE.search("\n".join(readable)):
+                raise ArchivePasswordError(
+                    f"{tool_name}: wrong or missing archive password (exit code {code}).{excerpt}")
+            raise ArchiveToolError(
+                f"{tool_name} exited with code {code} — extraction failed.{excerpt}",
+                returncode=code)
 
     @staticmethod
     def _first_volume(archive: Path) -> Path:
@@ -2901,6 +3063,29 @@ class ArchiveExtractor:
         return None
 
     @staticmethod
+    def _run_native_7z(exe: str, archive: Path, dest: Path, log_fn=None, progress_fn=None,
+                       password: str = "", cancel_event: threading.Event | None = None) -> None:
+        """Extract *archive* (any format the binary reads: 7z, zip, …) with the native
+        7-Zip CLI. -p is passed even when there is no password: without the switch
+        7-Zip prompts for one on an encrypted archive and blocks (with a closed stdin it
+        dies with exit 255 'Break signaled'), whereas an empty -p fails cleanly with
+        'Wrong password?' — and is a no-op on an unencrypted archive."""
+        cmd = [exe, "x", str(archive), f"-o{dest}", "-y", "-bsp1", f"-p{password}"]
+        ArchiveExtractor._run_extract_process(
+            cmd, os.path.basename(exe), log_fn=log_fn,
+            progress_fn=progress_fn, cancel_event=cancel_event)
+
+    @staticmethod
+    def _py7zr_password_failure(e: Exception) -> bool:
+        """py7zr has no wrong-password error. A bad key surfaces as corrupt data
+        (LZMAError 'Corrupt input data', CrcError), as an unreadable header (Bad7zFile —
+        or, in py7zr 1.1, TypeError 'Unknown field' on a header-encrypted archive) or
+        as PasswordRequired. Meaningful only when a password was actually supplied."""
+        if type(e).__name__ in ("LZMAError", "CrcError", "Bad7zFile", "PasswordRequired"):
+            return True
+        return isinstance(e, TypeError) and "unknown field" in str(e).lower()
+
+    @staticmethod
     def _sevenz(archive: Path, dest: Path, log_fn, progress_fn=None, password: str = "",
                 cancel_event: threading.Event | None = None):
         ArchiveExtractor._check_cancel(cancel_event)
@@ -2946,39 +3131,50 @@ class ArchiveExtractor:
                 try:
                     if log_fn:
                         log_fn("INFO", f"  7z: using native {os.path.basename(exe)} (fast).")
-                    cmd = [exe, "x", str(archive), f"-o{dest}", "-y", "-bsp1"]
-                    if password:
-                        cmd.append(f"-p{password}")
-                    ArchiveExtractor._run_extract_process(
-                        cmd, os.path.basename(exe), log_fn=log_fn,
-                        progress_fn=progress_fn, cancel_event=cancel_event
-                    )
+                    ArchiveExtractor._run_native_7z(exe, archive, dest, log_fn=log_fn,
+                                                    progress_fn=progress_fn, password=password,
+                                                    cancel_event=cancel_event)
                     return
                 except FileNotFoundError:
-                    pass    # disappeared between probe and exec
-                except ArchiveExtractionCancelled:
-                    raise
-                except RuntimeError as e:
+                    # Disappeared between probe and exec → the pure-Python route below.
                     if log_fn:
-                        log_fn("WARN", f"  7z: native CLI failed ({e}) — falling back to py7zr.")
+                        log_fn("WARN", "  7z: native CLI not runnable — falling back to py7zr.")
+                except ArchiveToolError as e:
+                    # py7zr only stands in for a CLI that could not run at all (7-Zip exit
+                    # 7 = command-line error, e.g. an old build rejecting a switch). After
+                    # a data or password error it would re-read the same bytes with the
+                    # same password and fail as LZMAError('Corrupt input data') — which
+                    # buried the wrong-password verdict under a generic failure, so the
+                    # next saved password was never tried.
+                    if e.returncode != 7:
+                        raise
+                    if log_fn:
+                        log_fn("WARN", f"  7z: native CLI rejected the command line ({e}) — "
+                                       "falling back to py7zr.")
             # Fallback: pure-Python py7zr (always available with our bundled deps).
             try:
                 import py7zr  # type: ignore
-                if log_fn:
-                    log_fn("INFO", "  7z: using py7zr (pure-Python — install p7zip / 7-Zip CLI for ~5x speedup).")
-                kwargs = {}
-                if password:
-                    kwargs["password"] = password
+            except ImportError:
+                py7zr = None
+            if py7zr is None:
+                raise RuntimeError(
+                    "Cannot extract 7z — install py7zr:  pip install py7zr\n"
+                    "or put 7z / 7zz / 7za on your PATH (Homebrew: brew install sevenzip)."
+                )
+            if log_fn:
+                log_fn("INFO", "  7z: using py7zr (pure-Python — install 7-Zip (7zz) for ~5x speedup).")
+            kwargs = {"password": password} if password else {}
+            try:
                 with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
                     sz.extractall(str(dest))
-                ArchiveExtractor._check_cancel(cancel_event)
-                return
-            except ImportError:
-                pass
-            raise RuntimeError(
-                "Cannot extract 7z — install py7zr:  pip install py7zr\n"
-                "or put 7z / 7zz / 7za on your PATH (Homebrew: brew install p7zip)."
-            )
+            except Exception as e:
+                # Only a failure WITH a password in play is a password verdict (see
+                # _py7zr_password_failure); without one the archive really is damaged.
+                if password and ArchiveExtractor._py7zr_password_failure(e):
+                    raise ArchivePasswordError(
+                        f"7z: wrong password? (py7zr: {type(e).__name__}: {str(e)[:200]})") from e
+                raise
+            ArchiveExtractor._check_cancel(cancel_event)
         finally:
             stop_evt.set()
             if poll_thread is not None:
@@ -2989,33 +3185,46 @@ class ArchiveExtractor:
     # ── helper ─────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _find_root(dest: Path) -> Path:
+    def _find_root(dest: Path, log_fn=None) -> Path:
         """Walk the extraction tree and return the PS5 game root.
 
         Priority order:
-          1. Any folder that directly contains sce_sys/param.json  (definitive)
+          1. The shallowest folder(s) that directly contain sce_sys/param.json
+             (definitive). Several at the same depth — a base game beside its patch
+             (<TID>-app/ + <TID>-patch/) or a multi-game bundle — yield their common
+             parent, so the caller's classification sees every game instead of
+             whichever one the directory listing happened to return first.
           2. Any folder whose name matches a PS5 title-ID pattern  (PPSA/CUSA + 5 digits)
           3. Single top-level folder unwrap (one level, legacy behaviour)
           4. The dest itself as fallback
         """
-        # BFS — check up to 4 levels deep so deeply nested archives still work
         from collections import deque
-        queue_dirs: deque[Path] = deque([dest])
+        # Level-by-level BFS (bounded): every folder of one depth is checked before
+        # descending, so side-by-side game roots are seen together.
+        level: list[Path] = [dest]
         visited = 0
-        while queue_dirs and visited < 200:
-            current = queue_dirs.popleft()
-            visited += 1
-            # Definitive PS5 game root marker
-            if (current / "sce_sys" / "param.json").exists():
-                return current
-            try:
-                subdirs = [p for p in current.iterdir() if p.is_dir()]
-            except PermissionError:
-                continue
-            queue_dirs.extend(subdirs)
+        while level and visited < 200:
+            visited += len(level)
+            hits = [d for d in level if (d / "sce_sys" / "param.json").exists()]
+            if len(hits) == 1:
+                return hits[0]
+            if hits:
+                common = Path(os.path.commonpath([str(h) for h in hits]))
+                if log_fn:
+                    log_fn("WARN", f"{len(hits)} game roots side by side in the archive "
+                                   f"({', '.join(h.name for h in hits)}) — using their parent "
+                                   f"'{common.name}' so every one gets classified.")
+                return common
+            nxt: list[Path] = []
+            for d in level:
+                try:
+                    nxt.extend(p for p in d.iterdir() if p.is_dir())
+                except PermissionError:
+                    continue
+            level = nxt
 
         # Second pass — title-ID folder name (e.g. PPSA00001-app, CUSA12345)
-        queue_dirs = deque([dest])
+        queue_dirs: deque[Path] = deque([dest])
         visited = 0
         while queue_dirs and visited < 200:
             current = queue_dirs.popleft()
@@ -5781,7 +5990,6 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         if not src.exists():
             messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
         it = self.edit_item
-        it.display_name = None   # re-capture the stable queue label from the new name
         op = getattr(it, "operation", "pack")
         if op == "unpack":
             if not (src.is_file() and src.suffix.lower() in (".ffpfsc", ".ffpfs")):
@@ -5824,6 +6032,9 @@ class JobEditMiniDialog(ctk.CTkToplevel):
                 it.title_id = parse_title_id(src) or "🖊"
             except Exception:
                 it.title_id = "🖊"
+        # Only now — every branch above has validated the new source — re-capture the
+        # stable queue label from the new name. A rejected edit keeps the old label.
+        it.display_name = None
         if it.status not in ("Done",):
             it.status = "Queued"
         self.destroy()
@@ -6012,18 +6223,32 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         try:
             while True:
                 kind, payload = self._q.get_nowait()
-                if kind == "list_out":
-                    self._on_list(payload)
-                elif kind == "list_err":
-                    self.status_var.set(f"Failed: {payload}")
-                elif kind == "ext_line":
-                    self._on_ext_line(payload)
-                elif kind == "ext_done":
-                    self._on_ext_done(payload)
+                try:
+                    if kind == "list_out":
+                        self._on_list(payload)
+                    elif kind == "list_err":
+                        self.status_var.set(f"Failed: {payload}")
+                    elif kind == "ext_line":
+                        self._on_ext_line(payload)
+                    elif kind == "ext_done":
+                        self._on_ext_done(payload)
+                except Exception as e:
+                    # A handler failure must not kill the poll loop — the dialog would
+                    # sit frozen mid-extraction. Show it in the status line and go on.
+                    try:
+                        self.status_var.set(f"Error: {e}")
+                        self.app.log("ERROR", f"PFS browser: '{kind}' handler failed: {e}")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
-        if self.winfo_exists():
-            self.after(120, self._poll)
+        finally:
+            # Re-arm no matter what happened above (the dialog may already be destroyed).
+            try:
+                if self.winfo_exists():
+                    self.after(120, self._poll)
+            except Exception:
+                pass
 
     def _on_list(self, text):
         line = next((l for l in text.splitlines() if l.startswith("PFSBROWSE_JSON:")), None)

@@ -132,6 +132,7 @@ It detects SSD versus HDD per drive, including USB SSDs that report no flash fla
 ## Special titles
 
 - **PlayGo / APR titles**: the app detects `playgo-chunk.dat`, injects the fakelib `.sprx` and an `AMPRIDX3` index, and signs before indexing so the index records the right sizes.
+- **HDR**: whether a game supports HDR is declared by its publisher in `sce_sys/param.json` (`attribute` bit 29); the console switches the TV to HDR only for titles that set it. fPKG builds keep that declaration by default (`--fpkg-hdr-flag auto|on|off`). To see it for a whole library: `python3 backend/cli.py --param-report <folder>` lists every folder, `.ffpfsc`, `.ffpfs` and `.pkg` with its title id, version and HDR flag, reading only the one file per game.
 - **Fake-sign**: a vendored, pure-Python `make_fself` (no keys, no native dependency) re-signs `eboot.bin`, `.elf`, `.prx`, and `.sprx` in place. Already-signed files are skipped, so a repeat run is safe.
 
 ## Requirements

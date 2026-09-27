@@ -172,6 +172,14 @@ internal static class Program
                 metadata_blocks = pkgObj.Fih.MetadataBlockCount,
                 naps_layout_size = pkgObj.Fih.NapsLayoutSize,
             },
+            // The CNT entries by name (sce_sys metadata such as icons, sound, trophy and
+            // PlayGo files live here, not in the inner image).
+            entries = pkgObj.Entries.Select(e => new InspectEntryDoc
+            {
+                name = e.Name ?? (EntryNames.IdToName.TryGetValue((EntryId)e.RawId, out var nm) ? nm : $"0x{e.RawId:X4}"),
+                id = e.RawId,
+                size = e.DataSize,
+            }).ToList(),
         };
         if (json) Console.WriteLine(JsonSerializer.Serialize(info, PkgToolJsonContext.Indented.InspectDoc));
         else
@@ -328,6 +336,14 @@ internal static class Program
         public ushort? sc_entry_count { get; set; }
         public bool finalized { get; set; }
         public InspectFihDoc? fih { get; set; }
+        public List<InspectEntryDoc>? entries { get; set; }
+    }
+
+    internal sealed class InspectEntryDoc
+    {
+        public string name { get; set; } = "";
+        public uint id { get; set; }
+        public uint size { get; set; }
     }
 
     internal sealed class InspectFihDoc
@@ -1532,7 +1548,10 @@ internal static class Program
                 //     hard-linked index from the source is replaced, never written through.
                 if (amprIndex && File.Exists(Path.Combine(autoStage, "fakelib", "libSceAmpr.sprx")))
                 {
-                    int rows = AmprIndex.Write(autoStage);
+                    // Every packaged file carries the build timestamp as its inode time (the
+                    // library's TimeStamp, the Unix epoch unless set): record exactly that.
+                    long pkgTime = (long)opts.TimeStamp.ToUniversalTime().Subtract(DateTime.UnixEpoch).TotalSeconds;
+                    int rows = AmprIndex.Write(autoStage, pkgTime);
                     Console.Error.WriteLine(rows > 0
                         ? $"  [ampr] rebuilt ampr_emu.index over the packed files ({rows:N0} file(s))"
                         : "  [ampr] nothing to index; ampr_emu.index left as it is");

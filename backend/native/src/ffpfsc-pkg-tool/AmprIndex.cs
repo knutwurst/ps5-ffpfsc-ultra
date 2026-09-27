@@ -63,8 +63,11 @@ internal static class AmprIndex
     /// <summary>Rebuild &lt;root&gt;/ampr_emu.index over the files under <paramref name="root"/>.
     /// Written to a temporary name and renamed into place, so an index that is a hard link
     /// into the user's source is replaced, never written through. Returns the record count
-    /// (0 = nothing indexed, no file written).</summary>
-    public static int Write(string root)
+    /// (0 = nothing indexed, no file written).
+    /// <paramref name="fixedMtime"/>: record this mtime for every file instead of the file's
+    /// own. A package gives every file the same inode time (the build timestamp), so that is
+    /// what the console reports for the installed files — and it keeps builds reproducible.</summary>
+    public static int Write(string root, long? fixedMtime = null)
     {
         root = Path.GetFullPath(root);
         var output = Path.Combine(root, FileName);
@@ -73,6 +76,8 @@ internal static class AmprIndex
         var seen = new HashSet<string>(StringComparer.Ordinal);
         Walk(root, root, rows, seen, output, tmp);
         if (rows.Count == 0) return 0;
+        if (fixedMtime is long fm)
+            for (int i = 0; i < rows.Count; i++) rows[i] = rows[i] with { Mtime = fm };
 
         rows.Sort((x, y) => CompareBytes(x.Key, y.Key));
 

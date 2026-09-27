@@ -13,8 +13,19 @@ fPKG: THE AMPR EMULATOR INDEX MATCHES THE PACKED FILES
   actually packed — fake-signing changes executable sizes, and some
   sources ship no index at all. The writer matches the reference builder
   of the emulator's author byte for byte; the source's own index is never
-  touched. --fpkg-no-ampr-index keeps the shipped one. The .ffpfsc path
-  uses the same key rules now (differs only for non-ASCII file names).
+  touched. Every entry records the package's own file time, so builds
+  stay reproducible. --fpkg-no-ampr-index keeps the shipped one. The
+  .ffpfsc path uses the same key rules now (differs only for non-ASCII
+  file names). A backported retail title packaged with the rebuilt index
+  installs and runs on a PS5.
+
+HDR: SEE WHAT EACH GAME DECLARES
+
+  --param-report <folder> lists every game folder, .ffpfsc, .ffpfs and
+  .pkg under a folder with its title id, version and whether its
+  param.json declares HDR support (attribute bit 29) — the flag the
+  console follows. Read-only; only that one file is decoded per game.
+  A game without the flag runs in SDR on the console, as published.
 
 SPACE CHECK AND DIAGNOSTICS DIALOG AGREE
 

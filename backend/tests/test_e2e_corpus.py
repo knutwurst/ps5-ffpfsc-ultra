@@ -112,7 +112,15 @@ class E2E:
         self.check(f"{name}.byte-identical", not (missing or extra or differ),
                    f"{len(a)} files; missing={missing[:5]} extra={extra[:5]} differ={differ[:5]}")
 
-    def expected_changes_only(self, name: str, ref: Path, got: Path, ampr: bool) -> None:
+    def cnt_entries(self, pkg: Path) -> dict[str, int]:
+        """name -> size of the package's CNT entries (sce_sys metadata lives there)."""
+        r = subprocess.run([str(self.tool()), "inspect", str(pkg), "--json"], capture_output=True, text=True)
+        try:
+            return {e["name"]: int(e["size"]) for e in json.loads(r.stdout).get("entries") or []}
+        except Exception:
+            return {}
+
+    def expected_changes_only(self, name: str, ref: Path, got: Path, ampr: bool, cnt: dict[str, int]) -> None:
         a, b = self.tree(ref), self.tree(got)
         problems, changed = [], []
         for rel, rp in sorted(a.items()):
@@ -123,7 +131,14 @@ class E2E:
                 if low.startswith("sce_sys/") and (base in SCE_SYS_DROPPABLE or base.endswith(".json")):
                     changed.append(f"dropped {rel}")
                     continue
-                problems.append(f"missing {rel}")
+                if low == "sce_sys/ext_info.dat":
+                    changed.append("dropped sce_sys/ext_info.dat (install sidecar; working packages leave it out)")
+                    continue
+                in_cnt = cnt.get(rel[len("sce_sys/"):]) if low.startswith("sce_sys/") else None
+                if in_cnt is not None and (in_cnt == rp.stat().st_size or low.endswith(".dds")):
+                    changed.append(f"in package metadata (CNT): {rel}")
+                    continue
+                problems.append(f"missing {rel}" + (f" (CNT size {in_cnt} != {rp.stat().st_size})" if in_cnt is not None else ""))
                 continue
             if rp.stat().st_size == gp.stat().st_size and self.sha(rp) == self.sha(gp):
                 continue
@@ -195,7 +210,7 @@ def main() -> int:
         x = subprocess.run([str(tool), "extract-inner", str(pkg), str(work / "C1x")], capture_output=True, text=True, errors="replace")
         (work / "C1-extract.log").write_text((x.stdout or "") + (x.stderr or ""), encoding="utf-8")
         if e.check("C1.extract", x.returncode == 0, (x.stderr or "")[-300:]):
-            e.expected_changes_only("C1", ref, work / "C1x", ampr)
+            e.expected_changes_only("C1", ref, work / "C1x", ampr, e.cnt_entries(pkg))
 
     # C2 — R → .ffpfsc → unpack
     rc, log = e.backend([str(ref), str(work / "C2"), "--pack", "--overwrite", "--temp-dir", str(tmp)], "C2-pack")

@@ -244,6 +244,100 @@ def list_pfs_image(image_path):
     }
 
 
+# param.json attribute bit 29: the application declares HDR support. The console switches
+# a TV set to "HDR when supported" into HDR only for titles that set it (verified on a PS5).
+PARAM_HDR_BIT = 0x20000000
+_REPORT_SKIP_DIRS = {"_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner", "__MACOSX"}
+
+
+def _read_param_json(src: Path) -> dict | None:
+    """sce_sys/param.json of a game folder, a .ffpfs/.ffpfsc image or a .pkg, read without
+    unpacking (only the blocks of that one file are decoded). None when there is none."""
+    import contextlib
+    import io
+    if src.is_dir():
+        pj = src / "sce_sys" / "param.json"
+        return json.loads(pj.read_text(encoding="utf-8", errors="replace")) if pj.is_file() else None
+    with tempfile.TemporaryDirectory(prefix="ffpfsc_param_") as td:
+        out = Path(td) / "x"
+        with contextlib.redirect_stdout(io.StringIO()):
+            if src.suffix.lower() == ".pkg":
+                import fpkg as _fpkg
+                entries = _fpkg.list_inner(src).get("entries") or []
+                member = next((e["path"] for e in entries if e.get("path", "").lower() == "sce_sys/param.json"), None)
+                if not member:
+                    return None
+                mf = Path(td) / "members.txt"
+                mf.write_text(member + "\n", encoding="utf-8")
+                _fpkg.extract_members(src, out, mf, on_line=lambda _l: None)
+            else:
+                listing = list_pfs_image(src)
+                cands = sorted((e["path"] for e in listing.get("entries") or []
+                                if e.get("type") == "file" and e.get("path", "").lower().endswith("sce_sys/param.json")),
+                               key=len)
+                if not cands:
+                    return None
+                member = cands[0]
+                extract_pfs_members(src, [member], out)
+        pj = out / member
+        return json.loads(pj.read_text(encoding="utf-8", errors="replace")) if pj.is_file() else None
+
+
+def _param_title(param: dict) -> str:
+    loc = param.get("localizedParameters") or {}
+    lang = loc.get("defaultLanguage") or "en-US"
+    return ((loc.get(lang) or {}).get("titleName") or next(
+        (v.get("titleName") for v in loc.values() if isinstance(v, dict) and v.get("titleName")), "") or "")
+
+
+def param_report(root: Path) -> int:
+    """Print, for every game under *root* (folders, .ffpfsc/.ffpfs images, .pkg files),
+    whether its param.json declares HDR support. Read-only; nothing is written next to
+    the sources."""
+    sources: list[Path] = []
+    if root.is_file() or (root / "sce_sys" / "param.json").is_file():
+        sources = [root]
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            d = Path(dirpath)
+            keep = []
+            for dn in sorted(dirnames):
+                if dn.startswith(".") or dn in _REPORT_SKIP_DIRS:
+                    continue
+                if (d / dn / "sce_sys" / "param.json").is_file():
+                    sources.append(d / dn)          # a game folder: listed, not descended
+                else:
+                    keep.append(dn)
+            dirnames[:] = keep
+            for fn in sorted(filenames):
+                if not fn.startswith(".") and fn.lower().endswith((".ffpfsc", ".ffpfs", ".pkg")):
+                    sources.append(d / fn)
+    if not sources:
+        print(f"[INFO] No games found under {root}")
+        return 0
+    rows, yes = [], 0
+    for src in sources:
+        try:
+            param = _read_param_json(src)
+        except Exception as e:
+            param = None
+            print(f"[WARN] {src.name}: {e}")
+        if not param:
+            rows.append(("?", "", "", "", src.name))
+            continue
+        attr = int(param.get("attribute") or 0)
+        hdr = bool(attr & PARAM_HDR_BIT)
+        yes += hdr
+        rows.append(("yes" if hdr else "no", param.get("titleId", ""), param.get("contentVersion", ""),
+                     _param_title(param), src.name))
+    print(f"{'HDR':4} {'TITLE ID':10} {'VERSION':10} TITLE  (SOURCE)")
+    for hdr, tid, ver, title, name in rows:
+        print(f"{hdr:4} {tid:10} {ver:10} {title}  ({name})")
+    print(f"\n{len(rows)} game(s): {yes} declare HDR, {sum(r[0] == 'no' for r in rows)} do not, "
+          f"{sum(r[0] == '?' for r in rows)} unreadable.")
+    return 0
+
+
 def extract_pfs_members(image_path, members, dest_dir) -> int:
     """Extract the given files / directory subtrees from a .ffpfs/.ffpfsc into dest_dir,
     decompressing only their blocks. A member naming a directory extracts every file
@@ -1507,6 +1601,9 @@ def main() -> None:
     parser.add_argument("--fake-sign-first", action="store_true",
                         help="Before packing a game FOLDER, fake-sign its executables in "
                              "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
+    parser.add_argument("--param-report", type=str, default=None, metavar="PATH",
+                        help="List every game under PATH (folders, .ffpfsc/.ffpfs, .pkg) with its title "
+                             "id, version and whether param.json declares HDR support, then exit. Read-only.")
     parser.add_argument("--list-image", type=str, default=None, metavar="IMG",
                         help="PFS BROWSE: print the directory tree of a .ffpfs/.ffpfsc as JSON "
                              "(only metadata blocks are decompressed), then exit.")
@@ -1525,6 +1622,9 @@ def main() -> None:
     # A .pkg (fPKG) browses the same way: the bundled tool lists / extracts the inner
     # image block-wise (list-inner / extract-inner --members) and answers in the same
     # JSON shape and progress-line format, so the GUI dialog needs no second path.
+    if args.param_report:
+        sys.exit(param_report(Path(args.param_report).expanduser().resolve()))
+
     if args.list_image:
         img = Path(args.list_image).resolve()
         try:

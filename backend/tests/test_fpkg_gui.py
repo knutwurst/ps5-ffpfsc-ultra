@@ -87,7 +87,10 @@ try:
     if pkg:
         ie = m.GameItem.from_fpkg_extract(pkg, output_path=str(OUT / "ext"))
         cmd2, *_ = app.build_command(ie)
-        ok("build_command.fpkg-extract", "--fpkg-extract" in cmd2 and str(OUT / "ext") in cmd2, " ".join(cmd2[-4:]))
+        # the extract lands in its own "<package> [extracted]" subfolder below the chosen output
+        _ext_out = next((a for a in cmd2 if a.startswith(str(OUT / "ext"))), "")
+        ok("build_command.fpkg-extract", "--fpkg-extract" in cmd2 and _ext_out.endswith(" [extracted]")
+           and Path(_ext_out).parent == OUT / "ext", " ".join(cmd2[-4:]))
     # 3) Pack dialog, .pkg format, FOLDER source → identity pre-filled from param.json; add goes through
     #    the shared classifier (async scan) and lands as an fpkg-build job carrying that identity
     dlg = m.PackDialog(app, source=HBT, fmt="pkg"); root.update()
@@ -294,12 +297,30 @@ try:
     w = m.CLIWorker(app, fi3, cmd3w, cwd3, out3w, tmp3); w.start_time = time.time() - 30
     w.output_path = str(dummy2)          # what the marker line sets
     found = w._find_output()
-    ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000].pkg"
-       and Path(w.output_path).exists() and not dummy2.exists(), f"{found} {w.output_path}")
+    # the organized name already exists from the step above: the rename must keep BOTH files
+    # (never replace an earlier build) and give the new one a " (2)" suffix
+    ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000] (2).pkg"
+       and Path(w.output_path).exists() and not dummy2.exists() and renamed.exists(), f"{found} {w.output_path}")
     ok("organize.title-cleanup", m.canonical_game_title("a large retail title™") == "a large retail title"
        and m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")
        == ("Example Quest Deluxe Edition [PPSA99098] [v01.200.007]", "Example Quest Deluxe Edition [PPSA99098] [v01.200].ffpfsc"),
        str(m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")))
+    # throwaway-extract detection is anchored to the app's own scratch roots: a user folder that
+    # merely carries the name "_extracted" is never treated as something the app may delete
+    _tmp_root = Path(app.temp_var.get()); _own = _tmp_root / "_extracted" / "game-a" / "sub"
+    _foreign = S / "library" / "_extracted" / "game-b" / "sub"
+    for d in (_own, _foreign): d.mkdir(parents=True, exist_ok=True)
+    class _Fake: pass
+    _ia = _Fake(); _ia.path = str(_own); _ib = _Fake(); _ib.path = str(_foreign)
+    ok("cleanup.extract-dir.own-scratch", app._extract_dir_for_item(_ia) == (_tmp_root / "_extracted" / "game-a").resolve(),
+       str(app._extract_dir_for_item(_ia)))
+    ok("cleanup.extract-dir.foreign-never", app._extract_dir_for_item(_ib) is None, str(app._extract_dir_for_item(_ib)))
+    # a pool drive's own root is not scratch: the router puts scratch under <pool>/_ffpfsc_temp
+    _pool = S / "pool"; _pool.mkdir(exist_ok=True); _ic = _Fake(); _ic.path = str(_pool / "_ffpfsc_temp" / "_extracted" / "g")
+    (_pool / "_ffpfsc_temp" / "_extracted" / "g").mkdir(parents=True, exist_ok=True)
+    app.temp_pool = [str(_pool)]
+    ok("cleanup.extract-dir.pool-subfolder", app._extract_dir_for_item(_ic) is not None, str(app._extract_dir_for_item(_ic)))
+    app.temp_pool = []
     # off: a single-archive folder whose parent is the output folder must not mirror into itself; elsewhere it still does
     conv = OUT / "convert"; conv.mkdir(exist_ok=True); shutil.copy2(ZP, conv / ZP.name)
     bi2 = m.GameItem.from_bundle(conv, conv / ZP.name, []); bi2.output_compressed = True; bi2.auto_organize = False; bi2.output_path = OUT

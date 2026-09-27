@@ -108,13 +108,18 @@ if sys.platform == "darwin":
     APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT"
 else:
     APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PS5_FFPFSC_ULTRA_BIZKUT"
+# Tests and headless drivers point this at a scratch folder so they never touch the
+# real profile (settings, queue, passwords, reports).
+_ENV_APP_DIR = os.environ.get("PS5_FFPFSC_APP_DIR", "").strip()
+if _ENV_APP_DIR:
+    APP_DIR = Path(_ENV_APP_DIR)
 
 # One-time migration after the PRO → ULTRA rename: if the new settings dir doesn't
 # exist yet but the old "…_PRO_BIZKUT" one does, move it over so saved settings,
 # queue, history, passwords and drive config carry across without the user noticing.
 _LEGACY_APP_DIR = APP_DIR.parent / "PS5_FFPFSC_PRO_BIZKUT"
 try:
-    if not APP_DIR.exists() and _LEGACY_APP_DIR.is_dir():
+    if not _ENV_APP_DIR and not APP_DIR.exists() and _LEGACY_APP_DIR.is_dir():
         APP_DIR.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(_LEGACY_APP_DIR), str(APP_DIR))
 except Exception:
@@ -332,8 +337,13 @@ def archive_set_ondisk_size(archive: Path) -> int:
             r'(\.part\d+\.rar|\.r\d{2,}|\.7z\.\d+|\.zip\.\d+|\.z\d+|\.\d{3}|\.rar|\.zip|\.7z)$',
             '', archive.name, flags=re.I)
         total = 0
+        # Anchor the match to the archive's own volume naming, so "Game Update.part1.rar"
+        # or "Game.nfo" next to "Game.part1.rar" are not counted into this set.
+        vol_re = re.compile(re.escape(base)
+                            + r"\.(part\d+\.rar|r\d{2,}|7z\.\d{3}|zip\.\d{3}|z\d{2}|\d{3}|rar|zip|7z)$",
+                            re.I)
         for p in archive.parent.iterdir():
-            if p.is_file() and p.name.startswith(base):
+            if p.is_file() and vol_re.match(p.name):
                 try:
                     total += p.stat().st_size
                 except OSError:
@@ -1310,21 +1320,43 @@ def save_history(items):
     HISTORY_FILE.write_text(json.dumps(items[-100:], indent=2), encoding="utf-8")
 
 
+_SETTINGS_UNREADABLE = False      # settings.json exists but does not parse
+_SETTINGS_CORRUPT_COPY: Path | None = None   # where the unreadable file was moved
+
+
 def load_settings() -> dict:
+    """Parsed settings.json, or {} when it does not exist. A file that exists but does
+    not parse is flagged so save_settings() keeps it aside instead of overwriting the
+    whole profile (queue, passwords, drives) with the single key being saved."""
+    global _SETTINGS_UNREADABLE
     ensure_app_dir()
     if SETTINGS_FILE.exists():
         try:
-            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            _SETTINGS_UNREADABLE = False
+            return data if isinstance(data, dict) else {}
         except Exception:
-            pass
+            _SETTINGS_UNREADABLE = True
     return {}
 
 
 def save_settings(data: dict) -> None:
+    """Merge *data* into settings.json atomically: write settings.json.tmp, then
+    os.replace, so a crash or power loss mid-write never leaves a torn file."""
+    global _SETTINGS_CORRUPT_COPY
     ensure_app_dir()
     existing = load_settings()
+    if _SETTINGS_UNREADABLE:
+        try:
+            keep = SETTINGS_FILE.with_name(f"settings.json.corrupt-{int(time.time())}")
+            SETTINGS_FILE.replace(keep)
+            _SETTINGS_CORRUPT_COPY = keep
+        except Exception:
+            pass
     existing.update(data)
-    SETTINGS_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp = SETTINGS_FILE.with_name("settings.json.tmp")
+    tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    os.replace(tmp, SETTINGS_FILE)
 
 
 def is_first_run() -> bool:
@@ -3613,8 +3645,9 @@ class CLIWorker(threading.Thread):
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",     # a non-UTF-8 file name must not kill the reader
                 bufsize=1,
-                universal_newlines=True,
                 env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 # Own session/process group on POSIX so cancel/close can kill the
@@ -3628,12 +3661,17 @@ class CLIWorker(threading.Thread):
             #    inside the blocking stdout loop and never fired during silent
             #    phases (e.g. the final-image write), making the app look hung.
             def _ticker():
+                _last_sample = 0.0
                 while not _ticker_stop.wait(5):
                     t = time.time()
-                    try:
-                        self.temp_peak_size = max(self.temp_peak_size, get_folder_size(self.temp_dir))
-                    except Exception:
-                        pass
+                    # Sizing the temp tree is a stat storm on the drive mkpfs is busy
+                    # with; sample it every 30 s, not on every tick.
+                    if t - _last_sample >= 30:
+                        _last_sample = t
+                        try:
+                            self.temp_peak_size = max(self.temp_peak_size, get_folder_size(self.temp_dir))
+                        except Exception:
+                            pass
                     if t - self.last_heartbeat >= 30:
                         self.last_heartbeat = t
                         elapsed = format_duration(t - self.start_time)
@@ -3758,15 +3796,27 @@ class CLIWorker(threading.Thread):
                 self.app.finish(False, f"Backend exited but no {expected} was created.", self.last_cmd_str)
                 return
 
+            # From here on the output exists and the job IS a success: bookkeeping
+            # errors are logged, never turned into a failure (that would trigger the
+            # failure cleanup and a full rebuild on the next START).
             # Bundle: copy the extra files (DLCs etc.) next to the new .ffpfsc / .pkg.
-            if self.operation not in ("unpack", "fpkg-extract"):
-                self._copy_bundle_siblings()
+            try:
+                if self.operation not in ("unpack", "fpkg-extract"):
+                    self._copy_bundle_siblings()
+            except Exception as e:
+                self.app.log("WARN", f"Bundle copy failed: {e}")
             # ShadowMount compatibility checks (a .pkg is installed, not mounted —
             # the fPKG path has its own validate checklist in the backend log).
-            if not self._is_fpkg and self.operation != "unpack":
-                for w in self._validate_shadowmount():
-                    self.app.log("WARN", w)
-            self._write_report(True)
+            try:
+                if not self._is_fpkg and self.operation != "unpack":
+                    for w in self._validate_shadowmount():
+                        self.app.log("WARN", w)
+            except Exception as e:
+                self.app.log("WARN", f"Compatibility check skipped: {e}")
+            try:
+                self._write_report(True)
+            except Exception as e:
+                self.app.log("WARN", f"Could not write the result report: {e}")
             # NOTE: history is recorded on the MAIN thread in the done_q handler
             # (add_history mutates Tk widgets, which are not thread-safe).
             success_msg = {"unpack": "Extraction completed successfully.",
@@ -3778,6 +3828,13 @@ class CLIWorker(threading.Thread):
             try:
                 _raw_append(f"[GUI ERROR] {e}\n")
                 _flush_raw_log()
+            except Exception:
+                pass
+            # The reader died, not the backend: stop the backend tree before reporting,
+            # or it keeps writing into scratch that the failure cleanup is about to remove.
+            try:
+                if self.proc is not None and self.proc.poll() is None:
+                    self._terminate()
             except Exception:
                 pass
             self.app.finish(False, str(e), self.last_cmd_str)
@@ -4238,7 +4295,8 @@ class CLIWorker(threading.Thread):
             return False
 
         if self.operation == "unpack":
-            expected = self.output_dir / f"{self.item.path.stem}_extracted"
+            # build_command already points output_dir at "<stem>_extracted".
+            expected = self.output_dir
             if expected.exists() and expected.is_dir():
                 self.output_path = str(expected)
                 self.final_size = get_folder_size(expected)
@@ -6263,14 +6321,16 @@ class App:
         # If a job is running, confirm and stop it (kill the whole backend tree)
         # before quitting — otherwise the backend + mkpfs Pool keep running headless.
         try:
-            if self.current_process and self.current_process.poll() is None:
+            proc_alive = bool(self.current_process and self.current_process.poll() is None)
+            if proc_alive or self._job_active():
                 if not messagebox.askyesno(
                     "Quit?", "A job is still running.\n\nQuit and stop it?"
                 ):
                     return
                 self.cancel_requested = True
                 self.extract_cancel_event.set()
-                _kill_process_tree(self.current_process)
+                if proc_alive:
+                    _kill_process_tree(self.current_process)
         except Exception:
             pass
         self._save_window_geometry()
@@ -6316,12 +6376,11 @@ class App:
         if self._saved_block_size in ("auto-fit", "4096", "8192", "16384", "32768"):
             self._saved_block_size = "auto"
             save_settings({"block_size": "auto"})
-        # Global, auto-tried archive password list. Seed once with the most
-        # common PS5-saved archive password so it never has to be typed again. `is None`
-        # (not falsiness) so an intentionally-emptied list is not re-seeded.
+        # Global, auto-tried archive password list — empty until the user adds entries
+        # (Settings → Archives). Saved lists from earlier versions are kept as they are.
         self._saved_passwords = settings.get("archive_passwords")
         if self._saved_passwords is None:
-            self._saved_passwords = ["EXAMPLE-PASSWORD"]
+            self._saved_passwords = []
             save_settings({"archive_passwords": self._saved_passwords})
         # Folder bundles: copy DLC/extra files next to the .ffpfsc (default on).
         self._saved_copy_siblings = settings.get("copy_bundle_siblings", True)
@@ -6435,7 +6494,7 @@ class App:
         self._warm_drive_types()
         self.password_var = tk.StringVar()
         # Live copy of the global auto-tried password list (backs the settings editor).
-        self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", ["EXAMPLE-PASSWORD"]))
+        self.archive_passwords: list[str] = list(getattr(self, "_saved_passwords", []))
         # Extra temp/scratch drives (a "pool" added to the primary temp field). When more
         # than one fast drive is available the router can keep pass 1 SSD↔SSD for big
         # archive games by extracting the source to one and building the image on another.
@@ -7485,6 +7544,11 @@ class App:
             messagebox.showerror("Path not found",
                                   f"This path does not exist:\n{src}")
             return
+        # One-shot "scan this folder for images to unpack" flag: whoever set it (the
+        # Converter batch action, an image browse) meant THIS add. Consume it here so it
+        # can never leak into the next folder the user drops.
+        _unpack_folder = bool(self.unpack_mode_var.get())
+        self.unpack_mode_var.set(False)
 
         # ── Existing uncompressed .ffpfs — a PACK source (re-pack to .ffpfsc, or copy
         #    when the format toggle is set to uncompressed). Read in place, no extraction. ─
@@ -7514,10 +7578,9 @@ class App:
                 self.status_update("Ready", f".ffpfsc queued for fPKG build: {src.name}",
                                     "Ready", 0, 0, "00:00", "—", "—")
                 return
-            item = GameItem.from_pfs_image(src)
+            item = GameItem.from_pfs_image(src)   # carries operation="unpack" itself
             self.queue.append(item)
             self.update_queue_box(select_item=item)
-            self.unpack_mode_var.set(True)
             self.log("OK", f".ffpfsc image queued for extraction: {src.name}  [{format_size(item.size)}]")
             self.status_update("Ready",
                                 f".ffpfsc image queued for extraction: {src.name}",
@@ -7552,7 +7615,7 @@ class App:
             return
 
         # ── Folder of existing PFS images to unpack ──────────────────────────
-        if src.is_dir() and self.unpack_mode_var.get():
+        if src.is_dir() and _unpack_folder:
             self.status_update("Scanning", f"Scanning {src.name} for PFS images…",
                                 "Scanning Files", 0, 0, "00:00", "—", "—")
             self.log("INFO", f"Scanning folder for .ffpfs/.ffpfsc images: {src}")
@@ -8057,7 +8120,8 @@ class App:
             self.log(level, msg)
 
         mode = self.drive_mode_var.get() if getattr(self, "drive_mode_var", None) else "auto"
-        out_str = self.output_var.get().strip()
+        _jo = self._job_output_dir(item)
+        out_str = str(_jo) if _jo else ""
         size = _build_size_of(item)
         size_is_estimate = False
         # Encrypted-header archives (rar -hp / 7z with encrypted file names) report
@@ -8158,6 +8222,13 @@ class App:
             item._image_only_on_temp = image_only
             item._extract_on_pool = on_pool
 
+        def _scratch(d):
+            """App-owned scratch on pool drive *d*: the primary temp folder as configured;
+            an EXTRA pool entry gets its own '_ffpfsc_temp' subfolder, so cleanup, the
+            Spotlight marker and mkpfs scratch never land in the user's drive root."""
+            d = Path(d)
+            return d if d == temp_base_p else d / "_ffpfsc_temp"
+
         def _is_ssd(d):
             # Pure speed test for a pool drive (independent of the same-drive-rw policy):
             # used to keep the inner image / SSD↔SSD legs on actual flash, never a slow HDD
@@ -8183,7 +8254,7 @@ class App:
         if size > 0 and fit_full and not size_is_estimate:
             ssd_full = [(d, f) for d, f in fit_full if _is_ssd(d)]
             best = max(ssd_full or fit_full, key=lambda t: t[1])[0]
-            _set(best, Path(best) / "_extracted", False, False)
+            _set(_scratch(best), _scratch(best) / "_extracted", False, False)
             if _drive_cache_key(best) != _drive_cache_key(temp_base_p):
                 _plog("INFO", f"Auto: {item.name} (~{szs}): whole scratch on pool drive {best}.")
             return item._build_root
@@ -8200,7 +8271,7 @@ class App:
                            if _is_ssd(d) and _drive_cache_key(d) != img_dev and f >= int(size)]
                 if ext_fit:
                     ext_dir = max(ext_fit, key=lambda t: t[1])[0]  # most-free OTHER SSD
-                    _set(img_dir, Path(ext_dir) / "_extracted", True, True)
+                    _set(_scratch(img_dir), _scratch(ext_dir) / "_extracted", True, True)
                     _plog("INFO", f"Auto: {item.name} (~{szs}): extract source → {ext_dir}; "
                                      f"inner image → {img_dir}; final → {out_dir}. Pass 1 stays SSD↔SSD.")
                     return item._build_root
@@ -8211,7 +8282,7 @@ class App:
         if size > 0 and img_fit and out_free >= out_split_need:
             ssd_img = [(d, f) for d, f in img_fit if _is_ssd(d)]
             img_dir = max(ssd_img or img_fit, key=lambda t: t[1])[0]  # prefer an SSD for the image
-            _set(img_dir, spread_root, True, False)          # source extracts to the big output drive
+            _set(_scratch(img_dir), spread_root, True, False)   # source extracts to the big output drive
             _plog("INFO", f"Auto: {item.name} (~{szs}): 1) extract source → output drive "
                              f"({out_dir}); 2) build inner image → {temp_drive_label(img_dir)} "
                              f"({img_dir}); spool auto-routed. No same-drive read+write.")
@@ -8228,16 +8299,56 @@ class App:
                           f"nor the output drive (~{format_size(out_full)}) — the space gate will skip/abort it.")
         return temp_root
 
+    def _scratch_parent_roots(self, item=None) -> set:
+        """Resolved folders under which THIS app creates its '_extracted' /
+        '_ffpfsc_extract' scratch: the temp folder, every temp-pool entry (and its
+        '_ffpfsc_temp' subfolder), the output folder(s) and the item's recorded build
+        dirs. A folder the user happened to name '_extracted' anywhere else is not ours."""
+        cands = []
+        try:
+            cands.append(self.temp_var.get().strip())
+            cands.append(self.output_var.get().strip())
+        except Exception:
+            pass
+        try:
+            # Every configured pool entry, not only the device-deduplicated set the router
+            # uses: a folder that was scratch under an earlier configuration stays ours.
+            pool = list(self._temp_pool_dirs()) + [str(x) for x in (getattr(self, "temp_pool", None) or [])]
+            for d in pool:
+                cands.append(str(d))
+                cands.append(str(Path(d) / "_ffpfsc_temp"))
+        except Exception:
+            pass
+        if item is not None:
+            for attr in ("output_path", "_build_temp", "_build_root"):
+                v = getattr(item, attr, None)
+                if v:
+                    cands.append(str(v))
+        roots = set()
+        for c in cands:
+            if not c:
+                continue
+            try:
+                roots.add(Path(c).resolve())
+            except Exception:
+                pass
+        return roots
+
     def _extract_dir_for_item(self, item):
         """The extract subdir THIS item was unpacked into (under a temp '_extracted' or
-        an output-drive '_ffpfsc_extract' folder), or None for a plain (non-extracted)
-        source. Used so cleanup only ever removes this item's own data."""
+        an output-drive '_ffpfsc_extract' folder the app created), or None for a plain
+        (non-extracted) source. Used so cleanup only ever removes this item's own data.
+        The scratch folder's parent must be one of the app's own roots — a library the
+        user named '_extracted' is never treated as throwaway."""
         try:
             src = Path(getattr(item, "path", "") or "").resolve()
         except Exception:
             return None
+        roots = self._scratch_parent_roots(item)
         for parent in src.parents:
             if parent.name in ("_extracted", "_ffpfsc_extract"):
+                if parent not in roots and parent.parent not in roots:
+                    return None
                 try:
                     return parent / src.relative_to(parent).parts[0]
                 except Exception:
@@ -8366,78 +8477,6 @@ class App:
                 pass
         self._run_cleanup(_work)
 
-    def _extract_and_queue_archive(self, archive: Path):
-        """Extract *archive* (background thread) with live progress, then queue.
-        (Currently unreachable — the queue path _extract_queued_item is used instead.)"""
-        extract_root = self._resolve_extract_root(GameItem.from_archive(archive))
-
-        self.log("INFO", f"Extracting archive: {archive.name}")
-        self.cancel_requested = False
-        self.extract_cancel_event.clear()
-        self.cancel_btn.configure(state="normal")
-        self.status_update("Extracting", f"Unpacking {archive.name}…  0%",
-                            "Extracting", 0, 0, "00:00", "—", "—")
-        # Show Logs tab so the user can watch per-file lines
-        try:
-            self.bottom_tabs.set("Logs")
-        except Exception:
-            pass
-
-        # Throttle: only update status every 2 % to avoid flooding the queue
-        _last_pct = [-1]
-        def _progress(pct: int, filename: str):
-            if pct - _last_pct[0] >= 2 or pct >= 100:
-                _last_pct[0] = pct
-                short = Path(filename).name[:50]
-                self.status_update(
-                    "Extracting",
-                    f"Unpacking {archive.name}…  {pct}%\n{short}",
-                    "Extracting", pct, pct * ARCHIVE_EXTRACT_OVERALL_PCT / 100.0, "—", "—", "—"
-                )
-
-        candidate_passwords = self._candidate_passwords()  # built on the Tk thread
-
-        def worker():
-            try:
-                extracted_root = ArchiveExtractor.extract_with_passwords(
-                    archive, extract_root,
-                    candidate_passwords,
-                    log_fn=self.log, progress_fn=_progress,
-                    cancel_event=self.extract_cancel_event
-                )
-                if self.cancel_requested:
-                    raise ArchiveExtractionCancelled("Archive extraction cancelled by user.")
-                self.status_update("Scanning", "Extraction done — scanning for games…",
-                                    "Scanning Files", 98, 98, "—", "—", "—")
-                kind, paths = self._classify_extracted_payload(extracted_root, archive.name)
-                if kind == "pfs":
-                    # Tk vars are not thread-safe — marshal the .set() to the main loop.
-                    self.root.after(0, lambda: self.unpack_mode_var.set(True))
-                    if len(paths) == 1:
-                        self.scan_q.put(("ok", GameItem.from_pfs_image(paths[0])))
-                    else:
-                        self.scan_q.put(("pfs_found", paths))
-                elif kind == "disk":
-                    if len(paths) == 1:
-                        self.scan_q.put(("ok", GameItem.from_exfat(paths[0])))
-                    else:
-                        self.scan_q.put(("exfat_found", paths))
-                elif len(paths) == 1:
-                    try:
-                        self.scan_q.put(("ok", GameItem(paths[0])))
-                    except Exception as e:
-                        self.scan_q.put(("error", str(e)))
-                else:
-                    self.scan_q.put(("multi_found", paths))
-            except ArchiveExtractionCancelled as exc:
-                self.log("WARN", str(exc))
-                self.scan_q.put(("cancelled", str(exc)))
-            except Exception as exc:
-                self.log("ERROR", f"Extraction failed: {exc}")
-                self.scan_q.put(("error", str(exc)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _candidate_passwords(self, item=None) -> list[str]:
         """Ordered, de-duplicated password candidates for an extraction:
         1) the explicit single-field password (left panel / settings),
@@ -8515,10 +8554,6 @@ class App:
                 if self.cancel_requested:
                     raise ArchiveExtractionCancelled("Archive extraction cancelled by user.")
                 kind, paths = self._classify_extracted_payload(extracted_root, archive.name)
-                if kind == "pfs":
-                    # Tk vars are not thread-safe — marshal the .set() to the main loop.
-                    self.root.after(0, lambda: self.unpack_mode_var.set(True))
-
                 payload_items = [self._item_from_payload_path(kind, path) for path in paths]
                 primary = payload_items[0]
                 self._copy_item_payload(item, primary)
@@ -9144,9 +9179,17 @@ class App:
         target = pkg_path.with_name(want)
         try:
             if target.exists():
-                target.unlink()
+                # Never replace a file that is already there (a second build of the same
+                # title with other settings is the common case) — keep both.
+                stem, ext = os.path.splitext(want)
+                n = 2
+                while target.exists():
+                    target = pkg_path.with_name(f"{stem} ({n}){ext}")
+                    n += 1
+                self.log("WARN", f"Auto-organize: {want} already exists — keeping both, "
+                                 f"the new build is named {target.name}")
             pkg_path.rename(target)
-            self.log("INFO", f"Auto-organize: renamed {pkg_path.name} → {want}")
+            self.log("INFO", f"Auto-organize: renamed {pkg_path.name} → {target.name}")
             return target
         except Exception as e:
             self.log("WARN", f"Auto-organize: could not rename {pkg_path.name} → {want}: {e}")
@@ -9207,6 +9250,7 @@ class App:
             self.queue[1:] = []   # keep index-0 (running game), clear the rest
         else:
             self.queue.clear()
+        self._queue_missing_saved = []   # a deliberate clear also drops parked entries
         self.update_queue_box()
 
     # GameItem fields that hold a Path (everything else is str/int/None and JSON-safe).
@@ -9234,6 +9278,7 @@ class App:
                         d[k] = v
                     # anything else (unexpected) is dropped rather than risk a crash
                 items.append(d)
+            items += list(getattr(self, "_queue_missing_saved", None) or [])
             save_settings({"queue": items})
         except Exception:
             pass
@@ -9243,6 +9288,7 @@ class App:
         are skipped; a mid-run status is reset to pending. Best-effort. Enables saving
         afterwards (sets _queue_restored)."""
         saved = []
+        missing = []   # saved entries whose source is not reachable right now
         try:
             saved = load_settings().get("queue") or []
         except Exception:
@@ -9264,8 +9310,18 @@ class App:
                 # The source must still be on disk to be packable/unpackable.
                 probe = getattr(obj, "archive_path", None) or getattr(obj, "path", None)
                 if not probe or not Path(probe).exists():
+                    # Unreachable right now (drive unplugged, share down): keep the saved
+                    # entry so it is not lost when the queue is next persisted.
                     skipped += 1
+                    missing.append(d)
                     continue
+                # Emu files injected into the user's own folder by a run that never
+                # finished (crash, force-quit): restore the folder now.
+                if getattr(obj, "ampr_injected", None) or getattr(obj, "ampr_index_path", None):
+                    try:
+                        self._ampr_cleanup(obj)
+                    except Exception:
+                        pass
                 obj.artwork = None   # re-detected lazily when the row is selected
                 if getattr(obj, "status", "") in ("Running", "Extracting", "Patching"):
                     obj.status = "Pending Extract" if getattr(obj, "archive_path", None) else "Queued"
@@ -9273,11 +9329,20 @@ class App:
                 restored += 1
             except Exception:
                 skipped += 1
+        self._queue_missing_saved = missing   # re-persisted by _save_queue, untouched
         self._queue_restored = True   # from here on, queue mutations persist
         if self.queue:
             self.update_queue_box()
         if restored:
             self.log("INFO", f"Restored {restored} item(s) from the saved queue.")
+        if missing:
+            names = ", ".join(str(m.get("display_name") or m.get("name") or m.get("path") or "?")
+                              for m in missing[:5])
+            self.log("WARN", f"{len(missing)} saved queue item(s) sit on a drive that is not mounted "
+                             f"right now; they stay parked until it returns: {names}")
+        if _SETTINGS_CORRUPT_COPY:
+            self.log("WARN", f"settings.json could not be read and was kept as "
+                             f"{_SETTINGS_CORRUPT_COPY.name}; the profile was re-created with defaults.")
         if skipped:
             self.log("WARN", f"Saved queue: {skipped} item(s) skipped (source path missing/invalid).")
 
@@ -9585,7 +9650,6 @@ class App:
                 out = base   # keep the subfolder; backend names <title_id><ext> inside
         temp = Path(self.temp_var.get().strip())
         backend = backend_base_dir()
-        cli_py = Path("backend") / "cli.py"  # macOS-ready pathlib form
         cli_py = backend / "cli.py"
         pycmd = get_backend_python_command()
         if not pycmd:
@@ -9640,6 +9704,11 @@ class App:
 
         # ── fPKG EXTRACT job (built package -> /app0 folder) ─────────────────
         if op == "fpkg-extract":
+            # Never dump /app0 straight into a library folder: the extract gets its own
+            # "<package> [extracted]" subfolder (the dialog pre-names it that way when
+            # the global Output is empty).
+            if not out.name.endswith(" [extracted]"):
+                out = out / f"{sanitize_filename(Path(item.path).stem)} [extracted]"
             head = (pycmd + ["placeholder", str(out)] if getattr(sys, "frozen", False)
                     else pycmd + ["-u", str(cli_py), "placeholder", str(out)])
             cmd = head + ["--fpkg-extract", str(item.path)]
@@ -9722,7 +9791,10 @@ class App:
                 pout = game                                  # patch the .ffpfsc in place
             else:
                 stem = game.stem if game.suffix.lower() == ".ffpfsc" else game.name
-                pout = out / f"{sanitize_filename(stem)} [patched].ffpfsc"
+                stem = re.sub(r"\s*\[patched\]\s*$", "", stem, flags=re.I)
+                tag = " [patched].ffpfsc"
+                budget = max(8, SHADOWMOUNT_NAME_LIMIT - len(tag.encode("utf-8")))
+                pout = out / (_truncate_to_bytes(sanitize_filename(stem), budget).rstrip() + tag)
             try:
                 pout.parent.mkdir(parents=True, exist_ok=True)
             except Exception:
@@ -9747,6 +9819,11 @@ class App:
             _bs = self.block_size_var.get()
             if _bs and _bs != "auto":
                 cmd += ["--block-size", _bs]
+            if self.verify_output_var.get():
+                cmd.append("--verify")
+            # Same spill target as a pack job: a big patched image can park its pass-2
+            # spool on the output drive instead of failing on a tight temp drive.
+            cmd += ["--spool-fallback-dir", str(pout.parent)]
             if self.verbose_var.get():
                 cmd.append("--verbose")
             return cmd, backend, pout.parent, temp
@@ -9932,6 +10009,7 @@ class App:
         target_dir = Path(item.path) / "fakelib"
         target_dir.mkdir(exist_ok=True)
         item._ampr_injected = []
+        item.ampr_injected = []        # persisted twin: survives a crash or force-quit
         for fname in AMPR_SPRX_FILES:
             src, dst = ampr_dir / fname, target_dir / fname
             if not src.exists():
@@ -9943,6 +10021,7 @@ class App:
             try:
                 shutil.copy2(src, dst)
                 item._ampr_injected.append(dst)
+                item.ampr_injected.append(str(dst))
                 self.log("INFO", f"AMPR: injected {fname}")
             except Exception as exc:
                 self.log("WARN", f"AMPR: failed to inject {fname}: {exc}")
@@ -10011,10 +10090,20 @@ class App:
 
         out_r, tmp_r = output.resolve(), output_tmp.resolve()
         _SKIP = {_key("/app0/ampr_emu.index"), _key("/app0/ampr_emu.index.tmp")}
+        # OS junk (.DS_Store, ._*, __MACOSX, Thumbs.db, …) is stripped by the backend
+        # before packing, so it must not be indexed either — same rule as MkPFS.
+        try:
+            _bk = backend_base_dir()
+            if str(_bk) not in sys.path:
+                sys.path.insert(0, str(_bk))
+            from mkpfs.utils import is_ignored_name as _is_junk_name
+        except Exception:
+            def _is_junk_name(n: str) -> bool:
+                return n in (".DS_Store", "Thumbs.db", "desktop.ini", "__MACOSX") or n.startswith("._")
         seen, rows = {}, []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort(key=str.lower)
-            filenames.sort(key=str.lower)
+            dirnames[:] = sorted((d for d in dirnames if not _is_junk_name(d)), key=str.lower)
+            filenames = sorted((f for f in filenames if not _is_junk_name(f)), key=str.lower)
             for fname in filenames:
                 fpath = Path(dirpath) / fname
                 try:
@@ -10032,8 +10121,13 @@ class App:
         try:
             _write(rows)
             item._ampr_index_path = output
+            item.ampr_index_path = str(output)   # persisted twin for crash recovery
             self.log("INFO", f"AMPR: built index → ampr_emu.index  ({len(rows):,} files)")
         except Exception as exc:
+            try:
+                output_tmp.unlink(missing_ok=True)   # never leave a half-written .tmp to be packed
+            except Exception:
+                pass
             self.log("WARN", f"AMPR: index build failed: {exc}")
 
     def _fake_sign_folder_inproc(self, folder: Path) -> None:
@@ -10104,8 +10198,8 @@ class App:
         in temp and are removed wholesale by the normal teardown, so they're left alone."""
         if item is None or getattr(item, "_from_archive", False):
             return
-        injected = getattr(item, "_ampr_injected", None)
-        idx = getattr(item, "_ampr_index_path", None)
+        injected = getattr(item, "_ampr_injected", None) or getattr(item, "ampr_injected", None)
+        idx = getattr(item, "_ampr_index_path", None) or getattr(item, "ampr_index_path", None)
         if not injected and not idx:
             return
         for p in (injected or []):
@@ -10126,6 +10220,8 @@ class App:
                 pass
         item._ampr_injected = []
         item._ampr_index_path = None
+        item.ampr_injected = []
+        item.ampr_index_path = None
         self.log("INFO", f"AMPR: cleaned injected emu files from {Path(item.path).name}.")
 
     def _oom_retry(self, item) -> bool:
@@ -10137,13 +10233,13 @@ class App:
         MAX_RETRIES = 2
         tries = getattr(item, "_oom_retries", 0)
         prev = getattr(item, "_cpu_retry_override", None)
-        if prev is not None:
-            new_cpu = prev - 1
-        else:
-            base = self.cpu_count_var.get()
-            new_cpu = (base - 1) if (base and base > 0) else 1
-        new_cpu = max(1, new_cpu)
-        if tries >= MAX_RETRIES or (prev is not None and new_cpu >= prev):
+        base = self.cpu_count_var.get()
+        # The core count the failed run actually used: an earlier retry's override, else
+        # the configured count (AUTO = 0 is unknown here; the backend capped it, so 1 is
+        # the only guaranteed reduction).
+        current = prev if prev is not None else (base if (base and base > 0) else None)
+        new_cpu = max(1, (current - 1) if current is not None else 1)
+        if tries >= MAX_RETRIES or (current is not None and new_cpu >= current):
             self.log("ERROR", f"Still out of memory at {new_cpu} core(s) — giving up on "
                               f"{item.name}. Try a lower compression level or smaller block size.")
             return False
@@ -10253,14 +10349,16 @@ class App:
         if getattr(self, "_browser_only", False):
             return   # browser-only launch (double-clicked a .ffpfsc) — don't prompt on the hidden window
         NAMES = ("_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner")
+        # Tk variables are read on the main thread only; the scan thread gets a snapshot.
+        bases0 = [self.temp_var.get().strip(), self.output_var.get().strip()]
+        try:
+            bases0 += [str(p) for p in self._temp_pool_dirs()]   # extra scratch SSDs too
+        except Exception:
+            pass
 
         def _scan():
             targets, seen = [], set()
-            bases = [self.temp_var.get().strip(), self.output_var.get().strip()]
-            try:
-                bases += [str(p) for p in self._temp_pool_dirs()]   # extra scratch SSDs too
-            except Exception:
-                pass
+            bases = list(bases0)
             # Drives from the history: each recorded output path is a folder we WROTE to,
             # so its parent may still hold our _ffpfsc_temp from a run that never cleaned up.
             try:
@@ -10314,13 +10412,16 @@ class App:
                     total += get_folder_size(p)
                 except Exception:
                     pass
-            if targets and total >= 64 * 1024**2:   # 64 MiB threshold (was 1 GiB — too permissive)
+            if targets and total >= 64 * 1024**2 and not self._job_active():   # 64 MiB threshold
                 self.root.after(0, lambda: self._prompt_startup_sweep(targets, total))
 
         threading.Thread(target=_scan, daemon=True).start()
 
     def _prompt_startup_sweep(self, targets, total):
         try:
+            if self._job_active():
+                self.log("INFO", "Startup sweep skipped — a job is already working in those folders.")
+                return
             n = len(targets)
             listing = "\n".join(f"  • {p}" for p in targets[:8]) + ("\n  • …" if n > 8 else "")
             msg = (f"Found ~{format_size(total)} of leftover working data from a previous "
@@ -10331,6 +10432,8 @@ class App:
             def _work():
                 freed = 0
                 for p in targets:
+                    if self._job_active():   # a job started while the prompt was open
+                        break
                     try:
                         sz = get_folder_size(p)
                         shutil.rmtree(str(p), ignore_errors=True)
@@ -10384,6 +10487,20 @@ class App:
         self.batch_counter_var.set(
             f"Game {current}/{self._batch_total}  |  ✓ {self._batch_done}  ✗ {self._batch_failed}"
         )
+
+    def _job_output_dir(self, item) -> Path | None:
+        """The folder this job writes to: its own output_path when set (the per-job
+        snapshot taken when it was queued), else the global Output field. The space
+        gate and the drive placement must look at THIS drive, not at whatever the
+        Output field says today."""
+        op = getattr(item, "output_path", None)
+        if op:
+            try:
+                return Path(str(op))
+            except Exception:
+                pass
+        g = (self.output_var.get() or "").strip()
+        return Path(g) if g else None
 
     def _space_gate(self, item, out_dir):
         """Place the run on a drive sized for its REAL footprint (sets item._build_root /
@@ -10502,9 +10619,9 @@ class App:
         #    footprint, then go/skip/cancel. Skip cleans any partial scratch and keeps
         #    the batch moving; a big game that fits the HDD is routed there, not skipped.
         try:
-            op = self.output_var.get().strip()
+            od = self._job_output_dir(item)
+            op = str(od) if od else ""
             if op and getattr(item, "operation", "pack") != "unpack":
-                od = Path(op)
                 gate = self._space_gate(item, od)
                 bt = getattr(item, "_build_temp", None)
                 if bt is not None:
@@ -10636,15 +10753,10 @@ class App:
                 self.status_update("Scanning", "Finishing the source scan, then starting…",
                                     "Scanning Files", 0, 0, "00:00", "—", "—")
                 return
-            self.pending_start = True
-            self.add_source_to_queue()
-            # A synchronous path (single file in the Source field) queues immediately —
-            # honor the Start intent now. Async scans leave the queue empty and let the
-            # scan_q handler consume pending_start instead; failed adds clear it (below),
-            # so it can't linger and silently auto-start a later, unrelated add.
-            if self.queue and self.pending_start:
-                self.pending_start = False
-                self.start()
+            # Nothing queued: do not fall back to the last-used source path (it is not
+            # shown anywhere) — just say so.
+            self.log("INFO", "Nothing to start — add a game folder, archive or image first.")
+            self.status_update("Idle", "Queue is empty.", "", 0, 0, "00:00", "—", "—")
             return
 
         # A FRESH Start re-arms previously failed/skipped/cancelled jobs so they're retried
@@ -10674,7 +10786,7 @@ class App:
         #    footprint and decide go/skip/cancel BEFORE any extraction or packing, so a
         #    too-big archive is judged on its true extracted size (from headers) rather
         #    than extracted onto a full SSD and only then failing. ─────────────────────
-        gate = self._space_gate(item, Path(self.output_var.get().strip()))
+        gate = self._space_gate(item, self._job_output_dir(item) or Path(self.output_var.get().strip()))
         if gate == "cancel":
             if self._batch_running:
                 self._batch_running = False
@@ -10844,21 +10956,33 @@ class App:
         if not temp_dir.exists():
             messagebox.showinfo("Clear Temp", "Temp folder does not exist. Nothing to clear.")
             return
-        size = get_folder_size(temp_dir)
-        if size == 0:
-            messagebox.showinfo("Clear Temp", "Temp folder is already empty.")
+        # Only this app's own scratch folders — never everything inside a folder the
+        # user may have pointed at a drive root or a shared directory.
+        def _ours(p: Path) -> bool:
+            return p.is_dir() and (p.name in ("_extracted", "_ffpfsc_extract", "_ffpfsc_inner",
+                                              "_patch_game", "_patch_files")
+                                   or _is_app_tmp_dir(p.name) or p.name.startswith("ffpfsc_spool_"))
+        try:
+            targets = [p for p in temp_dir.iterdir() if _ours(p)]
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot read the temp folder:\n{e}")
             return
+        size = sum(get_folder_size(p) for p in targets)
+        if not targets or size == 0:
+            messagebox.showinfo("Clear Temp", "No working data of this app in the temp folder.")
+            return
+        listing = "\n".join(f"  • {p.name}" for p in targets[:8]) + ("\n  • …" if len(targets) > 8 else "")
         ok = messagebox.askyesno(
             "Clear Temp Files",
-            f"Delete all contents of:\n{temp_dir}\n\n"
+            f"Delete this app's working data inside:\n{temp_dir}\n\n{listing}\n\n"
             f"Size to free: {format_size(size)}\n\n"
-            "Are you sure? This cannot be undone."
+            "Other files in that folder are left alone. Continue?"
         )
         if not ok:
             return
         try:
-            shutil.rmtree(str(temp_dir), ignore_errors=True)
-            temp_dir.mkdir(parents=True, exist_ok=True)
+            for p in targets:
+                shutil.rmtree(str(p), ignore_errors=True)
             messagebox.showinfo("Clear Temp", f"Temp folder cleared. Freed {format_size(size)}.")
             self.log("OK", f"Temp folder cleared: {temp_dir} ({format_size(size)} freed)")
         except Exception as e:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import re
 import sys
 import time
@@ -1039,7 +1040,42 @@ def file_count(path: Path) -> int:
         return 0
 
 
-def parse_title_id(path: Path) -> str:
+class FolderStats:
+    """Everything GameItem needs about a folder, gathered in ONE directory walk instead of
+    six recursive globs (size, file count, param.json candidates, artwork) — on a
+    hub-throttled USB drive each walk of a 100k-file game costs seconds."""
+    ARTWORK_NAMES = ("icon0.png", "pic0.png", "pic1.png")
+
+    def __init__(self, path: Path):
+        self.size = 0
+        self.count = 0
+        self.param_jsons: list[Path] = []
+        first_art: dict[str, Path] = {}
+        try:
+            if path.is_file():
+                self.size, self.count = path.stat().st_size, 1
+            else:
+                for dirpath, _dirnames, filenames in os.walk(path):
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            st = os.stat(fp)
+                        except OSError:
+                            continue
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        self.size += st.st_size
+                        self.count += 1
+                        if fn == "param.json":
+                            self.param_jsons.append(Path(fp))
+                        elif fn in self.ARTWORK_NAMES and fn not in first_art:
+                            first_art[fn] = Path(fp)
+        except Exception:
+            pass
+        self.artwork = next((first_art[n] for n in self.ARTWORK_NAMES if n in first_art), None)
+
+
+def parse_title_id(path: Path, param_jsons: list | None = None) -> str:
     # Prefer the game's OWN folder name, then its param.json; only fall back to the
     # full path last — a title id in a PARENT directory (e.g. a "[CUSA12345]" dump
     # folder) must not win over the game's own id.
@@ -1047,7 +1083,7 @@ def parse_title_id(path: Path) -> str:
     if m:
         return m.group(1).upper()
     try:
-        for p in path.rglob("param.json"):
+        for p in (param_jsons if param_jsons is not None else path.rglob("param.json")):
             text = p.read_text(encoding="utf-8", errors="ignore")
             m = TITLE_RE.search(text)
             if m:
@@ -3466,10 +3502,11 @@ class GameItem:
         self.archive_path: Path | None = None   # set for archive placeholders
         self.operation  = "pack"
         self.name       = guess_game_name(path)
-        self.title_id   = parse_title_id(path)
-        self.size       = folder_size(path)
-        self.files      = file_count(path)
-        self.artwork    = find_artwork(path)
+        _st             = FolderStats(path)      # one walk for size/count/param.json/artwork
+        self.title_id   = parse_title_id(path, _st.param_jsons)
+        self.size       = _st.size
+        self.files      = _st.count
+        self.artwork    = _st.artwork if path.is_dir() else None
         self.status     = "Queued"
         self.source_kind    = "inplace"   # a folder is packed in place — no second copy
         self.extracted_size = self.size   # already extracted; honest size for space math
@@ -7823,17 +7860,17 @@ class App:
 
         # ── Single archive file — queue as placeholder, extract on its turn ─────
         if src.is_file() and src.suffix.lower() in (".zip", ".rar", ".7z"):
-            item = GameItem.from_archive(src)
-            self.queue.append(item)
-            self.update_queue_box(select_item=item)
-            self.log("OK", f"Archive queued: {src.name}  [{format_size(item.size)}]")
-            self.status_update("Ready",
-                                f"Archive queued — will extract when compression starts: {src.name}",
-                                "Ready", 0, 0, "00:00", "—", "—")
-            # If the header is encrypted and no saved password worked, ask now — so the
-            # auto routing knows the real extracted size and can place this on the SSD.
-            self._resolve_archive_password(item)
-            self.update_queue_box(select_item=item)
+            # Reading the headers of a many-volume set takes seconds on a slow drive: do it
+            # on the scan thread; the main loop queues the item ("archive" message below).
+            self.status_update("Scanning", f"Reading archive headers: {src.name}…",
+                                "Scanning Files", 0, 0, "00:00", "—", "—")
+
+            def _read_archive(a=src):
+                try:
+                    self.scan_q.put(("archive", GameItem.from_archive(a)))
+                except Exception as e:
+                    self.scan_q.put(("error", f"Could not read {a.name}: {e}"))
+            self._launch_scan(_read_archive)
             return
 
         # ── Folder of existing PFS images to unpack ──────────────────────────
@@ -9244,12 +9281,22 @@ class App:
         if not p:
             return None
         p = Path(str(p))
+        # A source without readable metadata stays that way until it changes: remember the
+        # miss (keyed by path + mtime) instead of re-reading — for an image that means one
+        # backend process per preview refresh on the UI thread.
+        try:
+            _miss_key = (str(p), p.stat().st_mtime_ns)
+        except OSError:
+            _miss_key = None
+        if _miss_key is not None and getattr(item, "_identity_miss", None) == _miss_key:
+            return None
         ident = None
         try:
             if p.is_dir():
-                has_pj = (p / "sce_sys" / "param.json").is_file()
+                pj = p / "sce_sys" / "param.json"
+                has_pj = pj.is_file()
                 title = guess_game_name(p) if has_pj else ""
-                tid = parse_title_id(p)
+                tid = parse_title_id(p, [pj] if has_pj else None)
                 tid = "" if tid in ("Unknown", "") else tid
                 ver = guess_game_version(p)
                 if title or tid:
@@ -9269,6 +9316,11 @@ class App:
                 ident["version"] = _m.group(1) if _m else ""
             try:
                 item._identity = ident
+            except Exception:
+                pass
+        elif _miss_key is not None:
+            try:
+                item._identity_miss = _miss_key
             except Exception:
                 pass
         return ident
@@ -11458,7 +11510,22 @@ class App:
         try:
             while True:
                 status, payload = self.scan_q.get_nowait()
-                if status == "ok":
+                if status == "archive":
+                    item = payload
+                    self.queue.append(item)
+                    self.update_queue_box(select_item=item)
+                    self.log("OK", f"Archive queued: {item.archive_path.name}  [{format_size(item.size)}]")
+                    self.status_update("Ready",
+                                        f"Archive queued — will extract when compression starts: {item.archive_path.name}",
+                                        "Ready", 0, 0, "00:00", "—", "—")
+                    # If the header is encrypted and no saved password worked, ask now — so
+                    # the auto routing knows the real extracted size and can use the SSD.
+                    self._resolve_archive_password(item)
+                    self.update_queue_box(select_item=item)
+                    if self.pending_start:
+                        self.pending_start = False
+                        self.start()
+                elif status == "ok":
                     item = payload
                     self.queue.append(item)
                     self.update_queue_box(select_item=item)   # applies the remembered format (may make it an fPKG job)

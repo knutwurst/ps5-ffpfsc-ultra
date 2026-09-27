@@ -50,6 +50,9 @@ m.ensure_app_dir()
 root = m._CTkDnD(); root.withdraw()
 app = m.App(root)
 app.queue.clear()
+# Never touch the user's drives: every job in this driver uses scratch temp/output folders.
+(S / "temp").mkdir(parents=True, exist_ok=True)
+app.temp_var.set(str(S / "temp")); app.output_var.set(str(OUT))
 res = []
 def ok(name, cond, detail=""):
     res.append((name, bool(cond), detail))
@@ -307,7 +310,7 @@ try:
        str(m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")))
     # throwaway-extract detection is anchored to the app's own scratch roots: a user folder that
     # merely carries the name "_extracted" is never treated as something the app may delete
-    _tmp_root = Path(app.temp_var.get()); _own = _tmp_root / "_extracted" / "game-a" / "sub"
+    _tmp_root = S / "temp"; app.temp_var.set(str(_tmp_root)); _own = _tmp_root / "_extracted" / "game-a" / "sub"
     _foreign = S / "library" / "_extracted" / "game-b" / "sub"
     for d in (_own, _foreign): d.mkdir(parents=True, exist_ok=True)
     class _Fake: pass
@@ -401,6 +404,7 @@ try:
     ok("copy.landed-and-source-gone", len(moved) == 1 and not copy_src.exists(),
        f"moved={[p.name for p in moved]} src_exists={copy_src.exists()}")
 except Exception:
+    traceback.print_exc()   # the summary keeps one line; the full trace goes to stderr
     res.append(("driver", False, traceback.format_exc()))
 finally:
     # restore the user's real settings.json (the driver mutated queue + defaults)

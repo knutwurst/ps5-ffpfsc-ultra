@@ -1,7 +1,8 @@
 # ffpfsc-pkg-tool — source
 
 `backend/native/ffpfsc-pkg-tool` is a self-contained, single-file .NET 9 executable
-(macOS arm64) that the app calls for everything fPKG: `build`, `extract-inner`,
+(macOS arm64), with its one native library `Magick.Native-Q8-arm64.dll.dylib` beside it,
+that the app calls for everything fPKG: `build`, `extract-inner`,
 `extract-outer`, `list-inner`, `inspect`, `validate`, `version`. This folder holds the part
 we wrote:
 
@@ -23,11 +24,13 @@ the end of `Program.cs`. It dates from when the binary was published trimmed (wh
 reflection-based System.Text.Json off and crashed the anonymous types the commands used with
 "Reflection-based serialization has been disabled"); trimming is off today, the context stays.
 - `PkgTool.csproj` — the publish settings: self-contained single file, ReadyToRun,
-  no trimming (Magick.NET's Prospero-facing path is reflection-driven; trimming pruned
+  the native ImageMagick library next to the executable rather than bundled (a bundled
+  one is unpacked into `~/.net/ffpfsc-pkg-tool/<hash>/` on first run, a new ~27 MB folder
+  per build that nothing removes; the tool deletes folders left by older builds), no trimming (Magick.NET's Prospero-facing path is reflection-driven; trimming pruned
   the types the DDS conversion needs). Magick.NET is required — LibProsperoPkg calls it
   to convert `sce_sys/icon0.png` into the `sce_sys/icon0.dds` CNT entry the console needs
   to launch the app; without the DDS, an fPKG installs but never starts (CE-100096-6 /
-  CE-100022-5). Adds ~30 MB to the binary, unavoidable.
+  CE-100022-5). Adds ~30 MB (mostly the native library), unavoidable.
 
 The fPKG logic itself is LibProsperoPkg, which is GPL-3.0-or-later; see
 `../../LICENSE.LibProsperoPkg`, `../../NOTICE.LibProsperoPkg` and `../../NOTICE.fpkg`.
@@ -45,20 +48,23 @@ source is kept in the repo.
    `PkgTool.csproj` (BCnEncoder.Net 2.3.0, CommunityToolkit.HighPerformance 8.4.0,
    Magick.NET-Q8-AnyCPU 14.15.0 including the native ImageMagick library); the publish
    step restores them.
-3. Publish:
+3. From the repository root, build and install both files into `backend/native/`:
 
    ```bash
-   dotnet publish PkgTool.csproj -c Release -r osx-arm64 --self-contained true -o out
+   ./BUILD_PKG_TOOL.sh
    ```
 
-4. Copy `out/ffpfsc-pkg-tool` to `backend/native/ffpfsc-pkg-tool` (keep it executable).
-5. Prove it before shipping — the whole harness can run against any candidate binary:
+   It runs `dotnet publish PkgTool.csproj -c Release -r osx-arm64 --self-contained true -o out`
+   and replaces `backend/native/ffpfsc-pkg-tool` and `backend/native/Magick.Native-Q8-arm64.dll.dylib`
+   by delete + copy (copying over a signed binary in place can make macOS kill it on launch).
+   Neither file is tracked in git; `BUILD_MACOS_APP.sh` runs the script first.
+4. Prove it before shipping — the whole harness can run against any candidate binary:
 
    ```bash
    FFPFSC_PKG_TOOL=/path/to/out/ffpfsc-pkg-tool python backend/tests/test_fpkg_pipelines.py
    ```
 
-`bin/`, `obj/` and `out/` are ignored by git; `lib/` is tracked.
+`bin/`, `obj/` and `out/` are ignored by git, and so are the two built files in `backend/native/`; `lib/` is tracked.
 
 ## Browsing a package: `list-inner` and `extract-inner --members`
 

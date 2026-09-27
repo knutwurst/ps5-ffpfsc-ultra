@@ -11,6 +11,9 @@ if [[ -z "${VIRTUAL_ENV:-}" ]] \
     exit 1
 fi
 
+# The fPKG helper is built from source (backend/native/src), never taken from git.
+./BUILD_PKG_TOOL.sh
+
 python3 -m pip install -r requirements-build.txt
 python3 -m pip install ./backend/unrar
 (cd backend/unrar && python3 setup.py build_ext --inplace)

@@ -190,7 +190,10 @@ def sha(p: Path) -> str:
 
 # ── individual tests ────────────────────────────────────────────────────────
 def test_environment(r: Runner):
-    r.check("tool.present", TOOL.exists(), f"{TOOL}", f"missing: {TOOL}")
+    r.check("tool.present", TOOL.exists(), f"{TOOL}", f"missing: {TOOL} (build it: ./BUILD_PKG_TOOL.sh)")
+    magick = TOOL.parent / "Magick.Native-Q8-arm64.dll.dylib"
+    r.check("tool.magick-native", magick.is_file(), f"{magick.name} next to the tool",
+            f"missing: {magick} — icon conversion would fail (build it: ./BUILD_PKG_TOOL.sh)")
     if TOOL.exists():
         rc, out = r.run_tool(["version"])
         r.check("tool.runs", rc == 0, out.strip().splitlines()[0] if out else "", out)

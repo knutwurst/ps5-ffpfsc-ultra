@@ -3,7 +3,27 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.17  (current)
+  v1.1.18  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG HELPER: NO MORE COPIES UNDER ~/.net
+
+  The fPKG helper used to unpack its ImageMagick library into
+  ~/.net/ffpfsc-pkg-tool/ on first run, a new folder of about 27 MB for
+  every version, never removed. The library now ships next to the
+  helper and is loaded from there; nothing is unpacked. On its first
+  run the helper deletes the folders older versions left behind (not
+  while another copy of it is running).
+
+BUILD: THE HELPER IS BUILT FROM SOURCE
+
+  The helper binary is no longer tracked in git; every version added
+  about 52 MB to the repository. BUILD_MACOS_APP.sh builds it first with
+  the new BUILD_PKG_TOOL.sh, which needs the .NET SDK 9 or newer. The
+  release app contains it as before.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.17
 ────────────────────────────────────────────────────────────────────────
 
 fPKG: THE PUBLISHING RULES FOR sce_sys, APPLIED WHILE STAGING

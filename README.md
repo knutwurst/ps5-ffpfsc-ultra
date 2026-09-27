@@ -153,7 +153,7 @@ python3 PS5_FFPFSC_ULTRA_v1.0.py
 
 ## Build a standalone app
 
-Run the build script from the repository root inside an activated virtual environment (it refuses to run outside one and installs the pinned inputs from `requirements-build.txt`). It produces `dist/PS5 FFPFSC ULTRA.app`, the release archive `dist/PS5-FFPFSC-ULTRA-<version>-macos-arm64.zip` and its `.sha256`:
+Run the build script from the repository root inside an activated virtual environment (it refuses to run outside one and installs the pinned inputs from `requirements-build.txt`). It needs the [.NET SDK](https://dotnet.microsoft.com/download) 9 or newer: the fPKG helper is not tracked in git, the script builds it from `backend/native/src/ffpfsc-pkg-tool` with `./BUILD_PKG_TOOL.sh` first. Run that script on its own to use `.pkg` features or the tests from a source checkout. The build produces `dist/PS5 FFPFSC ULTRA.app`, the release archive `dist/PS5-FFPFSC-ULTRA-<version>-macos-arm64.zip` and its `.sha256`:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate

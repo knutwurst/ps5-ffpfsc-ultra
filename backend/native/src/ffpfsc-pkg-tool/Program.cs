@@ -19,13 +19,14 @@ namespace PkgTool;
 
 internal static class Program
 {
-    const string ToolVersion = "1.1.17";
+    const string ToolVersion = "1.1.18";
 
     static int Main(string[] args)
     {
         try
         {
             RedirectMagickNative();                    // must run before ANY Magick.NET call
+            RemoveOldBundleExtractions();
             if (args.Length == 0) { PrintUsage(); return 2; }
             return args[0].ToLowerInvariant() switch
             {
@@ -1068,13 +1069,45 @@ internal static class Program
         try { return File.Exists(p) && new FileInfo(p).LinkTarget != null; } catch { return false; }
     }
 
+    /// <summary>Builds up to 1.1.17 unpacked their native library into
+    /// $DOTNET_BUNDLE_EXTRACT_BASE_DIR (default ~/.net)/ffpfsc-pkg-tool/&lt;bundle hash&gt;/ — one
+    /// folder of about 27 MB per build, never removed. This build unpacks nothing, so the whole
+    /// folder is ours to delete. Skipped while another copy of the tool runs: that may be an
+    /// older build still loading from its folder.</summary>
+    static void RemoveOldBundleExtractions()
+    {
+        bool trace = Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1";
+        try
+        {
+            var baseRoot = Environment.GetEnvironmentVariable("DOTNET_BUNDLE_EXTRACT_BASE_DIR");
+            if (string.IsNullOrEmpty(baseRoot))
+                baseRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".net");
+            var root = Path.Combine(baseRoot, "ffpfsc-pkg-tool");
+            if (!Directory.Exists(root)) return;
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            int others = 0;
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName(self.ProcessName))
+                using (p) if (p.Id != self.Id) others++;
+            if (others > 0)
+            {
+                if (trace) Console.Error.WriteLine($"[trace] old bundle folders kept: {others} other tool process(es) running");
+                return;
+            }
+            Directory.Delete(root, recursive: true);
+            if (trace) Console.Error.WriteLine("[trace] removed old bundle folders under " + root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            if (trace) Console.Error.WriteLine("[trace] could not remove old bundle folders: " + ex.Message);
+        }
+    }
+
     /// <summary>Direct Magick.NET's DllImport lookups for <c>Magick.Native-Q8-arm64.dll</c>
     /// at the runtimes/osx-arm64/native/ file the runtime extracts alongside the exe.
     /// Magick's P/Invoke uses the bare "Magick.Native-Q8-arm64.dll" name (Windows-style),
     /// which .NET on macOS maps to Magick.Native-Q8-arm64.dll.dylib — but only when the
-    /// file lives on the default probing path. Inside a self-contained single-file exe
-    /// the native asset lands at <c>&lt;exe base&gt;/runtimes/osx-arm64/native/</c>, which
-    /// is not on that path. We resolve it once, ourselves.</summary>
+    /// file lives on the default probing path, which a single-file exe does not set up for
+    /// it. We resolve it once, ourselves, from the executable's own directory.</summary>
     static bool _magickRedirected;
     static void RedirectMagickNative()
     {
@@ -1082,22 +1115,21 @@ internal static class Program
         _magickRedirected = true;
         bool trace = Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1";
         var baseDir = AppContext.BaseDirectory ?? Environment.CurrentDirectory;
-        // Where a self-contained single-file app's natives can be (IncludeNativeLibrariesFor
-        // SelfExtract=true): next to the exe, or extracted under
-        // $DOTNET_BUNDLE_EXTRACT_BASE_DIR (default ~/.net)/<AppName>/<bundle hash>/runtimes/<RID>/native/.
-        // The probe is limited to exactly that layout — one level of bundle hashes, one level
-        // of RIDs — and never scans $TMPDIR: an earlier version enumerated the whole temp tree
-        // (5.6 s with 200k directories, and the GUI points TMPDIR at the game temp drive) and
-        // would have loaded any matching dylib it found there.
-        var appName = Assembly.GetEntryAssembly()?.GetName().Name ?? "ffpfsc-pkg-tool";
-        var extRoot = Environment.GetEnvironmentVariable("DOTNET_BUNDLE_EXTRACT_BASE_DIR")
-                      ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".net");
-        var extApp = Path.Combine(extRoot, appName);
+        // The ImageMagick library ships next to the executable (IncludeNativeLibrariesFor
+        // SelfExtract=false, so nothing is unpacked at run time). Probe only this build's own
+        // directory — the executable's real location and the base directory — plus their
+        // runtimes/<RID>/native/ (the NuGet layout of a framework-dependent run). Never the
+        // folders older builds unpacked under ~/.net, and never $TMPDIR.
+        var exeDir = Environment.ProcessPath is string pp
+            ? Path.GetDirectoryName(new FileInfo(pp).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? pp)
+            : null;
         string[] Candidates()
         {
             var acc = new List<string>();
-            void AddNativeDirs(string root)
+            void AddRoot(string? root)
             {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root) || acc.Contains(root)) return;
+                acc.Add(root);
                 var runtimes = Path.Combine(root, "runtimes");
                 if (!Directory.Exists(runtimes)) return;
                 try
@@ -1108,13 +1140,11 @@ internal static class Program
                         if (Directory.Exists(native)) acc.Add(native);
                     }
                 }
-                catch { }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
             }
-            if (Directory.Exists(baseDir)) { acc.Add(baseDir); AddNativeDirs(baseDir); }
-            if (Directory.Exists(extApp))
-            {
-                try { foreach (var hashDir in Directory.EnumerateDirectories(extApp)) AddNativeDirs(hashDir); } catch { }
-            }
+            AddRoot(exeDir);
+            AddRoot(baseDir);
             return acc.ToArray();
         }
         string[] candidates = Candidates();
@@ -1143,7 +1173,7 @@ internal static class Program
         IntPtr MagickResolver(string name, Assembly _, DllImportSearchPath? __)
         {
             if (!name.StartsWith("Magick.Native", StringComparison.OrdinalIgnoreCase)) return IntPtr.Zero;
-            var probe = Candidates();     // rescan — the runtime extracts natives lazily
+            var probe = candidates;
             if (trace) Console.Error.WriteLine("[trace] Magick resolver: probing " + probe.Length + " dirs for " + name);
             foreach (var dir in probe)
                 foreach (var suffix in new[] { ".dylib", ".dll.dylib", "" })

@@ -41,3 +41,8 @@ backend/native/src/ffpfsc-pkg-tool/publish.log
 
 # Local console-test builds
 /local-build/
+
+# The fPKG helper and its ImageMagick library are built by BUILD_PKG_TOOL.sh from
+# backend/native/src/ffpfsc-pkg-tool; they are release artefacts, not sources.
+/backend/native/ffpfsc-pkg-tool
+/backend/native/*.dylib

@@ -30,6 +30,7 @@ _BACKEND_REQUIRED = [
     _os.path.join("mkpfs", "cli.py"), _os.path.join("mkpfs", "pfs.py"),
     _os.path.join("unrar", "__init__.py"), _os.path.join("unrar", "rarfile.py"),
     _os.path.join("native", "ffpfsc-pkg-tool"),
+    _os.path.join("native", "Magick.Native-Q8-arm64.dll.dylib"),   # loaded from the tool's folder
     _os.path.join("native", "LICENSE.LibProsperoPkg"),
 ]
 

@@ -53,7 +53,8 @@ def tool_path() -> Path:
     tried = "\n  ".join(str(p) for p in _tool_search_paths())
     raise FileNotFoundError(
         f"ffpfsc-pkg-tool not found. Tried:\n  {tried}\n"
-        "Set FFPFSC_PKG_TOOL to override, or rebuild the app."
+        "In a source checkout, build it with ./BUILD_PKG_TOOL.sh (needs the .NET SDK 9+); "
+        "set FFPFSC_PKG_TOOL to override, or rebuild the app."
     )
 
 

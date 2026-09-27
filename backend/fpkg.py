@@ -73,6 +73,10 @@ def _run(argv: list[str], *, on_line=None) -> int:
         stderr=subprocess.STDOUT,
         bufsize=1,
         text=True,
+        # The tool echoes file names from the package; a byte that is not valid UTF-8
+        # must not turn into a UnicodeDecodeError after the build has already run.
+        encoding="utf-8",
+        errors="replace",
     )
     assert proc.stdout is not None
     try:

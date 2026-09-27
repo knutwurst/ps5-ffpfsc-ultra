@@ -1287,7 +1287,9 @@ def organized_names(ident: dict, ext: str, item=None) -> tuple[str, str]:
     tid = (ident.get("title_id") or "").strip().upper()
     ver = (ident.get("version") or "").strip().lstrip("vV")
     base = title or tid or "output"
-    folder = sanitize_filename(" ".join(p for p in (base, f"[{tid}]" if tid else "", f"[v{ver}]" if ver else "") if p))
+    # Without a title the id already names the folder; do not repeat it as a tag.
+    tid_tag = f"[{tid}]" if tid and tid.lower() not in base.lower() else ""
+    folder = sanitize_filename(" ".join(p for p in (base, tid_tag, f"[v{ver}]" if ver else "") if p))
     fname = descriptive_ffpfsc_name(item, ext, name_override=base, tid_override=tid, ver_override=ver, v_prefix=True)
     return folder, fname
 
@@ -9548,6 +9550,11 @@ class App:
                     except Exception:
                         pass
                 obj.artwork = None   # re-detected lazily when the row is selected
+                # A queue saved before per-job formats existed has no format snapshot; it
+                # was a compressed .ffpfsc job then. Without this, the snapshot step below
+                # would turn it into whatever format is remembered today (e.g. .pkg).
+                if getattr(obj, "operation", "pack") == "pack" and getattr(obj, "output_compressed", None) is None:
+                    obj.output_compressed = True
                 if getattr(obj, "status", "") in ("Running", "Extracting", "Patching"):
                     obj.status = "Pending Extract" if getattr(obj, "archive_path", None) else "Queued"
                 self.queue.append(obj)

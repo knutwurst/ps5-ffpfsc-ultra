@@ -6,16 +6,22 @@
 we wrote:
 
 - `Program.cs` — the command-line wrapper around drakmor's LibProsperoPkg 1.2.0: argument
-  parsing, the `[PHASE]`/progress lines the GUI translates, the 17-point `validate`
-  checklist, and the pin `KrakenMaxDegreeOfParallelism = 1` (LibProsperoPkg 1.2.0's
-  outer-PFS AES-XTS worker crashes above that).
+  parsing, the `[PHASE]`/progress lines the GUI translates, the `validate` checklist, the
+  staging of every build (a hard-link mirror next to the source folder, or in `--temp`;
+  a copy into `--temp` only when the source volume takes no hard links, announced by a
+  `[stage] ... copying N GB` line), SIGTERM/SIGINT cancellation with cleanup of the
+  mirror, the library's temp files and any partial `.pkg` (exit 143/130), and the pin
+  `KrakenMaxDegreeOfParallelism = 1`: LibProsperoPkg 1.2.0's encoder is not thread-safe
+  (`-j 4` crashed 4 of 6 runs with AccessViolationException in `OodleKrakenEncoder.Hash`
+  and in the `XtsBlockTransform` constructor behind `ProsperoNapsPhysicalIntegrityCollector`),
+  so `--parallelism` is accepted but clamped with a warning.
 - `InnerImage.cs` — random access into the inner PFS for `list-inner` and
   `extract-inner --members` (see below).
 
 Every `--json` document is serialized through the source-generated `PkgToolJsonContext` at
-the end of `Program.cs`. The trimmed publish switches reflection-based System.Text.Json off,
-and the anonymous types the commands used before crashed on the shipped binary with
-"Reflection-based serialization has been disabled" — the harness now parses all of them.
+the end of `Program.cs`. It dates from when the binary was published trimmed (which switches
+reflection-based System.Text.Json off and crashed the anonymous types the commands used with
+"Reflection-based serialization has been disabled"); trimming is off today, the context stays.
 - `PkgTool.csproj` — the publish settings: self-contained single file, ReadyToRun,
   no trimming (Magick.NET's Prospero-facing path is reflection-driven; trimming pruned
   the types the DDS conversion needs). Magick.NET is required — LibProsperoPkg calls it
@@ -62,18 +68,19 @@ PFS to a temp file, NAPS-decodes the complete inner image to a second temp file,
 then reads the directory. The two commands below chain the library's public random-access
 pieces instead (`InnerImage.cs`):
 
-    package -> ProsperoOuterPfsDecryptReader (AES-XTS, one 64 KiB outer block at a time)
+    package -> plain SubStream (PlaintextNoAuth) or ProsperoOuterPfsDecryptReader (AES-XTS)
             -> PfsReader (outer: pfs_image.dat + naps_pkg_layout.dat)
-            -> ProsperoNapsImage.DecompressRange (only the touched Kraken/stored spans)
-            -> NapsBlockReader (LRU cache of aligned blocks, 1 MiB x 32 or 4 MiB x 8)
+            -> NapsBlockReader (NAPS plan built once, spans found by binary search and decoded
+               through the library's span decoder; LRU cache of 1 MiB x 32 or 4 MiB x 8 blocks)
             -> PfsReader (inner: the /app0 tree)
 
-Two facts about the packages this tool builds shaped the code. The outer PFS is always
-encrypted (mode 0x000D with a real seed), so the library's `DecodePlaintextInnerPfsRange`
-refuses them — it demands the plaintext/no-auth marker; the decrypting reader covers both
-layouts. And the inner image is data-first: the metadata (superblock, inodes, dirents) is
-the *last* NAPS logical file, so the superblock is found by probing that boundary (one
-block decode) rather than the library's forward 64 KiB scan, which would decode everything.
+Two facts shaped the code. Both outer layouts occur: the packages this tool builds since
+1.1.10 use `PlaintextNoAuth` (mode 0x000D with the `PPPLAIN-NOAUTH!` seed marker, read
+straight from the file), older ones a real seed (decrypted block by block); the library's
+`DecodePlaintextInnerPfsRange` covers only the former. And the inner image is data-first:
+the metadata (superblock, inodes, dirents) is the *last* NAPS logical file, so the
+superblock is found by probing that boundary (one block decode) rather than the library's
+forward 64 KiB scan, which would decode everything.
 
 - `list-inner <pkg> [--passcode P]` prints one JSON object on stdout:
   `{"root": "<pkg file name>", "entries": [...], "file_count": N, "dir_count": N, "errors": []}`.
@@ -91,13 +98,16 @@ block decode) rather than the library's forward 64 KiB scan, which would decode 
   too. Progress goes to stdout as `[####] NN% extract (path)` (the GUI regex is
   `\[#{2,}\]\s*(\d{1,3})%`), then `[####] 100% extract` and an `OK — extracted N file(s) and
   M folder(s) to <dir>` line. Exit 0 on success, 1 when none of the members exist (each
-  unknown member is a `[warn]` on stderr), 2 on usage errors. File data streams in 4 MiB
-  chunks straight from `DecompressRange`, so a single large file never has to fit in RAM.
+  unknown member is a `[warn]` on stderr), 2 on usage errors. File data streams in 32 MiB
+  chunks, so a single large file never has to fit in RAM.
 
-One cost the library imposes: `DecompressRange` rebuilds the NAPS plan on every call
-(about 0.2 ms per 1000 cblocks, i.e. per ~256 MB of game). The 4 MiB chunking keeps that
-below the decode time for the packages measured here; on a 100 GB game it adds roughly
-70 ms per chunk.
+The library's `ProsperoNapsImage.DecompressRange` rebuilds the NAPS plan on every call
+(about 0.2 ms per 1000 cblocks, i.e. per ~256 MB of game) and scans all spans linearly.
+`NapsBlockReader` builds the plan once, binary-searches the spans a range touches and
+decodes them with the library's own span decoder (its private `DecodeSpan`, bound once by
+reflection; if a future library version renames it, the code falls back to
+`DecompressRange` unchanged). Byte identity with the full extract is covered by the
+harness's selective-extract tests.
 
 ## Why not NativeAOT
 

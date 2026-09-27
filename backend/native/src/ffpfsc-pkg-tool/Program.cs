@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Threading;
 using LibProsperoPkg;
 using LibProsperoPkg.Content;
 using LibProsperoPkg.PFS;
@@ -18,6 +19,8 @@ namespace PkgTool;
 
 internal static class Program
 {
+    const string ToolVersion = "1.1.15";
+
     static int Main(string[] args)
     {
         try
@@ -59,7 +62,7 @@ internal static class Program
         Console.WriteLine("      Selective: <file> lists one path per line (relative to /app0); a directory");
         Console.WriteLine("      means its whole subtree incl. empty folders. Prints '[####] NN% extract (path)'.");
         Console.WriteLine("  extract-outer <pkg> <out-dir> [--passcode P]     [--decompress|--no-decompress]");
-        Console.WriteLine("  validate      <pkg>                              [--json]");
+        Console.WriteLine("  validate      <pkg> [--passcode P]               [--json]");
         Console.WriteLine("      Diagnostic checklist: header magic + fields, CNT wrap, PFS bounds,");
         Console.WriteLine("      required sce_sys entries, param.json coherence, eboot fake-self magic.");
         Console.WriteLine("  build         <src-dir> <out-dir>");
@@ -74,7 +77,9 @@ internal static class Program
         Console.WriteLine("      --deterministic              byte-reproducible build");
         Console.WriteLine("      --temp <dir>                 intermediate files go here (default: $TMPDIR)");
         Console.WriteLine("      --level <n>                  compression level: Kraken -4..9, zlib 0..9 (default 7)");
-        Console.WriteLine("      --playgo-chunks <1..255>     PlayGo chunk count (auto-detected from source sce_sys/playgo-chunk.dat)");
+        Console.WriteLine("      --playgo-chunks <1..64>      PlayGo chunk count (auto-detected from source sce_sys/playgo-chunk.dat)");
+        Console.WriteLine("      --parallelism <n> / -j <n>   accepted for compatibility; LibProsperoPkg 1.2.0's encoder is not");
+        Console.WriteLine("                                   thread-safe, so every build runs single-threaded (a warning says so)");
         Console.WriteLine("      --fake-sign / --no-fake-sign fake-sign raw ELFs in source before packing (default ON; idempotent)");
         Console.WriteLine("      --regen-playgo               discard source sce_sys/playgo-*.dat and let the builder regenerate them");
         Console.WriteLine("                                   (a CORRUPT prepared set — wrong format, e.g. JSON under hash-table.dat — is");
@@ -89,17 +94,29 @@ internal static class Program
         Console.WriteLine("                                     add CNT entries 0x0400/0x0401 via IProsperoLicenseProvider");
         Console.WriteLine("");
         Console.WriteLine("  Default passcode 32 x '0'. Default output is a finalized debug image.");
-        Console.WriteLine("  Auto-fake-sign scans for raw ELF magic (0x7F454C46) in eboot.bin, *.elf, *.prx, *.sprx");
-        Console.WriteLine("  and rewrites them as SCE fake-selves in a hardlink mirror; source is never modified.");
+        Console.WriteLine("  Every build works on a hard-link mirror of the source (next to the source folder when");
+        Console.WriteLine("  that is writable, else in --temp); the source itself is never modified. Auto-fake-sign");
+        Console.WriteLine("  scans for raw ELF magic (0x7F454C46) in eboot.bin, *.elf, *.prx, *.sprx and rewrites");
+        Console.WriteLine("  them as SCE fake-selves in that mirror. SIGTERM/SIGINT cancel the build and remove the");
+        Console.WriteLine("  mirror, the library's temp files and any partial .pkg (exit 143/130).");
     }
 
     static int Bad(string m) { Console.Error.WriteLine("[usage] " + m); PrintUsage(); return 2; }
+
+    /// <summary>The value of the option at args[i]; throws when the option is the last argument.
+    /// Every value-taking option of every command goes through here so "--members" without a
+    /// file cannot fall through to a full extract and "--mode" alone cannot NRE.</summary>
+    static string Need(string[] args, ref int i, string name)
+    {
+        if (i + 1 >= args.Length) throw new ArgumentException(name + " needs a value");
+        return args[++i];
+    }
 
     static int CmdVersion()
     {
         var asm = typeof(ProsperoPkgReader).Assembly;
         var name = asm.GetName();
-        Console.WriteLine("ffpfsc-pkg-tool 0.1.0");
+        Console.WriteLine("ffpfsc-pkg-tool " + ToolVersion);
         Console.WriteLine($"LibProsperoPkg: {name.Name} v{name.Version}");
         Console.WriteLine($".NET: {Environment.Version}");
         Console.WriteLine($"Host: {Environment.OSVersion.Platform} {Environment.OSVersion.Version} ({System.Runtime.InteropServices.RuntimeInformation.OSArchitecture})");
@@ -112,7 +129,12 @@ internal static class Program
         if (args.Length < 2) return Bad("inspect needs <pkg>");
         var pkg = args[1];
         if (!File.Exists(pkg)) throw new FileNotFoundException("package not found", pkg);
-        bool json = Array.Exists(args, a => a == "--json");
+        bool json = false;
+        for (int i = 2; i < args.Length; i++)
+        {
+            if (args[i] == "--json") json = true;
+            else return Bad("unknown inspect flag: " + args[i]);
+        }
         var type = ProsperoPkgReader.DetectType(pkg);
         var pkgObj = ProsperoPkgReader.Read(pkg);
         var info = new InspectDoc
@@ -171,12 +193,16 @@ internal static class Program
         string? membersFile = null;
         for (int i = 3; i < args.Length; i++)
         {
-            if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
-            else if (args[i] == "--decompress") decompress = true;
-            else if (args[i] == "--no-decompress") decompress = false;
-            else if (args[i] == "--json") json = true;
-            else if (args[i] == "--no-merge-cnt") mergeCnt = false;
-            else if (args[i] == "--members" && i + 1 < args.Length) membersFile = args[++i];
+            switch (args[i])
+            {
+                case "--passcode": passcode = Need(args, ref i, "--passcode"); break;
+                case "--decompress": decompress = true; break;
+                case "--no-decompress": decompress = false; break;
+                case "--json": json = true; break;
+                case "--no-merge-cnt": mergeCnt = false; break;
+                case "--members": membersFile = Need(args, ref i, "--members"); break;
+                default: return Bad($"unknown extract-{(inner ? "inner" : "outer")} flag: {args[i]}");
+            }
         }
         if (membersFile != null)
         {
@@ -272,10 +298,11 @@ internal static class Program
         return result;
     }
 
-    // The binary is published trimmed, which turns reflection-based System.Text.Json off, so every
-    // --json document goes through the source-generated serializer (PkgToolJsonContext below).
-    // The classes mirror the anonymous types the commands used before: same field names, same
-    // number/bool/null shapes.
+    // Every --json document goes through the source-generated serializer (PkgToolJsonContext
+    // below). It was introduced while the binary was still published trimmed (which switches
+    // reflection-based System.Text.Json off); PublishTrimmed is false today, the context is kept
+    // because it works regardless of the publish settings. The classes mirror the anonymous
+    // types the commands used before: same field names, same number/bool/null shapes.
     internal sealed class InspectDoc
     {
         public string path { get; set; } = "";
@@ -409,7 +436,10 @@ internal static class Program
         if (!File.Exists(pkg)) throw new FileNotFoundException("package not found", pkg);
         string passcode = new string('0', 32);
         for (int i = 2; i < args.Length; i++)
-            if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
+        {
+            if (args[i] == "--passcode") passcode = Need(args, ref i, "--passcode");
+            else return Bad("unknown list-inner flag: " + args[i]);
+        }
 
         var errors = new List<string>();
         var tmpCnt = Path.Combine(Path.GetTempPath(), "fpkg-list-cnt-" + Guid.NewGuid().ToString("N"));
@@ -431,7 +461,7 @@ internal static class Program
             Console.WriteLine(JsonSerializer.Serialize(doc, PkgToolJsonContext.Default.ListInnerDoc));
             if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
                 Console.Error.WriteLine($"[trace] list-inner: logical image {img.LogicalSize:N0} B, superblock @0x{img.SuperblockOffset:X}, " +
-                                        $"{img.RangeCalls} range decodes / {img.RangeBytes:N0} B");
+                                        $"{img.RangeCalls} range decodes / {img.RangeBytes:N0} B, span decoder bound={NapsBlockReader.UsesSpanDecoder}");
             return 0;
         }
         finally
@@ -545,7 +575,17 @@ internal static class Program
     {
         if (args.Length < 2) return Bad("validate needs <pkg>");
         var pkg = args[1];
-        bool json = Array.Exists(args, a => a == "--json");
+        bool json = false;
+        string passcode = new string('0', 32);
+        for (int i = 2; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--json": json = true; break;
+                case "--passcode": passcode = Need(args, ref i, "--passcode"); break;
+                default: return Bad("unknown validate flag: " + args[i]);
+            }
+        }
         if (!File.Exists(pkg)) throw new FileNotFoundException("package not found", pkg);
         var checks = new System.Collections.Generic.List<ValidateResult>();
         void Ok(string k, string msg) => checks.Add(new ValidateResult { Check = k, Level = "pass", Message = msg });
@@ -553,12 +593,15 @@ internal static class Program
         void Fail(string k, string msg) => checks.Add(new ValidateResult { Check = k, Level = "fail", Message = msg });
 
         long sz = new FileInfo(pkg).Length;
-        Ok("file", $"{sz:N0} bytes on disk");
+        // A finalized image starts with a 64 KiB FIH block, so anything smaller cannot be one.
+        if (sz >= 0x10000) Ok("file", $"{sz:N0} bytes on disk");
+        else               Fail("file", $"{sz:N0} bytes on disk — smaller than one 64 KiB image block");
 
         // Magic
         using (var fs = new FileStream(pkg, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
-            var m = new byte[4]; fs.Read(m, 0, 4);
+            var m = new byte[4]; int got = fs.Read(m, 0, 4);
+            if (got < 4) { Fail("magic", "file shorter than 4 bytes"); Report(checks, json); return 1; }
             string magic = (m[0] == 0x7F && m[1] == 'C' && m[2] == 'N' && m[3] == 'T') ? "CNT"
                          : (m[0] == 0x7F && m[1] == 'F' && m[2] == 'I' && m[3] == 'H') ? "FIH"
                          : $"UNKNOWN ({m[0]:X2} {m[1]:X2} {m[2]:X2} {m[3]:X2})";
@@ -619,13 +662,35 @@ internal static class Program
         {
             Directory.CreateDirectory(tmpCnt);
             cntFiles = new System.Collections.Generic.List<string>(
-                ProsperoPackageArchive.ExtractCntEntries(pkg, tmpCnt, new string('0', 32), includeEncrypted: true));
-            var need = new[] { "param.json", "icon0.png", "playgo-chunk.dat" };
+                ProsperoPackageArchive.ExtractCntEntries(pkg, tmpCnt, passcode, includeEncrypted: true));
+            var need = new[] { "param.json", "icon0.png" };
             foreach (var n in need)
             {
                 var p = Path.Combine(tmpCnt, n);
                 if (File.Exists(p)) Ok("cnt." + n, $"{new FileInfo(p).Length:N0} bytes present");
                 else                Fail("cnt." + n, "MISSING from CNT — installer will reject");
+            }
+            // PlayGo prepared set: presence is not enough — a set under the wrong names (JSON text
+            // as hash-table.dat, a hash table as ficm.dat) installs but dies at launch with
+            // CE-100022-5. Check the on-wire format with the same helpers the build uses.
+            foreach (var n in new[] { "playgo-chunk.dat", "playgo-hash-table.dat", "playgo-ficm.dat" })
+            {
+                var p = Path.Combine(tmpCnt, n);
+                if (!File.Exists(p))
+                {
+                    if (n == "playgo-chunk.dat") Fail("cnt." + n, "MISSING from CNT — installer will reject");
+                    else                         Warn("cnt." + n, "absent from CNT (the builder normally emits it)");
+                    continue;
+                }
+                var b = File.ReadAllBytes(p);
+                bool ok = n switch
+                {
+                    "playgo-chunk.dat"      => LooksLikePlayGoChunkDat(b),
+                    "playgo-hash-table.dat" => LooksLikePlayGoHashTable(b),
+                    _                       => LooksLikePlayGoFicm(b),
+                };
+                if (ok) Ok("cnt." + n, $"{b.Length:N0} bytes, on-wire format OK");
+                else    Fail("cnt." + n, $"{b.Length:N0} bytes but NOT the {n} format" + (LooksLikeJsonText(b) ? " (it is JSON text)" : LooksLikePlayGoHashTable(b) ? " (it is a hash table)" : "") + " — launch will fail (CE-100022-5)");
             }
             // param.json coherence with header
             var pj = Path.Combine(tmpCnt, "param.json");
@@ -641,13 +706,23 @@ internal static class Program
                         if (v == h.ContentId) Ok("param.contentId", "matches CNT header");
                         else Fail("param.contentId", $"'{v}' != CNT header '{h.ContentId}'");
                     }
+                    else Fail("param.contentId", "param.json has no contentId");
+                    // The title id is characters 7..15 of the content id (XX0000-TTTTNNNNN_00-...).
+                    string headerTid = h.ContentId.Length >= 16 ? h.ContentId.Substring(7, 9) : "";
                     if (root.TryGetProperty("titleId", out var tid))
                     {
                         var v = tid.GetString() ?? "";
-                        Ok("param.titleId", v);
+                        if (v == headerTid) Ok("param.titleId", $"{v} matches the content id");
+                        else Fail("param.titleId", $"'{v}' != content id title '{headerTid}'");
                     }
+                    else Fail("param.titleId", "param.json has no titleId");
                     if (root.TryGetProperty("applicationDrmType", out var drm))
-                        Ok("param.applicationDrmType", drm.GetString() ?? "");
+                    {
+                        var v = drm.GetString() ?? "";
+                        if (v is "free" or "standard" or "upgradable") Ok("param.applicationDrmType", $"{v} (header drm_type=0x{h.DrmType:X})");
+                        else Warn("param.applicationDrmType", $"'{v}' is not free/standard/upgradable (header drm_type=0x{h.DrmType:X})");
+                    }
+                    else Warn("param.applicationDrmType", "absent");
                 }
                 catch (Exception ex) { Fail("param.parse", ex.Message); }
             }
@@ -660,15 +735,17 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(tmpInner);
-            var innerFiles = ProsperoPackageArchive.ExtractInnerFiles(pkg, tmpInner, new string('0', 32), decompressFiles: true);
+            var innerFiles = ProsperoPackageArchive.ExtractInnerFiles(pkg, tmpInner, passcode, decompressFiles: true);
             Ok("inner.pfs", $"decoded {innerFiles.Count} file(s) from inner PFS");
             var ebootPath = Path.Combine(tmpInner, "eboot.bin");
             if (File.Exists(ebootPath))
             {
-                var head = new byte[4]; using (var f = File.OpenRead(ebootPath)) f.Read(head, 0, 4);
-                uint magic = (uint)(head[0] | (head[1] << 8) | (head[2] << 16) | (head[3] << 24));
-                if      (magic == 0x1D3D154Fu) Ok("eboot.magic", "SCE fake-self (0x1D3D154F) — good");
-                else if (magic == 0xEEF51454u) Ok("eboot.magic", "SCE encrypted fake-self (0xEEF51454) — good (v1.2.0 default)");
+                var head = new byte[4]; int got = 0; using (var f = File.OpenRead(ebootPath)) got = f.Read(head, 0, 4);
+                uint magic = got < 4 ? 0u : (uint)(head[0] | (head[1] << 8) | (head[2] << 16) | (head[3] << 24));
+                // 0xEEF51454 ("SCE" fake-self) is what LibProsperoPkg's MakeFself and Sony's SELFs
+                // carry; 0x1D3D154F is the PS4 SELF magic and does not load on a PS5.
+                if      (magic == 0xEEF51454u) Ok("eboot.magic", "SCE fake-self (0xEEF51454) — good");
+                else if (magic == 0x1D3D154Fu) Fail("eboot.magic", "PS4 SELF magic (0x1D3D154F) — not a PS5 executable");
                 else if (magic == 0x464C457Fu) Fail("eboot.magic", "raw ELF (0x7F454C46) — not fake-signed; kstuff-fpkg install path will refuse");
                 else Warn("eboot.magic", $"unrecognized 0x{magic:X8}");
             }
@@ -715,13 +792,71 @@ internal static class Program
         Console.WriteLine($"summary: {p} passed, {w} warned, {f} failed");
     }
 
-    /// <summary>Mirror *src* into *dst* using hard links for every regular file and real
-    /// subdirectories, so the build sees the tree unchanged without copying gigabytes.
-    /// Hard links (not symlinks) — LibProsperoPkg stats the source path and expects a real
-    /// file layout; some readers get the size right but read partial data through symlinks
-    /// (verified: "ended after 6 of 84 bytes"). Falls back to a copy when hardlinking is
-    /// refused (source across filesystems, or FS without hardlink support).</summary>
-    static void MirrorAsHardLinks(string src, string dst)
+    /// <summary>Where the build's mirror of the source goes and whether it can be made of hard
+    /// links. Hard links only work on the volume the source lives on, so the preferred place is
+    /// a hidden directory next to the source folder (<c>&lt;parent&gt;/.ffpfsc-stage-&lt;id&gt;</c>);
+    /// --temp is tried second (it may be the same volume). Each candidate is proven with one
+    /// real <c>link()</c> of a source file — EXDEV (18) means another volume, EPERM (1) or
+    /// ENOTSUP (45) a file system without hard links (exFAT/FAT). Only when no candidate
+    /// takes a hard link does the mirror become a copy into --temp, and the caller says so
+    /// before copying; the old code fell back to File.Copy per file silently, which turned a
+    /// cross-volume build into an unannounced full copy of the game.</summary>
+    static (string dir, bool hardLinks, string copyReason) ChooseStageDir(string source, string temp)
+    {
+        string id = Guid.NewGuid().ToString("N").Substring(0, 8);
+        string sourceFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(source));
+        string tempFull = Path.GetFullPath(temp);
+        string? parent = Path.GetDirectoryName(sourceFull);
+        string? probeSource = null;
+        try { probeSource = Directory.EnumerateFiles(sourceFull, "*", SearchOption.AllDirectories).FirstOrDefault(f => !IsSymlink(f)); } catch { }
+        bool parentWritable = false, parentSameVolume = false, noHardLinkSupport = false;
+
+        var candidates = new List<(string dir, bool nextToSource)>();
+        if (parent != null) candidates.Add((Path.Combine(parent, ".ffpfsc-stage-" + id), true));
+        candidates.Add((Path.Combine(tempFull, "ffpfsc-stage-" + id), false));
+        foreach (var (cand, nextToSource) in candidates)
+        {
+            // Never inside the source: the mirror would contain itself (the old --temp-inside-
+            // source run recursed until PathTooLongException) and the library refuses it anyway.
+            if (IsInside(cand, sourceFull)) continue;
+            try { Directory.CreateDirectory(cand); } catch { continue; }
+            if (nextToSource) parentWritable = true;
+            if (probeSource == null) return (cand, true, "");   // nothing to link
+            var probe = Path.Combine(cand, ".hardlink-probe");
+            int rc = link(probeSource, probe);
+            int errno = rc == 0 ? 0 : Marshal.GetLastPInvokeError();
+            if (rc == 0)
+            {
+                try { File.Delete(probe); } catch { }
+                return (cand, true, "");
+            }
+            try { Directory.Delete(cand, recursive: true); } catch { }
+            if (errno == 1 || errno == 45) noHardLinkSupport = true;            // EPERM / ENOTSUP
+            if (nextToSource && errno != 18) parentSameVolume = true;           // anything but EXDEV
+        }
+        string dir = Path.Combine(tempFull, "ffpfsc-stage-" + id);
+        Directory.CreateDirectory(dir);
+        string reason = noHardLinkSupport ? "source file system does not support hard links"
+                      : !parentWritable   ? "source volume is read-only"
+                      : parentSameVolume  ? "hard links refused on the source volume"
+                                          : "no writable location on the source volume";
+        return (dir, false, reason);
+    }
+
+    static bool IsInside(string path, string root)
+    {
+        var p = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        var r = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+        return p.Equals(r, StringComparison.Ordinal) || p.StartsWith(r + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+    }
+
+    /// <summary>Mirror *src* into *dst*: real subdirectories and, per regular file, a hard link
+    /// (or a copy when <paramref name="hardLinks"/> is false). Hard links, not symlinks —
+    /// LibProsperoPkg stats the source path and expects a real file layout; some readers get
+    /// the size right but read partial data through symlinks (verified: "ended after 6 of 84
+    /// bytes"). A hard link that fails for one file (EMLINK and the like) is copied with a
+    /// visible line, never silently.</summary>
+    static void MirrorSource(string src, string dst, bool hardLinks)
     {
         foreach (var d in Directory.EnumerateDirectories(src, "*", SearchOption.AllDirectories))
             Directory.CreateDirectory(Path.Combine(dst, Path.GetRelativePath(src, d)));
@@ -730,13 +865,22 @@ internal static class Program
             var target = Path.Combine(dst, Path.GetRelativePath(src, f));
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             if (File.Exists(target) || IsSymlink(target)) File.Delete(target);
-            try
+            if (hardLinks)
             {
                 var rc = link(Path.GetFullPath(f), target);
-                if (rc != 0) throw new System.ComponentModel.Win32Exception(Marshal.GetLastPInvokeError(), "link() failed");
+                if (rc == 0) continue;
+                int errno = Marshal.GetLastPInvokeError();
+                Console.Error.WriteLine($"  [stage] link() failed for {Path.GetRelativePath(src, f)} (errno {errno}); copying that file");
             }
-            catch { File.Copy(f, target, overwrite: true); }
+            File.Copy(f, target, overwrite: true);
         }
+    }
+
+    static long DirectorySize(string root)
+    {
+        long total = 0;
+        try { foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)) { try { total += new FileInfo(f).Length; } catch { } } } catch { }
+        return total;
     }
 
     [DllImport("libc", SetLastError = true)]
@@ -761,29 +905,38 @@ internal static class Program
         _magickRedirected = true;
         bool trace = Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1";
         var baseDir = AppContext.BaseDirectory ?? Environment.CurrentDirectory;
-        // Runtime asset paths for a self-contained single-file app: with
-        // IncludeNativeLibrariesForSelfExtract=true the runtime extracts natives to
-        // ~/.net/<AppName>/<hash>/runtimes/<RID>/native/ (also under $TMPDIR).
-        // Include the exe dir, the extraction cache, and TMPDIR — resolve every
-        // Magick.Native*.dylib we can find under them.
+        // Where a self-contained single-file app's natives can be (IncludeNativeLibrariesFor
+        // SelfExtract=true): next to the exe, or extracted under
+        // $DOTNET_BUNDLE_EXTRACT_BASE_DIR (default ~/.net)/<AppName>/<bundle hash>/runtimes/<RID>/native/.
+        // The probe is limited to exactly that layout — one level of bundle hashes, one level
+        // of RIDs — and never scans $TMPDIR: an earlier version enumerated the whole temp tree
+        // (5.6 s with 200k directories, and the GUI points TMPDIR at the game temp drive) and
+        // would have loaded any matching dylib it found there.
         var appName = Assembly.GetEntryAssembly()?.GetName().Name ?? "ffpfsc-pkg-tool";
         var extRoot = Environment.GetEnvironmentVariable("DOTNET_BUNDLE_EXTRACT_BASE_DIR")
                       ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".net");
-        var searchRoots = new List<string> { baseDir, Path.Combine(extRoot, appName), Path.GetTempPath() };
+        var extApp = Path.Combine(extRoot, appName);
         string[] Candidates()
         {
             var acc = new List<string>();
-            foreach (var root in searchRoots)
+            void AddNativeDirs(string root)
             {
-                if (!Directory.Exists(root)) continue;
-                acc.Add(root);
+                var runtimes = Path.Combine(root, "runtimes");
+                if (!Directory.Exists(runtimes)) return;
                 try
                 {
-                    foreach (var sub in Directory.EnumerateDirectories(root, "runtimes", SearchOption.AllDirectories))
-                        foreach (var native in Directory.EnumerateDirectories(sub, "native", SearchOption.AllDirectories))
-                            acc.Add(native);
+                    foreach (var rid in Directory.EnumerateDirectories(runtimes))
+                    {
+                        var native = Path.Combine(rid, "native");
+                        if (Directory.Exists(native)) acc.Add(native);
+                    }
                 }
                 catch { }
+            }
+            if (Directory.Exists(baseDir)) { acc.Add(baseDir); AddNativeDirs(baseDir); }
+            if (Directory.Exists(extApp))
+            {
+                try { foreach (var hashDir in Directory.EnumerateDirectories(extApp)) AddNativeDirs(hashDir); } catch { }
             }
             return acc.ToArray();
         }
@@ -849,9 +1002,14 @@ internal static class Program
             KrakenBackend = ProsperoKrakenBackend.BuiltIn,
             Passcode = new string('0', 32),
             Version = "01.000.000",
-            // Force single-threaded worker across the outer-PFS AES-XTS pass —
-            // v1.2.0's OuterBlockWorker races (SIGSEGV in BlockSector) when this
-            // is >1. The build path also uses this value for its outer parallelism.
+            // Single-threaded, always. LibProsperoPkg 1.2.0's encoder is not thread-safe:
+            // -j 4 crashed 4 of 6 runs with AccessViolationException — inside
+            // OodleKrakenEncoder.Hash under the Task.Run workers of the inner-data pass, and
+            // inside the XtsBlockTransform constructor reached from the ThreadLocal factory
+            // in ProsperoNapsPhysicalIntegrityCollector.Observe — and each crash left a
+            // partial .pkg under the final name. (An earlier note blamed the outer-PFS
+            // AES-XTS worker; that pass no longer runs since PlaintextNoAuth.) --parallelism
+            // is still accepted for compatibility and clamped to 1 with a warning.
             KrakenMaxDegreeOfParallelism = 1,
             LegacyZlibMaxDegreeOfParallelism = 1,
             // PS5 debug-image loader only accepts the plaintext-no-auth outer PFS
@@ -873,26 +1031,29 @@ internal static class Program
         for (int i = 3; i < args.Length; i++)
         {
             string a = args[i];
-            string? v = i + 1 < args.Length ? args[i + 1] : null;
             switch (a)
             {
-                case "--content-id": opts.ContentId = v!; i++; break;
-                case "--title-id": opts.TitleId = v!; i++; break;
-                case "--title": opts.Title = v!; i++; break;
-                case "--version": opts.Version = v!; i++; break;
-                case "--passcode": opts.Passcode = v!; i++; break;
+                case "--content-id": opts.ContentId = Need(args, ref i, a); break;
+                case "--title-id": opts.TitleId = Need(args, ref i, a); break;
+                case "--title": opts.Title = Need(args, ref i, a); break;
+                case "--version": opts.Version = Need(args, ref i, a); break;
+                case "--passcode": opts.Passcode = Need(args, ref i, a); break;
                 case "--mode":
-                    opts.InnerCompression = (v!.ToLowerInvariant()) switch
+                {
+                    var v = Need(args, ref i, a);
+                    opts.InnerCompression = v.ToLowerInvariant() switch
                     {
                         "none" => ProsperoInnerCompression.None,
                         "zlib" => ProsperoInnerCompression.Zlib,
                         "kraken" => ProsperoInnerCompression.Kraken,
                         _ => throw new ArgumentException($"unknown --mode: {v}")
                     };
-                    i++;
                     break;
+                }
                 case "--kraken-backend":
-                    opts.KrakenBackend = (v!.ToLowerInvariant()) switch
+                {
+                    var v = Need(args, ref i, a);
+                    opts.KrakenBackend = v.ToLowerInvariant() switch
                     {
                         "automatic" => ProsperoKrakenBackend.Automatic,
                         "builtin" => ProsperoKrakenBackend.BuiltIn,
@@ -905,40 +1066,51 @@ internal static class Program
                         // automatic path installs and shows its icon but the launch fails with
                         // CE-100096-6. Only the built-in Kraken encoder is console-launchable.
                         Console.Error.WriteLine($"[warn] --kraken-backend {v}: this output is NOT launchable on a console (CE-100096-6 verified); use 'builtin'");
-                    i++;
                     break;
-                case "--pubtools-dll": opts.PublishingToolsLibraryPath = v!; i++; break;
+                }
+                case "--pubtools-dll": opts.PublishingToolsLibraryPath = Need(args, ref i, a); break;
                 case "--parallelism":
                 case "-j":
-                    if (int.TryParse(v, out int j) && j >= 1) { opts.KrakenMaxDegreeOfParallelism = j; opts.LegacyZlibMaxDegreeOfParallelism = j; }
-                    else throw new ArgumentException("--parallelism needs integer >= 1");
-                    i++;
+                {
+                    var v = Need(args, ref i, a);
+                    if (!int.TryParse(v, out int j) || j < 1) throw new ArgumentException("--parallelism needs an integer >= 1");
+                    // Never applied: see the KrakenMaxDegreeOfParallelism note above.
+                    if (j > 1)
+                        Console.Error.WriteLine($"[warn] --parallelism {j} ignored: LibProsperoPkg 1.2.0's encoder is not thread-safe (crashes observed); running single-threaded");
                     break;
+                }
                 case "--deterministic": opts.DeterministicBuild = true; break;
                 case "--temp":
+                {
+                    var v = Need(args, ref i, a);
                     if (string.IsNullOrWhiteSpace(v)) throw new ArgumentException("--temp needs a directory");
-                    Directory.CreateDirectory(v!);
+                    Directory.CreateDirectory(v);
                     opts.TemporaryDirectory = v;
-                    i++;
                     break;
+                }
                 case "--level":
+                {
+                    var v = Need(args, ref i, a);
                     if (!int.TryParse(v, out int lvl)) throw new ArgumentException("--level needs an integer");
                     // Kraken accepts -4..9 (drakmor's encoder), the legacy zlib path 0..9.
                     opts.KrakenCompressionLevel = Math.Clamp(lvl, -4, 9);
                     opts.LegacyZlibCompressionLevel = Math.Clamp(lvl, 0, 9);
-                    i++;
                     break;
+                }
                 case "--playgo-chunks":
+                {
                     // LibProsperoPkg defaults to 64 and spreads files over as many chunks as
                     // there are files; Sony's publisher packs every launch-time file into
                     // chunk 0 (default here). Auto-detected from source's playgo-chunk.dat
-                    // when present; this override wins over the auto-detect.
-                    if (!int.TryParse(v, out int chunks) || chunks < 1 || chunks > 255)
-                        throw new ArgumentException("--playgo-chunks needs an integer 1..255");
+                    // when present; this override wins over the auto-detect. The library
+                    // itself rejects anything outside 1..64.
+                    var v = Need(args, ref i, a);
+                    if (!int.TryParse(v, out int chunks) || chunks < 1 || chunks > 64)
+                        throw new ArgumentException("--playgo-chunks needs an integer 1..64 (LibProsperoPkg's range)");
                     opts.PlayGoChunkCount = chunks;
                     playGoChunksExplicit = true;
-                    i++;
                     break;
+                }
                 case "--no-fake-sign":
                     // Retail games have raw ELFs that must be fake-signed to boot on a
                     // jailbroken console. Default is ON so a retail-shaped source (with
@@ -974,10 +1146,9 @@ internal static class Program
                     // auto: keep the source's declaration (a console on "HDR when supported"
                     // follows bit 29 — set means it switches to HDR output for this title).
                     // on: set the bit even if the source lacks it. off: clear it.
-                    hdrFlag = (v ?? "").ToLowerInvariant();
+                    hdrFlag = Need(args, ref i, a).ToLowerInvariant();
                     if (hdrFlag is not ("auto" or "on" or "off"))
                         throw new ArgumentException("--hdr-flag needs auto, on or off");
-                    i++;
                     break;
                 case "--no-hdr-flag": hdrFlag = "off"; break;   // 1.1.12/1.1.13 spelling
                 default: return Bad("unknown build flag: " + a);
@@ -987,8 +1158,8 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(opts.TitleId)) return Bad("--title-id required");
         Directory.CreateDirectory(opts.OutputFolder);
 
-        // Stage: mirror the source into a temp folder (hard links, no gigabyte copy) if
-        // ANY of these pre-build transforms need to run on the source:
+        // Stage: every build works on a mirror of the source (hard links where possible, no
+        // gigabyte copy). The pre-build transforms run on that mirror:
         //   (a) auto-generate sce_sys/*.dds from PNGs the source only provides as PNG
         //       (LibProsperoPkg's builder moves sce_sys/*.dds into the outer CNT but does
         //       NOT generate the DDS itself; without them the .pkg installs but never
@@ -997,13 +1168,17 @@ internal static class Program
         //       source ships unsigned — a jailbroken PS5's app loader rejects a package
         //       whose eboot is not a fake-self and kills the process immediately (short
         //       fan-spin then CE-100096-6). Idempotent — already-signed inputs are skipped.
+        // Staging is unconditional because LibProsperoPkg's EnsureParamJson writes a generated
+        // sce_sys/param.json into the folder it builds from when none exists — which used to
+        // be the user's source folder whenever nothing else needed staging.
         // Auto-detect PlayGoChunkCount from the source's own sce_sys/playgo-chunk.dat is a
-        // pure metadata read and runs regardless of whether we stage a mirror.
+        // pure metadata read.
         string effectiveSource = opts.SourceFolder!;
         string? autoStage = null;
         var srcSceSys = Path.Combine(effectiveSource, "sce_sys");
 
         // -- PlayGoChunkCount auto-detect (unless the user pinned it explicitly) --
+        bool playgoOutOfRange = false;   // the source's set declares a count the library rejects
         if (!playGoChunksExplicit)
         {
             try
@@ -1020,7 +1195,19 @@ internal static class Program
                         bytes[0] == (byte)'p' && bytes[1] == (byte)'l' && bytes[2] == (byte)'g' && bytes[3] == (byte)'x')
                     {
                         int detected = bytes[0x0A] | (bytes[0x0B] << 8);
-                        if (detected >= 1 && detected <= 255 && detected != opts.PlayGoChunkCount)
+                        if (detected > 64)
+                        {
+                            // LibProsperoPkg throws "PlayGo chunk count must be in the range 1..64"
+                            // for such a set; discard it and regenerate with the default count.
+                            Console.Error.WriteLine($"  [playgo] source declares {detected} chunks (> 64): regenerating the prepared set");
+                            playgoOutOfRange = true;
+                        }
+                        else if (detected == 0)
+                        {
+                            Console.Error.WriteLine("  [playgo] source declares 0 chunks (invalid): regenerating the prepared set");
+                            playgoOutOfRange = true;
+                        }
+                        else if (detected != opts.PlayGoChunkCount)
                         {
                             Console.Error.WriteLine($"  [playgo] source declares {detected} chunk(s); using that (was default {opts.PlayGoChunkCount})");
                             opts.PlayGoChunkCount = detected;
@@ -1111,18 +1298,20 @@ internal static class Program
                 };
                 if (!ok) playgoBad.Add(n + (LooksLikeJsonText(b) ? " (is JSON text)" : LooksLikePlayGoHashTable(b) ? " (is a hash table)" : " (bad format)"));
             }
-            bool discardPlayGo = playgoPresent.Length > 0 && (regenPlayGo || playgoBad.Count > 0);
+            bool discardPlayGo = playgoPresent.Length > 0 && (regenPlayGo || playgoBad.Count > 0 || playgoOutOfRange);
             if (discardPlayGo)
-                Console.Error.WriteLine(regenPlayGo && playgoBad.Count == 0
+                Console.Error.WriteLine(playgoBad.Count > 0
+                    ? $"  [playgo] prepared set is CORRUPT — {string.Join(", ", playgoBad)}; discarding all {playgoPresent.Length} file(s) so LibProsperoPkg regenerates a consistent {opts.PlayGoChunkCount}-chunk set"
+                    : regenPlayGo
                     ? $"  [playgo] --regen-playgo: discarding prepared set ({playgoPresent.Length} file(s)); LibProsperoPkg will regenerate {opts.PlayGoChunkCount} chunk(s)"
-                    : $"  [playgo] prepared set is CORRUPT — {string.Join(", ", playgoBad)}; discarding all {playgoPresent.Length} file(s) so LibProsperoPkg regenerates a consistent {opts.PlayGoChunkCount}-chunk set");
+                    : $"  [playgo] discarding prepared set ({playgoPresent.Length} file(s)); LibProsperoPkg will regenerate {opts.PlayGoChunkCount} chunk(s)");
 
             // Any sce_sys/*.json that is not JSON is a mislabeled dump artifact (same
             // shifted-name bug); it would land in the inner PFS as junk. Drop it.
             var badJson = Directory.Exists(srcSceSys)
                 ? Directory.EnumerateFiles(srcSceSys, "*.json").Where(p =>
                     { try { return !LooksLikeJsonText(File.ReadAllBytes(p)); } catch { return false; } })
-                  .Select(Path.GetFileName).ToArray()
+                  .Select(p => Path.GetFileName(p)!).ToArray()
                 : Array.Empty<string>();
             if (badJson.Length > 0)
                 Console.Error.WriteLine($"  [sce_sys] dropping mislabeled non-JSON file(s): {string.Join(", ", badJson)}");
@@ -1136,42 +1325,29 @@ internal static class Program
             else
                 Console.Error.WriteLine($"  [keystone] source has no sce_sys/keystone — the builder generates one for passcode {opts.Passcode}; saves from other builds of this title will NOT be readable");
 
-            bool needStage = pngsToConvert.Length > 0 || elfsToSign.Length > 0 || doRetailNormalize || discardPlayGo || badJson.Length > 0;
-
-            if (needStage)
+            // Always stage (see the note above). Any failure in this block is fatal — a package
+            // built from the raw source would silently lack the PlayGo validation, the license
+            // entries, the fake-signing and the retail SELF flag. The one exception is the DDS
+            // conversion, which runs LAST and is caught per icon.
             {
-                autoStage = Path.Combine(
-                    string.IsNullOrEmpty(opts.TemporaryDirectory) ? Path.GetTempPath() : opts.TemporaryDirectory!,
-                    "ffpfsc-stage-" + Guid.NewGuid().ToString("N").Substring(0, 8));
-                Directory.CreateDirectory(autoStage);
-                MirrorAsHardLinks(effectiveSource, autoStage);
-                Console.Error.WriteLine($"  [stage] mirrored source into {autoStage}");
+                string tempRoot = string.IsNullOrEmpty(opts.TemporaryDirectory) ? Path.GetTempPath() : opts.TemporaryDirectory!;
+                var (stageDir, hardLinks, copyReason) = ChooseStageDir(effectiveSource, tempRoot);
+                autoStage = stageDir;
+                if (!hardLinks)
+                    Console.Error.WriteLine($"[stage] {copyReason}: copying {DirectorySize(effectiveSource) / 1073741824.0:F1} GB into {tempRoot}");
+                MirrorSource(effectiveSource, autoStage, hardLinks);
+                Console.Error.WriteLine($"  [stage] mirrored source into {autoStage} ({(hardLinks ? "hard links" : "copy")})");
 
                 // (0) Drop corrupt/mislabeled sce_sys metadata from the mirror (unlinks the
-                //     hardlink; the on-disk source is untouched).
+                //     hard link; the on-disk source is untouched). Shipping a corrupt PlayGo
+                //     file means CE-100022-5 at launch, so a failed unlink is fatal.
                 if (discardPlayGo || badJson.Length > 0)
                 {
                     var stagedSceSys0 = Path.Combine(autoStage, "sce_sys");
                     foreach (var n in (discardPlayGo ? playgoPresent : Array.Empty<string>()).Concat(badJson))
                     {
                         var p = Path.Combine(stagedSceSys0, n);
-                        try { if (File.Exists(p) || IsSymlink(p)) File.Delete(p); } catch (Exception ex) { Console.Error.WriteLine($"  [stage] could not drop sce_sys/{n}: {ex.GetType().Name}"); }
-                    }
-                }
-
-                // (a) DDS icon CNT entries
-                if (pngsToConvert.Length > 0)
-                {
-                    var stagedSceSys = Path.Combine(autoStage, "sce_sys");
-                    Directory.CreateDirectory(stagedSceSys);
-                    foreach (var name in pngsToConvert)
-                    {
-                        var png = File.ReadAllBytes(Path.Combine(srcSceSys, name));
-                        var dds = ProsperoDdsEncoder.EncodePngToDds(png, opts.TemporaryDirectory ?? Path.GetTempPath());
-                        var ddsPath = Path.Combine(stagedSceSys, Path.ChangeExtension(name, ".dds"));
-                        if (File.Exists(ddsPath) || IsSymlink(ddsPath)) File.Delete(ddsPath);
-                        File.WriteAllBytes(ddsPath, dds);
-                        Console.Error.WriteLine($"  [icon] generated sce_sys/{Path.ChangeExtension(name, ".dds")} ({dds.Length:N0} B) from {name}");
+                        if (File.Exists(p) || IsSymlink(p)) File.Delete(p);
                     }
                 }
 
@@ -1216,8 +1392,8 @@ internal static class Program
                 //         entries 0x0400 (license.dat) and 0x0401 (license.info) — kills
                 //         the "License missing" padlock on the PS5 homescreen.
                 // drm_type=16 in the CNT header is handled UPSTREAM by our IL-patched
-                // LibProsperoPkg.dll (patches/README.md documents the one-byte hex patch
-                // that flips the hardcoded 0-for-Application ternary to always-16). This
+                // LibProsperoPkg.dll (patches/README.md: the Mono.Cecil patcher retargets the
+                // branch of the hardcoded 0-for-Application ternary to always-16). This
                 // lets us keep applicationDrmType="standard" verbatim in the embedded
                 // param.json — flipping it to "upgradable" inside the pkg breaks games
                 // whose source metadata declares an upgrade chain (originContentVersion,
@@ -1293,87 +1469,42 @@ internal static class Program
                     }
                     Console.Error.WriteLine($"  [self-hdr] set retail bit (byte 0x0B: 0x10) on {selfPatched} eboot.bin/*.prx; left {selfLeft} untouched");
 
-                    // (c.iii) Rewrite staged param.json:
-                    //   (a) attribute bit 29 (0x20000000, HDR support) per --hdr-flag. auto keeps
-                    //       the source's declaration — that is the publisher's intent, and a
-                    //       console on "HDR when supported" switches output modes on it. on/off
-                    //       set/clear it explicitly.
-                    //   (b) a "kernel" block (a retail reference package's cpu/gpu page-table + flexible-memory
-                    //       sizes) when the source has none. Not launch-critical (a build without
-                    //       it launched), kept to match retail packages. A source's own block
-                    //       always wins.
-                    var stagedParam = Path.Combine(stagedSceSys, "param.json");
-                    var srcParam = Path.Combine(srcSceSys, "param.json");
-                    if (File.Exists(srcParam))
+                    // (c.iii) Rewrite staged param.json: attribute bit 29 per --hdr-flag and a
+                    //         "kernel" block when the source has none (see RewriteStagedParamJson).
+                    RewriteStagedParamJson(srcSceSys, stagedSceSys, hdrFlag, addKernel: true, tag: "retail");
+                    Console.Error.WriteLine("  [retail] dropped placeholder license.dat/info; installed DebugLicenseProvider (CNT entries 0x0400/0x0401); drm_type=16 via patched LibProsperoPkg.dll");
+                }
+
+                // (d) --hdr-flag on|off for every other source (free DRM, or --no-retail-
+                //     normalize): the attribute rewrite used to live only inside the retail
+                //     block, so the flag was silently ignored there. auto changes nothing.
+                if (!doRetailNormalize && hdrFlag != "auto")
+                    RewriteStagedParamJson(srcSceSys, Path.Combine(autoStage!, "sce_sys"), hdrFlag, addKernel: false, tag: "param");
+
+                // (e) DDS icon CNT entries — LAST, and caught per icon: a PNG that Magick
+                //     rejects must not abort the safety-critical steps above. The package then
+                //     lacks that DDS (without icon0.dds it installs but never launches).
+                if (pngsToConvert.Length > 0)
+                {
+                    var stagedSceSys = Path.Combine(autoStage, "sce_sys");
+                    Directory.CreateDirectory(stagedSceSys);
+                    foreach (var name in pngsToConvert)
                     {
                         try
                         {
-                            using var pdoc = JsonDocument.Parse(File.ReadAllBytes(srcParam));
-                            long currentAttr = 0;
-                            if (pdoc.RootElement.TryGetProperty("attribute", out var at)) currentAttr = at.GetInt64();
-                            const long HdrBit = 0x20000000L;
-                            bool srcHdr = (currentAttr & HdrBit) != 0;
-                            long newAttr = hdrFlag switch
-                            {
-                                "on"  => currentAttr | HdrBit,
-                                "off" => currentAttr & ~HdrBit,
-                                _     => currentAttr,
-                            };
-                            string hdrNote = hdrFlag switch
-                            {
-                                "on"  => srcHdr ? "HDR support flag already set in source (--hdr-flag on)" : "HDR support flag set (--hdr-flag on; the source did not declare it)",
-                                "off" => srcHdr ? "HDR support flag CLEARED (--hdr-flag off; the source declared it)" : "HDR support flag absent in source, left absent (--hdr-flag off)",
-                                _     => srcHdr ? "source declares HDR support (attribute bit 29) — kept" : "source does not declare HDR support (attribute bit 29) — kept as is; pass --hdr-flag on to force HDR output",
-                            };
-                            Console.Error.WriteLine($"  [retail] {hdrNote}");
-                            bool hasKernel = pdoc.RootElement.TryGetProperty("kernel", out _);
-                            bool changed = (newAttr != currentAttr) || !hasKernel;
-                            if (changed)
-                            {
-                                var buf = new System.IO.MemoryStream();
-                                using (var w = new Utf8JsonWriter(buf, new JsonWriterOptions { Indented = true }))
-                                {
-                                    w.WriteStartObject();
-                                    bool kernelWritten = false;
-                                    foreach (var prop in pdoc.RootElement.EnumerateObject())
-                                    {
-                                        // Keep source order; write kernel just before "localizedParameters"
-                                        // (typical Sony ordering) if missing.
-                                        if (!hasKernel && !kernelWritten && prop.Name == "localizedParameters")
-                                        {
-                                            w.WriteStartObject("kernel");
-                                            w.WriteNumber("cpuPageTableSize", 67108864);       // 64 MiB
-                                            w.WriteNumber("flexibleMemorySize", 272629760);    // ~260 MiB (retail reference value)
-                                            w.WriteNumber("gpuPageTableSize", 67108864);       // 64 MiB
-                                            w.WriteEndObject();
-                                            kernelWritten = true;
-                                        }
-                                        if (prop.Name == "attribute")
-                                            w.WriteNumber("attribute", newAttr);
-                                        else
-                                            prop.WriteTo(w);
-                                    }
-                                    // Fallback: if we didn't find localizedParameters, append kernel at end
-                                    if (!hasKernel && !kernelWritten)
-                                    {
-                                        w.WriteStartObject("kernel");
-                                        w.WriteNumber("cpuPageTableSize", 67108864);
-                                        w.WriteNumber("flexibleMemorySize", 272629760);
-                                        w.WriteNumber("gpuPageTableSize", 67108864);
-                                        w.WriteEndObject();
-                                    }
-                                    w.WriteEndObject();
-                                }
-                                if (File.Exists(stagedParam) || IsSymlink(stagedParam)) File.Delete(stagedParam);
-                                File.WriteAllBytes(stagedParam, buf.ToArray());
-                                var kernelNote = hasKernel ? "" : "; added kernel{cpuPageTable=64Mi, flex=260Mi, gpuPageTable=64Mi}";
-                                var attrNote = newAttr != currentAttr ? $"param.json attribute 0x{currentAttr:X8} -> 0x{newAttr:X8}" : $"param.json attribute 0x{currentAttr:X8} unchanged";
-                                Console.Error.WriteLine($"  [retail] {attrNote}{kernelNote}");
-                            }
+                            var png = File.ReadAllBytes(Path.Combine(srcSceSys, name));
+                            var dds = ProsperoDdsEncoder.EncodePngToDds(png, opts.TemporaryDirectory ?? Path.GetTempPath());
+                            var ddsPath = Path.Combine(stagedSceSys, Path.ChangeExtension(name, ".dds"));
+                            if (File.Exists(ddsPath) || IsSymlink(ddsPath)) File.Delete(ddsPath);
+                            File.WriteAllBytes(ddsPath, dds);
+                            Console.Error.WriteLine($"  [icon] generated sce_sys/{Path.ChangeExtension(name, ".dds")} ({dds.Length:N0} B) from {name}");
                         }
-                        catch (Exception ex) { Console.Error.WriteLine($"[warn] retail-normalize: param.json rewrite failed ({ex.GetType().Name})"); }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[warn] icon conversion failed for {name}: {ex.GetType().Name}: {ex.Message}"
+                                + (name == "icon0.png" ? " — the package will have no icon0.dds and will not launch on a console" : ""));
+                        }
                     }
-                    Console.Error.WriteLine("  [retail] dropped placeholder license.dat/info; installed DebugLicenseProvider (CNT entries 0x0400/0x0401); drm_type=16 via patched LibProsperoPkg.dll");
                 }
 
                 opts.SourceFolder = autoStage;
@@ -1384,19 +1515,186 @@ internal static class Program
             var chain = ex.GetType().Name + ": " + ex.Message;
             for (var e = ex.InnerException; e != null; e = e.InnerException)
                 chain += "  <- " + e.GetType().Name + ": " + e.Message;
-            Console.Error.WriteLine("[warn] source auto-stage failed (" + chain + "). The .pkg will be built from the source as-is, which may lack DDS CNT entries and/or unsigned executables.");
+            Console.Error.WriteLine("[error] source staging failed (" + chain + "); nothing was built. A package built from the raw source would lack PlayGo validation, license entries, fake-signing and the retail SELF flag.");
             if (Environment.GetEnvironmentVariable("PKG_TOOL_TRACE") == "1")
                 Console.Error.WriteLine(ex.ToString());
+            CleanupStage(autoStage);
+            return 1;
         }
 
         Console.Error.WriteLine($"[info] build  {opts.SourceFolder} -> {opts.OutputFolder}  (inner={opts.InnerCompression}, backend={opts.KrakenBackend}, level={opts.KrakenCompressionLevel}, temp={opts.TemporaryDirectory ?? "$TMPDIR"}, chunks={opts.PlayGoChunkCount}, fake-sign={autoFakeSign}, retail-normalize={doRetailNormalize})");
+
+        // Baselines for the cleanup after a failed or cancelled build: only files that did not
+        // exist before the build are removed — a .pkg in the output folder (the library writes
+        // the FIH image straight under its final name) and the library's intermediates in temp.
+        string outFull = Path.GetFullPath(opts.OutputFolder);
+        string tempFull = Path.GetFullPath(string.IsNullOrWhiteSpace(opts.TemporaryDirectory) ? Path.GetTempPath() : opts.TemporaryDirectory!);
+        var pkgBefore = new HashSet<string>(SafeEnumerate(outFull, "*.pkg"), StringComparer.Ordinal);
+        var tempBefore = new HashSet<string>(LibraryTempFiles(tempFull), StringComparer.Ordinal);
+        void CleanupAfterFailure()
+        {
+            CleanupStage(autoStage);
+            foreach (var p in SafeEnumerate(outFull, "*.pkg")) if (!pkgBefore.Contains(p)) TryDeleteFile(p, "partial package");
+            foreach (var p in LibraryTempFiles(tempFull)) if (!tempBefore.Contains(p)) TryDeleteFile(p, "library temp file");
+        }
+
+        // SIGTERM (what the GUI's cancel sends to the process group) and SIGINT cancel the build
+        // through the library's own CancellationToken, then everything this run created is
+        // removed. The library polls the token per file and per block, so it normally unwinds
+        // within a second; the GUI follows up with SIGKILL after 5 s, so if the build has not
+        // unwound in 2.5 s the handler thread cleans up itself and exits.
+        using var cts = new CancellationTokenSource();
+        opts.CancellationToken = cts.Token;
+        int signalExit = 0;
+        using var buildDone = new ManualResetEventSlim(false);
+        void OnSignal(PosixSignalContext ctx)
+        {
+            ctx.Cancel = true;   // the runtime must not terminate the process for us
+            int code = ctx.Signal == PosixSignal.SIGINT ? 130 : 143;
+            if (Interlocked.CompareExchange(ref signalExit, code, 0) != 0) return;
+            try { Console.Error.WriteLine($"[cancel] {ctx.Signal} received: cancelling the build and cleaning up"); } catch { }
+            cts.Cancel();
+            if (!buildDone.Wait(TimeSpan.FromMilliseconds(2500)))
+            {
+                CleanupAfterFailure();
+                Environment.Exit(code);
+            }
+        }
+        using var onTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, OnSignal);
+        using var onInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, OnSignal);
+
         ProsperoBuildResult result;
-        try { result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s)); }
-        finally { if (autoStage != null && Directory.Exists(autoStage)) { try { Directory.Delete(autoStage, recursive: true); } catch { } } }
+        try
+        {
+            result = ProsperoPackageBuilder.Build(opts, logger: s => Console.Error.WriteLine("  " + s));
+        }
+        catch (Exception) when (signalExit != 0)
+        {
+            buildDone.Set();
+            CleanupAfterFailure();
+            try { Console.Error.WriteLine($"[cancel] build cancelled; mirror, temp files and partial output removed (exit {signalExit})"); } catch { }
+            return signalExit;
+        }
+        catch
+        {
+            buildDone.Set();
+            CleanupAfterFailure();
+            throw;
+        }
+        finally
+        {
+            buildDone.Set();
+            CleanupStage(autoStage);
+        }
         Console.WriteLine($"OK — wrote {result.OutputPath} ({new FileInfo(result.OutputPath).Length:N0} B)");
         if (result.Warnings != null)
             foreach (var w in result.Warnings) Console.Error.WriteLine("[warn] " + w);
         return 0;
+    }
+
+    /// <summary>Rewrite the staged sce_sys/param.json from the source's copy: attribute bit 29
+    /// (0x20000000, HDR support) per --hdr-flag — auto keeps the source's declaration, the
+    /// publisher's intent, which a console on "HDR when supported" follows; on/off set/clear
+    /// it — and, with <paramref name="addKernel"/> (retail-normalize), a "kernel" block (a
+    /// retail reference package's cpu/gpu page-table + flexible-memory sizes) when the source
+    /// has none; not launch-critical, kept to match retail packages, a source's own block wins.
+    /// The staged file is only replaced when something changes, so the hard link to the source
+    /// stays in place otherwise.</summary>
+    static void RewriteStagedParamJson(string srcSceSys, string stagedSceSys, string hdrFlag, bool addKernel, string tag)
+    {
+        var srcParam = Path.Combine(srcSceSys, "param.json");
+        var stagedParam = Path.Combine(stagedSceSys, "param.json");
+        if (!File.Exists(srcParam))
+        {
+            if (hdrFlag != "auto")
+                Console.Error.WriteLine($"[warn] --hdr-flag {hdrFlag} ignored: the source has no sce_sys/param.json (the builder generates a minimal one)");
+            return;
+        }
+        using var pdoc = JsonDocument.Parse(File.ReadAllBytes(srcParam));
+        long currentAttr = 0;
+        bool hasAttribute = pdoc.RootElement.TryGetProperty("attribute", out var at);
+        if (hasAttribute) currentAttr = at.GetInt64();
+        const long HdrBit = 0x20000000L;
+        bool srcHdr = (currentAttr & HdrBit) != 0;
+        long newAttr = hdrFlag switch
+        {
+            "on"  => currentAttr | HdrBit,
+            "off" => currentAttr & ~HdrBit,
+            _     => currentAttr,
+        };
+        string hdrNote = hdrFlag switch
+        {
+            "on"  => srcHdr ? "HDR support flag already set in source (--hdr-flag on)" : "HDR support flag set (--hdr-flag on; the source did not declare it)",
+            "off" => srcHdr ? "HDR support flag CLEARED (--hdr-flag off; the source declared it)" : "HDR support flag absent in source, left absent (--hdr-flag off)",
+            _     => srcHdr ? "source declares HDR support (attribute bit 29) — kept" : "source does not declare HDR support (attribute bit 29) — kept as is; pass --hdr-flag on to force HDR output",
+        };
+        Console.Error.WriteLine($"  [{tag}] {hdrNote}");
+        bool hasKernel = pdoc.RootElement.TryGetProperty("kernel", out _);
+        bool wantKernel = addKernel && !hasKernel;
+        bool addAttr = !hasAttribute && newAttr != currentAttr;   // the source has no "attribute" at all
+        if (newAttr == currentAttr && !wantKernel) return;
+
+        var buf = new MemoryStream();
+        using (var w = new Utf8JsonWriter(buf, new JsonWriterOptions { Indented = true }))
+        {
+            void WriteKernel()
+            {
+                w.WriteStartObject("kernel");
+                w.WriteNumber("cpuPageTableSize", 67108864);       // 64 MiB
+                w.WriteNumber("flexibleMemorySize", 272629760);    // ~260 MiB (retail reference value)
+                w.WriteNumber("gpuPageTableSize", 67108864);       // 64 MiB
+                w.WriteEndObject();
+            }
+            w.WriteStartObject();
+            bool kernelWritten = false, attrWritten = false;
+            foreach (var prop in pdoc.RootElement.EnumerateObject())
+            {
+                // Keep source order; the kernel block goes just before "localizedParameters"
+                // (typical Sony ordering) when it is missing.
+                if (wantKernel && !kernelWritten && prop.Name == "localizedParameters") { WriteKernel(); kernelWritten = true; }
+                if (prop.Name == "attribute") { w.WriteNumber("attribute", newAttr); attrWritten = true; }
+                else prop.WriteTo(w);
+                // A source without "attribute": add it after applicationDrmType (Sony's ordering).
+                if (addAttr && !attrWritten && prop.Name == "applicationDrmType") { w.WriteNumber("attribute", newAttr); attrWritten = true; }
+            }
+            if (addAttr && !attrWritten) w.WriteNumber("attribute", newAttr);
+            if (wantKernel && !kernelWritten) WriteKernel();
+            w.WriteEndObject();
+        }
+        if (File.Exists(stagedParam) || IsSymlink(stagedParam)) File.Delete(stagedParam);
+        Directory.CreateDirectory(stagedSceSys);
+        File.WriteAllBytes(stagedParam, buf.ToArray());
+        var kernelNote = wantKernel ? "; added kernel{cpuPageTable=64Mi, flex=260Mi, gpuPageTable=64Mi}" : "";
+        var attrNote = newAttr != currentAttr ? $"param.json attribute 0x{currentAttr:X8} -> 0x{newAttr:X8}" : $"param.json attribute 0x{currentAttr:X8} unchanged";
+        Console.Error.WriteLine($"  [{tag}] {attrNote}{kernelNote}");
+    }
+
+    static void CleanupStage(string? stage)
+    {
+        if (stage == null) return;
+        try { if (Directory.Exists(stage)) Directory.Delete(stage, recursive: true); } catch { }
+    }
+
+    static List<string> SafeEnumerate(string dir, string pattern)
+    {
+        try { return Directory.Exists(dir) ? Directory.EnumerateFiles(dir, pattern).ToList() : new List<string>(); }
+        catch { return new List<string>(); }
+    }
+
+    /// <summary>LibProsperoPkg's intermediates in the temp directory: libprospero-publisher-&lt;guid&gt;.*
+    /// (pfs_image.dat, naps_pkg_layout.dat, outer.pfs) and .&lt;pkg name&gt;.&lt;guid&gt;.cnt.tmp.</summary>
+    static IEnumerable<string> LibraryTempFiles(string tempDir)
+        => SafeEnumerate(tempDir, "libprospero-publisher-*").Concat(SafeEnumerate(tempDir, ".*.cnt.tmp"));
+
+    static void TryDeleteFile(string path, string what)
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
+            File.Delete(path);
+            Console.Error.WriteLine($"  [cleanup] removed {what}: {path}");
+        }
+        catch { }
     }
 
     /// <summary>LicenseProvider that issues a valid debug license.dat/info pair for a given

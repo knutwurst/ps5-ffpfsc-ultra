@@ -171,6 +171,7 @@ def build(src_dir: Path, out_dir: Path,
           hdr_flag: str = "auto",               # "auto" | "on" | "off" (bool accepted: True→on, False→off)
           regen_playgo: bool = False,
           fake_sign: bool = True,
+          ampr_index: bool = True,
           on_line=None) -> int:
     """
     Build a debug fPKG from a prepared /app0-style source folder.
@@ -202,6 +203,8 @@ def build(src_dir: Path, out_dir: Path,
       swapped contents) is always discarded and regenerated; that alone turned an
       "installs but will not start" package into a launching one.
     - fake_sign: fake-sign raw ELFs found in the source (idempotent). Default on.
+    - ampr_index: rebuild ampr_emu.index over the packed files when the source ships the
+      AMPR emulator (fakelib/libSceAmpr.sprx). Default on.
     - temp_dir: where LibProsperoPkg stages the inner image / CNT / outer image
       (defaults to $TMPDIR). Pass the app's fast temp drive for big games.
     - level: Kraken preset. Measured: 0..9 give byte-identical output (the encoder's
@@ -236,6 +239,8 @@ def build(src_dir: Path, out_dir: Path,
         argv += ["--hdr-flag", hdr_flag]
     if regen_playgo:
         argv += ["--regen-playgo"]
+    if not ampr_index:
+        argv += ["--no-ampr-index"]
     if not fake_sign:
         argv += ["--no-fake-sign"]
     return _run(argv, on_line=on_line)

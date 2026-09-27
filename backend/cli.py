@@ -1492,6 +1492,9 @@ def main() -> None:
                              "set is always regenerated.")
     parser.add_argument("--fpkg-no-fake-sign", action="store_true",
                         help="fPKG build: do not fake-sign raw ELFs found in the source.")
+    parser.add_argument("--fpkg-no-ampr-index", action="store_true",
+                        help="fPKG: keep the source's ampr_emu.index as it is (default: when "
+                             "fakelib/libSceAmpr.sprx is shipped, rebuild it over the packed files)")
     parser.add_argument("--fpkg-pubtools-dll", type=str, default=None,
                         help="fPKG build: path to Sony libScePubTools.dll for the "
                              "'publishingtools' backend. Overrides the LIBPROSPERO_PUBTOOLS_DLL "
@@ -1781,6 +1784,7 @@ def main() -> None:
                                  hdr_flag=args.fpkg_hdr_flag,
                                  regen_playgo=bool(args.fpkg_regen_playgo),
                                  fake_sign=not args.fpkg_no_fake_sign,
+                                 ampr_index=not args.fpkg_no_ampr_index,
                                  on_line=_gui_line)
             finally:
                 if staged is not None:

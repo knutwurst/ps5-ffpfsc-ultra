@@ -683,6 +683,38 @@ def test_deterministic_build(r: Runner):
             f"drift: {sha(pa)[:16]} vs {sha(pb)[:16]}")
 
 
+def test_ampr_index_rebuilt(r: Runner):
+    """A source shipping the AMPR emulator gets an ampr_emu.index that describes the packed
+    files (fake-signing changes sizes; a stale or missing index must not ship), and the
+    source's own index is never touched (the staging mirror is made of hard links)."""
+    hbt = fetch_hbt(r.work / "hbt")
+    src = r.work / "ampr_src"; out = r.work / "ampr_out"; ext = r.work / "ampr_ext"
+    for d in (src, out, ext):
+        if d.exists(): shutil.rmtree(d)
+    shutil.copytree(hbt, src); out.mkdir(parents=True)
+    (src / "fakelib").mkdir(exist_ok=True)
+    (src / "fakelib" / "libSceAmpr.sprx").write_bytes(b"\x00" * 2048)
+    (src / "ampr_emu.index").write_bytes(b"stale")
+    rc = subprocess.run([str(TOOL), "build", str(src), str(out),
+                         "--content-id", "UP9000-PPSA99099_00-PROSPERO00000000", "--title-id", "PPSA99099",
+                         "--mode", "kraken", "--temp", str(r.work / "ampr_tmp")],
+                        capture_output=True, text=True, timeout=600)
+    log = (rc.stdout or "") + (rc.stderr or "")
+    r.check("ampr.build", rc.returncode == 0, "build succeeded", log[-400:])
+    r.check("ampr.rebuilt-logged", "[ampr] rebuilt ampr_emu.index" in log, "index rebuild reported", log[-400:])
+    r.check("ampr.source-untouched", (src / "ampr_emu.index").read_bytes() == b"stale",
+            "the source's own index is unchanged", "the source index was modified")
+    pkg = next(out.glob("*.pkg"), None)
+    if not pkg:
+        return
+    members = r.work / "ampr_members.txt"; members.write_text("ampr_emu.index\n")
+    subprocess.run([str(TOOL), "extract-inner", str(pkg), str(ext), "--members", str(members)],
+                   capture_output=True, text=True, timeout=300)
+    idx = ext / "ampr_emu.index"
+    r.check("ampr.index-in-package", idx.is_file() and idx.read_bytes()[:8] == b"AMPRIDX3",
+            "the package carries a fresh AMPRIDX3 index", "no valid index inside the package")
+
+
 def test_list_and_selective_extract(r: Runner):
     """list-inner + extract-inner --members: the PFS-browser contract for fPKGs. The JSON
     listing must describe exactly what a full extract-inner writes (same file set, same
@@ -847,6 +879,7 @@ def main():
         ("gui progress translation",        test_gui_progress_translation),
         ("determinism: byte-identical",     test_deterministic_build),
         ("list-inner + selective extract",  test_list_and_selective_extract),
+        ("ampr index rebuilt in staging",   test_ampr_index_rebuilt),
     ]:
         if args.only and args.only.lower() not in name.lower():
             continue

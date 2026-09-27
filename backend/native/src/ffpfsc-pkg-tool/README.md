@@ -132,3 +132,14 @@ PlaintextNoAuth` (mode 0x000D + the `PPPLAIN-NOAUTH!` seed marker — no actual 
 `Program.cs` now forces that mode; a `pfs-dump` diff against a `libScePubTools.dll`
 reference build shows layer B/L/C are byte-identical, only the outer PFS wrap remained
 non-deterministic (timestamp/ICV bytes, harmless).
+
+## AMPR emulator index
+
+A backported source can ship drakmor's AMPR emulator as `fakelib/libSceAmpr.sprx`. The
+emulator resolves APR file ids through `/app0/ampr_emu.index`, so `build` rebuilds that index
+over the staged tree as its last staging step (after fake-signing, which changes sizes). The
+writer (`AmprIndex.cs`) follows the reference builder in drakmor's ampr_emu repository byte for
+byte: UTF-8 keys with only ASCII A–Z folded, FNV-1a-64 slots, the emulator's trace files and OS
+metadata skipped. The index is written by rename, so a hard-linked index from the source is
+replaced in the mirror, never written through. `--no-ampr-index` keeps the source's index as is;
+`ampr-index <folder>` writes one for any folder (diagnostics).

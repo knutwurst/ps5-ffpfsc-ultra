@@ -10272,12 +10272,16 @@ class App:
         output_tmp = output.with_suffix(output.suffix + ".tmp")
 
         def _key(p):
-            return p.replace("\\", "/").lower()
+            # The emulator runtime's key (drakmor's reference builder): UTF-8 bytes with
+            # "\\" -> "/" and only ASCII A-Z folded. Unicode .lower() would change the hash
+            # and the sort order of non-ASCII paths.
+            raw = p.replace("\\", "/").encode("utf-8")
+            return bytes((b + 0x20) if 0x41 <= b <= 0x5A else b for b in raw)
 
         def _fnv(p):
             h = 1469598103934665603
-            for ch in _key(p):
-                h ^= ord(ch)
+            for b in _key(p):
+                h ^= b
                 h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
             return h or 1
 
@@ -10290,12 +10294,14 @@ class App:
             for i, (_, _, path) in enumerate(rows):
                 h = _fnv(path)
                 pos = h & mask
+                dup = False
                 while table[pos][1] != 0:
                     if table[pos][0] == h:
                         oh, oi, of_ = table[pos]
                         table[pos] = (oh, oi, of_ | 1)
+                        dup = True
                     pos = (pos + 1) & mask
-                table[pos] = (h, i + 1, 0)
+                table[pos] = (h, i + 1, 1 if dup else 0)
             return table
 
         def _write(rows):
@@ -10323,7 +10329,8 @@ class App:
             output_tmp.replace(output)
 
         out_r, tmp_r = output.resolve(), output_tmp.resolve()
-        _SKIP = {_key("/app0/ampr_emu.index"), _key("/app0/ampr_emu.index.tmp")}
+        _SKIP = {_key("/app0/ampr_emu.index"), _key("/app0/ampr_emu.index.tmp"),
+                 _key("/app0/ampr_commands.bin"), _key("/app0/apr_emu.log")}   # emulator trace/log
         # OS junk (.DS_Store, ._*, __MACOSX, Thumbs.db, …) is stripped by the backend
         # before packing, so it must not be indexed either — same rule as MkPFS.
         try:

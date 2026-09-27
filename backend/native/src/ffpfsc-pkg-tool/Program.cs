@@ -36,6 +36,7 @@ internal static class Program
                 "extract-outer" => CmdExtract(args, inner: false),
                 "build" => CmdBuild(args),
                 "validate" => CmdValidate(args),
+                "ampr-index" => CmdAmprIndex(args),
                 _ => Bad("unknown command: " + args[0]),
             };
         }
@@ -54,6 +55,7 @@ internal static class Program
         Console.WriteLine("  version");
         Console.WriteLine("  inspect       <pkg>                              [--json]");
         Console.WriteLine("  list-inner    <pkg> [--passcode P]");
+        Console.WriteLine("  ampr-index    <folder>          (re)write <folder>/ampr_emu.index (AMPRIDX3) over its files");
         Console.WriteLine("      One JSON object on stdout: the /app0 tree (files with logical sizes, every");
         Console.WriteLine("      directory, CNT-lifted sce_sys metadata tagged \"source\":\"cnt\") — read via");
         Console.WriteLine("      random access, the inner image is NOT decoded as a whole.");
@@ -81,6 +83,8 @@ internal static class Program
         Console.WriteLine("      --parallelism <n> / -j <n>   accepted for compatibility; LibProsperoPkg 1.2.0's encoder is not");
         Console.WriteLine("                                   thread-safe, so every build runs single-threaded (a warning says so)");
         Console.WriteLine("      --fake-sign / --no-fake-sign fake-sign raw ELFs in source before packing (default ON; idempotent)");
+        Console.WriteLine("      --no-ampr-index              keep the source's ampr_emu.index as it is (default: when fakelib/");
+        Console.WriteLine("                                   libSceAmpr.sprx is shipped, rebuild the index over the packed files)");
         Console.WriteLine("      --regen-playgo               discard source sce_sys/playgo-*.dat and let the builder regenerate them");
         Console.WriteLine("                                   (a CORRUPT prepared set — wrong format, e.g. JSON under hash-table.dat — is");
         Console.WriteLine("                                   always discarded automatically; this forces it for valid-looking sets too)");
@@ -106,6 +110,14 @@ internal static class Program
     /// <summary>The value of the option at args[i]; throws when the option is the last argument.
     /// Every value-taking option of every command goes through here so "--members" without a
     /// file cannot fall through to a full extract and "--mode" alone cannot NRE.</summary>
+    static int CmdAmprIndex(string[] args)
+    {
+        if (args.Length != 2 || !Directory.Exists(args[1])) return Bad("usage: ampr-index <folder>");
+        int rows = AmprIndex.Write(args[1]);
+        Console.WriteLine(rows > 0 ? $"OK — wrote {AmprIndex.FileName} ({rows:N0} file(s))" : "nothing to index");
+        return 0;
+    }
+
     static string Need(string[] args, ref int i, string name)
     {
         if (i + 1 >= args.Length) throw new ArgumentException(name + " needs a value");
@@ -990,6 +1002,7 @@ internal static class Program
         bool playGoChunksExplicit = false; // did the user pass --playgo-chunks?
         bool retailNormalize = true;      // auto-upgrade a "standard" retail source to a shape the console launches
         bool regenPlayGo = false;         // force-discard a prepared PlayGo set even if it validates
+        bool amprIndex = true;            // rebuild ampr_emu.index when the AMPR emulator is shipped
         string hdrFlag = "auto";          // param.json attribute bit 29 (HDR support): auto = as the source declares, on, off
 
         var opts = new ProsperoBuildOptions
@@ -1141,6 +1154,11 @@ internal static class Program
                     // Discard the source's sce_sys/playgo-*.dat even when they validate, so
                     // LibProsperoPkg generates a set that matches the inner tree it builds.
                     regenPlayGo = true;
+                    break;
+                case "--no-ampr-index":
+                    // Keep whatever ampr_emu.index the source ships (or none) instead of
+                    // rebuilding it over the files that are actually packed.
+                    amprIndex = false;
                     break;
                 case "--hdr-flag":
                     // auto: keep the source's declaration (a console on "HDR when supported"
@@ -1505,6 +1523,19 @@ internal static class Program
                                 + (name == "icon0.png" ? " — the package will have no icon0.dds and will not launch on a console" : ""));
                         }
                     }
+                }
+
+                // (f) ampr_emu.index — the AMPR emulator (fakelib/libSceAmpr.sprx) resolves APR
+                //     file ids through /app0/ampr_emu.index, so the index must describe the files
+                //     that are actually packed: fake-signing above changes sizes, and a source may
+                //     ship no index at all. Rebuilt over the staged tree, written by rename so a
+                //     hard-linked index from the source is replaced, never written through.
+                if (amprIndex && File.Exists(Path.Combine(autoStage, "fakelib", "libSceAmpr.sprx")))
+                {
+                    int rows = AmprIndex.Write(autoStage);
+                    Console.Error.WriteLine(rows > 0
+                        ? $"  [ampr] rebuilt ampr_emu.index over the packed files ({rows:N0} file(s))"
+                        : "  [ampr] nothing to index; ampr_emu.index left as it is");
                 }
 
                 opts.SourceFolder = autoStage;

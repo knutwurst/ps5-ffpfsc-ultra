@@ -595,12 +595,33 @@ def _is_same_file(a: Path, b: Path) -> bool:
         return False
 
 
-def _assert_pass2_spool_space(image_path, temp_dir) -> None:
-    """Before pass-2 PFSC compression — which spools roughly the image size into
+def _pass2_needs_spool(block_size) -> bool:
+    """Whether MkPFS's `pack file` will spool the image into its temp folder at all.
+
+    MkPFS streams single-file packs (no spool, only the output's own .tmp) unless the
+    image is signed, uses 64-bit inodes or asks for an auto-fit block size — its own
+    `_stream_fallback_reason` decides. This backend never signs, always passes
+    --inode-bits 32 and normalises the block size to 64 KiB, so pass 2 normally
+    streams. Asking MkPFS itself keeps this in step if that rule ever changes; any
+    doubt keeps the conservative answer (spool)."""
+    try:
+        import argparse as _ap
+        from mkpfs.cli import _stream_fallback_reason
+        ns = _ap.Namespace(signed=False, inode_bits=32, block_size=str(block_size or "65536"))
+        return _stream_fallback_reason(args=ns) is not None
+    except Exception:
+        return True
+
+
+def _assert_pass2_spool_space(image_path, temp_dir, block_size="65536") -> None:
+    """Before pass-2 PFSC compression — when it spools roughly the image size into
     *temp_dir* — make sure the temp drive can hold it. If not, exit non-zero with a
     distinct, parseable message BEFORE mkpfs starts. Call this INSIDE the enclosing
     TemporaryDirectory block so its unwind reclaims the inner image, instead of letting
-    mkpfs crash mid-write and strand a ~150 GB image."""
+    mkpfs crash mid-write and strand a ~150 GB image. A streaming pass 2 needs no spool,
+    so there is nothing to check (see _pass2_needs_spool)."""
+    if not _pass2_needs_spool(block_size):
+        return
     try:
         need = int(Path(image_path).stat().st_size * 1.10)
         free = shutil.disk_usage(str(temp_dir)).free
@@ -614,7 +635,8 @@ def _assert_pass2_spool_space(image_path, temp_dir) -> None:
         sys.exit(1)
 
 
-def _open_pass2_spool_dir(image_path, default_temp_dir, output_path, spill_base=None):
+def _open_pass2_spool_dir(image_path, default_temp_dir, output_path, spill_base=None,
+                          block_size="65536"):
     """Pick where the pass-2 PFSC spool lives — the key to using a fast SSD temp even when
     it can't hold image+spool together.
 
@@ -634,6 +656,8 @@ def _open_pass2_spool_dir(image_path, default_temp_dir, output_path, spill_base=
     caller's own temp dir). Never raises — on any doubt it returns default_temp_dir and the
     pre-pass-2 assert remains the backstop."""
     default_temp_dir = Path(default_temp_dir) if default_temp_dir else Path(tempfile.gettempdir())
+    if not _pass2_needs_spool(block_size):
+        return default_temp_dir, None          # streaming pass 2: no spool to place
     try:
         need = int(Path(image_path).stat().st_size * 1.10)
     except Exception:
@@ -2016,9 +2040,9 @@ def main() -> None:
                 # compression (ENOSPC, OOM kill, cancel, unplugged drive) never loses the
                 # previous image.
                 _phase("Compressing")
-                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, td2, ffpfs_path, spill_base=user_spill)
+                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, td2, ffpfs_path, spill_base=user_spill, block_size=args.block_size)
                 try:
-                    _assert_pass2_spool_space(temp_pfs, spool_dir)
+                    _assert_pass2_spool_space(temp_pfs, spool_dir, block_size=args.block_size)
                     compress_file_to_ffpfsc(
                         temp_pfs, ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                         temp_folder=spool_dir, replace_existing=bool(args.overwrite), **pass2_kwargs,
@@ -2167,9 +2191,9 @@ def main() -> None:
                 with tempfile.TemporaryDirectory(dir=user_temp) as exdir:
                     exfat_img = _build_exfat_image(item, Path(exdir), title_id)
                     if exfat_img is not None:
-                        spool_dir, spool_ctx = _open_pass2_spool_dir(exfat_img, exdir, current_ffpfs_path, spill_base=user_spill)
+                        spool_dir, spool_ctx = _open_pass2_spool_dir(exfat_img, exdir, current_ffpfs_path, spill_base=user_spill, block_size=args.block_size)
                         try:
-                            _assert_pass2_spool_space(exfat_img, spool_dir)
+                            _assert_pass2_spool_space(exfat_img, spool_dir, block_size=args.block_size)
                             print("[INFO] Compressing exFAT image -> .ffpfsc...", flush=True)
                             compress_file_to_ffpfsc(
                                 exfat_img, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
@@ -2202,7 +2226,7 @@ def main() -> None:
                 # path). A .ffpfs is re-wrapped into its native compressed container. The
                 # source is read in place; route the spool to the SSD temp if it fits, else
                 # spill onto the output drive (same adaptive rule as the folder path).
-                spool_dir, spool_ctx = _open_pass2_spool_dir(item, user_temp, current_ffpfs_path, spill_base=user_spill)
+                spool_dir, spool_ctx = _open_pass2_spool_dir(item, user_temp, current_ffpfs_path, spill_base=user_spill, block_size=args.block_size)
                 try:
                     compress_file_to_ffpfsc(
                         item, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
@@ -2279,9 +2303,9 @@ def main() -> None:
                 # put the spool there too if it still fits beside it, else spill the spool
                 # onto the output drive — so a big game still compresses off the fast drive
                 # instead of falling entirely to the HDD.
-                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, str(inner_dir), current_ffpfs_path, spill_base=user_spill)
+                spool_dir, spool_ctx = _open_pass2_spool_dir(temp_pfs, str(inner_dir), current_ffpfs_path, spill_base=user_spill, block_size=args.block_size)
                 try:
-                    _assert_pass2_spool_space(temp_pfs, spool_dir)
+                    _assert_pass2_spool_space(temp_pfs, spool_dir, block_size=args.block_size)
                     compress_file_to_ffpfsc(
                         temp_pfs, current_ffpfs_path, mkpfs_cmd_base, mkpfs_cwd,
                         temp_folder=spool_dir, replace_existing=replace_existing,

@@ -12,21 +12,53 @@ APP_VERSION = _m.group(1) if _m else "1.0"
 
 import os as _os
 
+# backend/ ships as data files, minus everything that does not run inside the app.
+# Directories (relative to backend/) holding no runtime material:
+_BACKEND_SKIP_DIRS = {
+    _os.path.join("native", "src"),    # fPKG tool sources + .NET build inputs/outputs (~160 MB)
+    "tests",                           # test suites
+    _os.path.join("unrar", "src"),     # UnRAR C++ sources (compiled into unrar/_unrar*.so)
+    _os.path.join("unrar", "build"),   # setuptools build tree of that extension
+    ".github",
+}
+# Build inputs, packaging metadata and documentation, not runtime files:
+_BACKEND_SKIP_FILES = {".gitignore", ".DS_Store", "setup.py", "pyproject.toml", "_unrar.cpp"}
+_BACKEND_SKIP_SUFFIXES = (".pyc", ".pyo", ".md")
+# Files every bundle must contain; a missing one is a broken build, so fail early.
+_BACKEND_REQUIRED = [
+    "cli.py", "fpkg.py", "copy_job.py", "fake_sign.py", "make_fself.py",
+    _os.path.join("mkpfs", "cli.py"), _os.path.join("mkpfs", "pfs.py"),
+    _os.path.join("unrar", "__init__.py"), _os.path.join("unrar", "rarfile.py"),
+    _os.path.join("native", "ffpfsc-pkg-tool"),
+    _os.path.join("native", "LICENSE.LibProsperoPkg"),
+]
+
 
 def _backend_datas():
-    """backend/ as data files — minus what is not runtime material: the fPKG tool's
-    SOURCE folder with its .NET build inputs/outputs (lib/ bin/ obj/ out/ — ~160 MB that
-    once inflated the bundle from 99 to 263 MB) and Python bytecode caches."""
+    """backend/ as (source, dest_dir) data pairs: the runtime modules (cli.py, fpkg.py,
+    copy_job.py, fake_sign.py, make_fself.py), mkpfs/, the unrar package with its compiled
+    extension, the native fPKG tool and the license/notice texts. Tests, C++ and C# sources,
+    build trees, packaging metadata, docs and bytecode caches stay out."""
     out = []
-    src_tree = _os.path.join("backend", "native", "src")
     for root, dirs, files in _os.walk("backend"):
-        if root == src_tree or root.startswith(src_tree + _os.sep) or "__pycache__" in root.split(_os.sep):
-            dirs[:] = []
-            continue
-        for f in files:
-            if f.endswith((".pyc", ".pyo")) or f == ".DS_Store":
+        rel = _os.path.relpath(root, "backend")
+        if rel == ".":
+            rel = ""
+        dirs[:] = sorted(
+            d for d in dirs
+            if _os.path.join(rel, d) not in _BACKEND_SKIP_DIRS
+            and d != "__pycache__" and not d.endswith(".egg-info")
+        )
+        for f in sorted(files):
+            if f in _BACKEND_SKIP_FILES or f.endswith(_BACKEND_SKIP_SUFFIXES):
                 continue
             out.append((_os.path.join(root, f), root))
+    bundled = {_os.path.relpath(src, "backend") for src, _ in out}
+    missing = [p for p in _BACKEND_REQUIRED if p not in bundled]
+    if not any(p.startswith(_os.path.join("unrar", "_unrar")) and p.endswith(".so") for p in bundled):
+        missing.append("unrar/_unrar*.so (build it: cd backend/unrar && python3 setup.py build_ext --inplace)")
+    if missing:
+        raise SystemExit("PS5_FFPFSC_ULTRA_macos.spec: runtime files missing from backend/: " + ", ".join(missing))
     return out
 
 

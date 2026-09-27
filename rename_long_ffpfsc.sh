@@ -21,14 +21,8 @@ set -euo pipefail
 
 # --- EDIT ME: "TITLEID|New base name (without .ffpfsc extension)" -------------------
 MAP=(
-  "PPSA00007|Example Title H [PPSA00007] [01.009]"
-  "PPSA00008|Example Title G [PPSA00008] [01.009]"
-  "PPSA00004|Example Sample Bundle [PPSA00004] [01.000]"
-  "PPSA00010|Example Title E [PPSA00010] [01.004]"
-  "PPSA00012|Example Title C [PPSA00012] [04.040]"
-  "PPSA00009|Example Title F [PPSA00009] [01.000]"
-  "PPSA00011|Example Title D [PPSA00011] [01.004]"
-  "PPSA00006|Example Title I [PPSA00006] [01.005]"
+  "PPSA00001|Example Title [PPSA00001] [01.009]"
+  "PPSA00002|Another Example Title [PPSA00002] [01.004]"
 )
 # ------------------------------------------------------------------------------------
 

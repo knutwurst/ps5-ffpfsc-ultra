@@ -497,7 +497,7 @@ def _parse_sfo(data: bytes) -> dict[str, str]:
         entry_base = 0x14 + index * 16
         if entry_base + 16 > len(data):
             break
-        key_offset, fmt = struct.unpack_from("<the retail sample", data, entry_base)
+        key_offset, fmt = struct.unpack_from("<HH", data, entry_base)
         param_len = _le32(data, entry_base + 4)
         data_offset = _le32(data, entry_base + 12)
 

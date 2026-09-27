@@ -1046,7 +1046,7 @@ def guess_game_name(path: Path) -> str:
 
     # 2. Fall back to folder name, cleaning up common PS5 dump suffixes
     name = path.name
-    # Strip "-app" / "_app" suffix (e.g. PPSA00005-app → PPSA00005)
+    # Strip "-app" / "_app" suffix (e.g. PPSA00001-app → PPSA00001)
     # Do NOT use parent folder — it is often a generic dump dir like "PS5 DUMPS"
     name = re.sub(r"[-_]app$", "", name, flags=re.I)
     name = re.sub(r"\s*\[.*?\]\s*", " ", name)
@@ -1180,7 +1180,7 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
         tid = ""
     # Prefer the stable friendly name (the bundle/folder name the user saw, or a folder
     # pack's param.json title) over item.name, which collapses to the extracted stem
-    # (e.g. "PPSA00013") after an archive/bundle is unpacked. This makes the .ffpfsc
+    # (e.g. "PPSA00001") after an archive/bundle is unpacked. This makes the .ffpfsc
     # named after the GAME, the same as packing a folder directly.
     name = (name_override if name_override is not None
             else (getattr(item, "display_name", "") or getattr(item, "name", "") or "")).strip()
@@ -2982,7 +2982,7 @@ class ArchiveExtractor:
                 continue
             queue_dirs.extend(subdirs)
 
-        # Second pass — title-ID folder name (e.g. PPSA00015-app, CUSA12345)
+        # Second pass — title-ID folder name (e.g. PPSA00001-app, CUSA12345)
         queue_dirs = deque([dest])
         visited = 0
         while queue_dirs and visited < 200:
@@ -9337,7 +9337,7 @@ class App:
             # Capture a STABLE display name the first time we render this item — at add
             # time item.name is the friendly name (a bundle's folder, the archive's name).
             # After extraction _copy_item_payload rewrites item.name to the extracted
-            # stem (e.g. "PPSA00013"), which still drives the output filename; this keeps
+            # stem (e.g. "PPSA00001"), which still drives the output filename; this keeps
             # the queue row showing what the user added.
             if not getattr(item, "display_name", None):
                 item.display_name = (getattr(item, "bundle_subfolder", None)

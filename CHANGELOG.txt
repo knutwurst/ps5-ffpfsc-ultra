@@ -18,6 +18,15 @@ HDR FLAG: FOLLOW THE SOURCE BY DEFAULT
   launch-critical. 1.1.12/1.1.13 forced it on for every retail source;
   a remembered setting from those versions migrates to "auto".
 
+FIX: SOURCES WITH A param.sfo NO LONGER CRASH THE METADATA READER
+
+  The vendored MkPFS metadata reader parses PS4-style sce_sys/param.sfo
+  files when a source has no param.json title. Its index-entry struct
+  format string had been damaged in the repository (a text rewrite hit
+  it), so every such source raised struct.error inside the app. Restored
+  to the upstream bytes and covered by a unit test
+  (backend/tests/test_mkpfs_vendored.py).
+
 BUILD: THE fPKG TOOL REBUILDS FROM A CLEAN CLONE
 
   The LibProsperoPkg 1.2.0 assembly — pristine and patched, with SHA-256

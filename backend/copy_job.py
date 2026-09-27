@@ -57,6 +57,37 @@ def _same_device(a: Path, b: Path) -> bool:
     return da != -1 and da == db
 
 
+def _fsync_file(fd: int) -> None:
+    """Push written data to stable storage before the source may be deleted. On
+    macOS a plain fsync only reaches the drive's own cache; F_FULLFSYNC asks the drive
+    to flush that too, which is what makes unplugging the destination after a move
+    safe. Falls back to fsync where the filesystem does not support it."""
+    if sys.platform == "darwin":
+        try:
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except (OSError, AttributeError, ImportError):
+            pass
+    os.fsync(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Flush the directory entry of a just-renamed file. Best effort: Windows cannot
+    open a directory for fsync and some filesystems refuse it — neither is an error
+    for the copy itself."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _resolves_same(src: Path, dst: Path) -> bool:
     """True when ``src`` and ``dst`` resolve to the same file — including the
     macOS case-insensitive equality that ``resolve()`` normalizes. A missing
@@ -151,14 +182,32 @@ def run_copy(src, dst_dir, *,
                 buf = fin.read(CHUNK)
                 if not buf:
                     break
-                fout.write(buf)
-                written += len(buf)
+                # An unbuffered write may accept fewer bytes than offered; count what
+                # actually went out and resubmit the rest.
+                view = memoryview(buf)
+                while view:
+                    n = fout.write(view)
+                    if n is None:            # a buffered writer took everything
+                        n = len(view)
+                    written += n
+                    view = view[n:]
                 if total > 0:
                     pct = min(99, int(written * 100 / total))
                     if pct != last_pct:
                         _print(on_line, f"[####] {pct}% copy")
                         last_pct = pct
+            # Everything must be on the destination before the source may go: flush,
+            # sync, then compare the byte count AND the on-disk size with the source
+            # size, so a short read/write (drive unplugged, a source that changed under
+            # us, a silent ENOSPC) fails here instead of surfacing later as a truncated
+            # game on the destination drive.
+            fout.flush()
+            _fsync_file(fout.fileno())
+            landed = os.fstat(fout.fileno()).st_size
+            if written != total or landed != total:
+                raise OSError(f"short copy: {landed} of {total} bytes reached {tmp.name}")
         os.replace(tmp, dst)
+        _fsync_dir(dst.parent)
     except Exception as e:
         try:
             if tmp.exists():

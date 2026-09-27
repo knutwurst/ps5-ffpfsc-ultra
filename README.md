@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/macOS-first-22c55e?style=for-the-badge&logo=apple&logoColor=white" alt="macOS-first">
   <img src="https://img.shields.io/badge/PS5%20fPKG-native-22c55e?style=for-the-badge" alt="PS5 fPKG native">
   <img src="https://img.shields.io/badge/FW%2011.60-verified-22c55e?style=for-the-badge" alt="FW 11.60 verified">
-  <img src="https://img.shields.io/badge/MkPFS-0.0.8-3a3a3a?style=for-the-badge" alt="MkPFS 0.0.8">
+  <img src="https://img.shields.io/badge/MkPFS-1.0.0-3a3a3a?style=for-the-badge" alt="MkPFS 1.0.0">
   <img src="https://img.shields.io/badge/source-MIT-3a3a3a?style=for-the-badge" alt="Source MIT">
   <img src="https://img.shields.io/badge/binary-GPL--3-3a3a3a?style=for-the-badge" alt="Binary GPL-3">
 </p>

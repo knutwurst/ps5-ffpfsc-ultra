@@ -4139,7 +4139,7 @@ class CLIWorker(threading.Thread):
                 "⚠  Temp drive does not support hardlinks/symlinks. "
                 "Fallback to copy mode — compression will be slower and needs extra space.")
 
-        # Inner image auto-rename (MkPFS 0.0.8) — informational, not an error
+        # Inner image auto-rename (MkPFS) — informational, not an error
         if "renaming inner image" in lower or "inner image renamed" in lower:
             self.app.log("INFO",
                 "ℹ  mkpfs renamed the inner image to match the outer filename. "
@@ -6545,7 +6545,7 @@ class App:
         # cycles. When no job runs we ping nothing and let the drive fully sleep (its lowest-
         # wear state). Default off; toggle + interval live in Settings → Drive & Space.
         self.keep_drives_awake_var = self._persisted_bool(settings, "keep_drives_awake", False)
-        # MkPFS 0.0.8 tuning
+        # MkPFS tuning
         self.compression_level_var = tk.IntVar(value=self._saved_compression_level)
         self.cpu_count_var         = tk.IntVar(value=self._saved_cpu_count)
         self.verbose_var           = self._persisted_bool(settings, "verbose", False)
@@ -6805,7 +6805,7 @@ class App:
             self._cpu_count_lbl.configure(text="auto" if v == 0 else str(v))
         self.cpu_count_var.trace_add("write", _update_cpu_lbl)
 
-        # ── Block size ──  (new in MkPFS 0.0.7/0.0.8 — smaller = less waste for small files)
+        # ── Block size ──  (MkPFS option — smaller = less waste for small files)
         ctk.CTkLabel(tune_bar, text="Block size:", text_color=MUTED,
                       font=ctk.CTkFont(size=11), anchor="e").grid(
             row=1, column=6, sticky="e", padx=(14, 4), pady=(0, 8))
@@ -9784,7 +9784,7 @@ class App:
             cmd.append("--keep-pfs")
         if self.verify_output_var.get():
             cmd.append("--verify")
-        # MkPFS 0.0.8 tuning
+        # MkPFS tuning
         comp_level = self.compression_level_var.get()
         if comp_level != 7:  # only pass if non-default
             cmd += ["--compression-level", str(comp_level)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PS5 FFPFSC ULTRA — backend wrapper (MkPFS 0.0.8+)"""
+"""PS5 FFPFSC ULTRA — backend wrapper (MkPFS 1.0.0, vendored under backend/mkpfs)"""
 import sys
 import os
 
@@ -518,14 +518,14 @@ def _locate_mkpfs() -> tuple[list[str], str | None]:
     # Auto-install via pip
     print("[INFO] MkPFS not found. Installing automatically via pip...")
     res = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "mkpfs==0.0.8"],
+        [sys.executable, "-m", "pip", "install", "mkpfs==1.0.0"],
         capture_output=True, text=True,
     )
     if res.returncode != 0:
         print("[ERROR] Failed to install mkpfs. Please install it manually: pip install mkpfs")
         print(res.stderr)
         sys.exit(1)
-    print("[OK] MkPFS 0.0.8 installed successfully.")
+    print("[OK] MkPFS 1.0.0 installed successfully.")
     return [sys.executable, "-m", "mkpfs"], None
 
 
@@ -1262,7 +1262,7 @@ def main() -> None:
     parser.add_argument("--batch",        action="store_true", help="Process all supported items found under source")
     parser.add_argument("-f", "--force", "--overwrite", dest="overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--password",     type=str, help="Password for ZIP/RAR archives")
-    # MkPFS 0.0.8 tuning flags (forwarded to mkpfs pack file)
+    # MkPFS tuning flags (forwarded to mkpfs pack file)
     parser.add_argument("--compression-level", type=int, default=7,  metavar="0-9",
                         help="Zlib compression level (0=store, 9=max, default: 7)")
     parser.add_argument("--cpu-count",    type=int, default=0,  metavar="N",

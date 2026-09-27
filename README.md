@@ -20,7 +20,7 @@
 
 ---
 
-## 🎮 New in 1.1.10 — PS5 fPKG that actually launches on 11.60
+## 🎮 PS5 fPKG that launches on 11.60
 
 **Build console-installable PS5 `.pkg` files on macOS, in-process, no Wine, no Sony DLL.** The bundled `ffpfsc-pkg-tool` (a self-contained .NET 9 build of drakmor's LibProsperoPkg 1.2.0, GPL-3) turns any pack source — a decrypted game folder, a third-party archive, a `.ffpfsc`, an `.exfat` image — into a debug `.pkg` that installs and launches on a jailbroken PS5.
 
@@ -30,9 +30,11 @@
 
 **Verified 2026-09-24 on retail PS5, firmware 11.60, kstuff-lite 1.13-dr-test3:** the `HomebrewTest` fPKG produced by this tool launches — no `CE-100096-6`, no `beschädigte Daten` sequence, just the app coming up. Byte-diff against a `libScePubTools.dll` reference build: the inner PFS is byte-identical, only the outer PFS wrap differs in non-load-critical timestamp/ICV bytes. The old "≤ 11.40 only" firmware ceiling that shipped in every earlier build was a single wrong outer-PFS wrap mode in our builder — not a Sony patch, not something Wine could have fixed.
 
+**Retail titles launch too (since 1.1.12, verified 2026-09-25 on the same console):** a game built from its own container installs, starts and keeps its saves. The builder validates the source's PlayGo files, stamps the retail DRM type and license entries, and keeps the backport emulators in `fakelib/`.
+
 - **Any source** → `.pkg`: game folder, parent folder (scanned), third-party archive, disk image (`.exfat` / `.ffpkg`), an existing `.ffpfs` or `.ffpfsc` (unwrapped on the temp drive first).
 - **Identity from the game itself.** Content id, title id, version, title read from the source's own `sce_sys/param.json` at build time. The dialog's identity fields are fallbacks for game folders that lack a `param.json`.
-- **17-point validate checklist** runs after every build. If the console rejects the package the log tells you which invariant failed.
+- **19-point validate checklist** runs after every build. If the console rejects the package the log tells you which invariant failed.
 - **Auto-organize** names the result `<Title> [TITLEID] [vXX.YYY].pkg` in a per-title folder, straight from `param.json`.
 - **fPKG⇢** goes the other direction: extract a finalized `.pkg` into a `/app0`-style folder (inner PFS + all `sce_sys` CNT metadata merged), ready to pack, patch, or turn back into a `.pkg`.
 - **Browse** a `.pkg` without extracting the rest: the tree, plus surgical extract of a single file or folder. Decodes only the blocks it touches.

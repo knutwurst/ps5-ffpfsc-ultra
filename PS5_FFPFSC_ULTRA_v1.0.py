@@ -94,7 +94,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.14"
+APP_VERSION = "1.1.15"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -4982,7 +4982,7 @@ class PackDialog(ctk.CTkToplevel):
         ctk.CTkSegmentedButton(r1, values=list(self._INNER), variable=self.inner_var,
                                 selected_color=GREEN, selected_hover_color=GREEN2,
                                 command=lambda *_: self._refresh_hints()).pack(side="left")
-        ctk.CTkLabel(r1, text="  none = default; the extra layer saved nothing in tests",
+        ctk.CTkLabel(r1, text="  kraken = default, the layout verified on the console",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
         if self._backend_shown:
             r2 = ctk.CTkFrame(self.crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
@@ -7226,7 +7226,9 @@ class App:
         # Logs tab
         log_tab = self.bottom_tabs.tab("Logs")
         log_tab.grid_columnconfigure(0, weight=1)
-        log_tab.grid_rowconfigure(0, weight=1)
+        # Only the text box grows or shrinks; the header row keeps its natural height,
+        # otherwise a short log pane squeezes it and "LOGS" / CLEAR LOGS are cut off.
+        log_tab.grid_rowconfigure(0, weight=0)
         log_head = ctk.CTkFrame(log_tab, fg_color=BLACK)
         log_head.grid(row=0, column=0, sticky="ew")
         log_head.grid_columnconfigure(0, weight=1)
@@ -7238,7 +7240,7 @@ class App:
                                         font=ctk.CTkFont(size=12))
         self._ram_label.grid(row=0, column=1, padx=(0, 10), sticky="e")
         self._button(log_head, "CLEAR LOGS", self.clear_logs, width=110).grid(row=0, column=2, padx=4)
-        self.log_box = ctk.CTkTextbox(log_tab, fg_color=BLACK, border_width=1, border_color=BORDER,
+        self.log_box = ctk.CTkTextbox(log_tab, fg_color=BLACK, border_width=1, border_color=BORDER, height=60,
                                        text_color="#94a3b8", font=ctk.CTkFont(family="Consolas", size=12), wrap="none")
         self.log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         log_tab.grid_rowconfigure(1, weight=1)
@@ -10523,6 +10525,13 @@ class App:
         _w = getattr(self, "worker", None)
         _partial_dir = Path(str(getattr(_w, "output_dir", "") or "")) if _w is not None else None
         _partial_since = float(getattr(_w, "start_time", 0) or 0) - 2.0
+        _stage_parent = None
+        try:
+            _src = Path(str(getattr(item, "path", "") or ""))
+            if getattr(item, "operation", "") == "fpkg-build" and _src.is_dir():
+                _stage_parent = _src.parent
+        except Exception:
+            _stage_parent = None
         for cand in (getattr(item, "_build_temp", None), self.temp_var.get().strip(), out_spool):
             if not cand:
                 continue
@@ -10534,7 +10543,8 @@ class App:
             if key not in seen and r.exists():
                 seen.add(key)
                 roots.append(r)
-        if not roots and self._extract_dir_for_item(item) is None and _partial_dir is None:
+        if not roots and self._extract_dir_for_item(item) is None and _partial_dir is None \
+                and _stage_parent is None:
             return
 
         _tp = (self.temp_var.get() or "").strip()   # snapshot on the main thread
@@ -10548,6 +10558,17 @@ class App:
                             sz = get_folder_size(p)
                             shutil.rmtree(str(p), ignore_errors=True)
                             freed += sz
+                except Exception:
+                    pass
+            # The fPKG tool stages a hard-link mirror of a folder source next to it
+            # ("<parent>/.ffpfsc-stage-<id>"); a killed build can leave it behind. Removing
+            # it only unlinks the mirror's links — the source files keep their own.
+            if _stage_parent is not None and _stage_parent.is_dir():
+                try:
+                    for p in _stage_parent.iterdir():
+                        if p.is_dir() and p.name.startswith(".ffpfsc-stage-") \
+                                and p.stat().st_mtime >= _partial_since:
+                            shutil.rmtree(str(p), ignore_errors=True)
                 except Exception:
                     pass
             if _partial_dir is not None and _partial_dir.is_dir():

@@ -3,7 +3,90 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.14  (current)
+  v1.1.15  (current — includes the unreleased 1.1.14)
+────────────────────────────────────────────────────────────────────────
+
+SAFETY: THE APP ONLY EVER DELETES ITS OWN WORKING DATA
+
+  - Cleanup after a job, a failure or pass 1 only removes scratch folders
+    under the app's own temp, pool, output and build folders. A library
+    folder that happens to be called "_extracted" is no longer treated as
+    throwaway.
+  - Extra temp drives get their own "_ffpfsc_temp" subfolder instead of
+    their root. "Clear Temp Files" removes only this app's folders.
+  - The startup sweep never runs while a job is working.
+  - Building over an existing output keeps the old file until the new one
+    is complete (it is built as "<name>.partial" and swapped in). A source
+    can no longer be its own output, and "Overwrite original" for a patch
+    no longer deletes the game before the new image exists.
+  - A move to another drive syncs the data and checks its size before the
+    source is removed.
+  - Auto-organize keeps both packages when the name already exists.
+  - Emulator files injected into a library folder are removed after a
+    crash, and the emulator index skips macOS/Windows junk files.
+  - settings.json is written atomically; an unreadable file is kept aside
+    instead of being replaced. Queue items on an unplugged drive are
+    parked, not dropped.
+
+fPKG TOOL
+
+  - A failed staging step stops the build instead of silently building
+    from the raw source; a broken icon only produces a warning.
+  - The source folder is never written to (a missing param.json used to
+    be created there).
+  - With the temp folder on another drive, the staging mirror is placed
+    next to the source as hard links instead of copying the whole game.
+  - Cancel removes the staging mirror, the library's temp files and the
+    partial .pkg.
+  - --hdr-flag on|off works for every DRM type. Sources declaring more
+    than 64 PlayGo chunks get a regenerated set instead of an error.
+  - Options without a value are errors; validate runs 19 checks
+    (title id vs content id, PlayGo on-wire format, PS5 SELF magic).
+  - --parallelism is capped at 1: the bundled library crashes with more
+    than one worker.
+  - Listing and extracting large packages decodes far less metadata; the
+    tool no longer scans the temp folder at start.
+
+ARCHIVES
+
+  - A wrong first password no longer ends the saved-password list for .7z.
+  - AES-encrypted ZIPs are extracted with 7-Zip.
+  - An archive holding a base game and its patch side by side is no longer
+    packed from the patch folder alone.
+  - The diagnostics export leaves out all passwords. No archive password
+    is pre-filled any more.
+
+OTHER FIXES
+
+  - param.sfo sources no longer crash the metadata reader (the vendored
+    MkPFS copy had a damaged format string; restored and unit-tested).
+  - Pass 2 no longer demands temp space for a spool MkPFS never writes.
+  - fPKG builds report validation failures as a warning after the build.
+  - An fPKG extract goes into its own "<package> [extracted]" folder.
+  - Patch output names stay within the 63-byte limit; patch jobs honour
+    Verify and the spool fallback.
+  - Queue: START with an empty queue does nothing, the unpack-scan mode no
+    longer sticks to the next drop, quitting during an archive extraction
+    asks first, OOM retries never repeat a core count, non-UTF-8 backend
+    output no longer stops the reader.
+  - Organized folders without a title no longer repeat the id; queues
+    saved by older versions keep their format.
+  - The log pane header is no longer cut off.
+
+BUILD & DOCS
+
+  - The fPKG tool rebuilds from a clean clone: LibProsperoPkg 1.2.0
+    (pristine and patched, with sums and a modification notice) is in the
+    repository, the other .NET dependencies are pinned NuGet packages.
+  - macOS-only build: pinned requirements-build.txt, a virtual-environment
+    check, and a release zip with a .sha256 file. Windows leftovers and
+    unused upstream files are gone; the app bundles runtime files only.
+  - NOTICES lists every library inside the app and the backend's origin.
+  - New unit test suites (backend guards, archive extraction, vendored
+    MkPFS); the GUI driver runs in an isolated profile.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.14  (not released; contained in 1.1.15)
 ────────────────────────────────────────────────────────────────────────
 
 HDR FLAG: FOLLOW THE SOURCE BY DEFAULT
@@ -17,23 +100,6 @@ HDR FLAG: FOLLOW THE SOURCE BY DEFAULT
   follows the bit when set to "HDR when supported"; nothing about it is
   launch-critical. 1.1.12/1.1.13 forced it on for every retail source;
   a remembered setting from those versions migrates to "auto".
-
-FIX: SOURCES WITH A param.sfo NO LONGER CRASH THE METADATA READER
-
-  The vendored MkPFS metadata reader parses PS4-style sce_sys/param.sfo
-  files when a source has no param.json title. Its index-entry struct
-  format string had been damaged in the repository (a text rewrite hit
-  it), so every such source raised struct.error inside the app. Restored
-  to the upstream bytes and covered by a unit test
-  (backend/tests/test_mkpfs_vendored.py).
-
-BUILD: THE fPKG TOOL REBUILDS FROM A CLEAN CLONE
-
-  The LibProsperoPkg 1.2.0 assembly — pristine and patched, with SHA-256
-  sums and a modification notice — now lives in the repository under
-  backend/native/src/ffpfsc-pkg-tool/lib/, and the remaining .NET
-  dependencies are pinned NuGet packages instead of hand-copied DLLs.
-  No change to the app itself.
 
 ────────────────────────────────────────────────────────────────────────
   v1.1.13

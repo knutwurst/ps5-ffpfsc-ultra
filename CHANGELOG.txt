@@ -3,7 +3,40 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.15  (current — includes the unreleased 1.1.14)
+  v1.1.16  (current)
+────────────────────────────────────────────────────────────────────────
+
+fPKG: THE AMPR EMULATOR INDEX MATCHES THE PACKED FILES
+
+  A backported source that ships the AMPR emulator (fakelib/
+  libSceAmpr.sprx) gets its ampr_emu.index rebuilt over the files that are
+  actually packed — fake-signing changes executable sizes, and some
+  sources ship no index at all. The writer matches the reference builder
+  of the emulator's author byte for byte; the source's own index is never
+  touched. --fpkg-no-ampr-index keeps the shipped one. The .ffpfsc path
+  uses the same key rules now (differs only for non-ASCII file names).
+
+SPACE CHECK AND DIAGNOSTICS DIALOG AGREE
+
+  The dialog shows exactly what the pre-flight gate checks, drive by
+  drive, so it no longer warns about runs that fit (a disk image needs no
+  temp space; a split run needs only the inner image on the SSD). Split
+  runs no longer reserve room for a pass-2 spool that is never written.
+
+FASTER ON SLOW DRIVES
+
+  A folder is walked once instead of six times when it is added, archive
+  headers are read off the UI thread, and a source without readable
+  metadata is not re-read on every preview refresh.
+
+CODE
+
+  The Tk-free core (settings, naming, space logic, archive extraction,
+  the queue model) moved to ultra_core.py; the GUI re-exports it. The
+  space test runs against the core without loading the GUI.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.15  (includes the unreleased 1.1.14)
 ────────────────────────────────────────────────────────────────────────
 
 SAFETY: THE APP ONLY EVER DELETES ITS OWN WORKING DATA

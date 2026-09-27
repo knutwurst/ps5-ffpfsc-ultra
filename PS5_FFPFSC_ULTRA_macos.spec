@@ -75,6 +75,7 @@ a = Analysis(
     binaries=cryptography_binaries,
     datas=datas,
     hiddenimports=cryptography_hiddenimports + [
+        "ultra_core",   # the Tk-free core next to the app script
         "py7zr",
         "py7zr.helpers",
         "py7zr.compressor",

@@ -3,15 +3,15 @@
 Both read _space_requirements(); this test drives every placement shape with random free
 space on each drive and checks that the dialog's verdict (_space_report) always equals the
 gate's (_space_preflight_ok), and that a disk image never needs temp space. Headless: the
-GUI module is imported, no App and no window is created.
+Tk-free core is imported; nothing GUI is loaded.
 
     python3 -m unittest backend.tests.test_space_gate
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import random
+import sys
 import tempfile
 import types
 import unittest
@@ -19,9 +19,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 os.environ.setdefault("PS5_FFPFSC_APP_DIR", tempfile.mkdtemp(prefix="ffpfsc-space-test-"))
-_spec = importlib.util.spec_from_file_location("ultra_space", REPO / "PS5_FFPFSC_ULTRA_v1.0.py")
-m = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(m)
+sys.path.insert(0, str(REPO))
+import ultra_core as m  # noqa: E402  (the Tk-free core; no GUI import needed)
 
 GB = 1024 ** 3
 TEMP, OUT, POOL = Path("/virtual/temp"), Path("/virtual/out"), Path("/virtual/pool")

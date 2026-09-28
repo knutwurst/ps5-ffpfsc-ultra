@@ -121,6 +121,12 @@ Targets offered, and why only these (all from public sources as of September 202
 
 Nothing above 10.xx is offered: no public SDK constant exists for it, and the app does not guess one.
 
+**One-click prepare.** Point Settings at your 10.01 libraries (the ones from your firmware) and at a folder for the patched result, then click **Prepare 7.61** or **Prepare 6.02**. The app downloads the current BPS patches from [BestPig/BackPork](https://github.com/BestPig/BackPork), applies each one to the matching library from your folder, and writes the patched files into `<patched folder>/<target>/`. Small download, cached; nothing Sony-copyrighted leaves your machine, and nothing is bundled with this app. The same from the command line:
+
+```bash
+python3 backend/cli.py --prepare-backport-libs 7.61 --fw-libs-root <10.01 libs> --backport-libs <where to write>
+```
+
 **Check before building.** With the target firmware's original libraries in Settings, **Check** in the dialog reads which functions the game imports, compares them with what the firmware and your patched libraries export, and reports per library *covered*, *partial* or *missing* — so a title that cannot run on the target is caught before a single byte is packed. The same from the command line:
 
 ```bash

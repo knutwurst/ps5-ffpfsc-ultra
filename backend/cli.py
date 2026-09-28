@@ -1835,6 +1835,12 @@ def main() -> None:
     parser.add_argument("--param-report", type=str, default=None, metavar="PATH",
                         help="List every game under PATH (folders, .ffpfsc/.ffpfs, .pkg) with its title "
                              "id, version and whether param.json declares HDR support, then exit. Read-only.")
+    parser.add_argument("--prepare-backport-libs", type=str, default=None,
+                        choices=("7.61", "6.02"),
+                        help="BACKPORT: download BestPig's BackPork BPS patches for TARGET, "
+                             "apply them to your 10.01 libraries (--fw-libs-root), and write "
+                             "the patched libraries into --backport-libs/<TARGET>/. Runs and "
+                             "exits; the app's job dialog then finds them under Patched libraries.")
     parser.add_argument("--backport-analyze", type=str, default=None, metavar="SRC",
                         help="BACKPORT: read every eboot/prx/sprx under SRC, list the libraries and "
                              "NIDs it imports, and (with --fw-libs-root) compare them to the target "
@@ -1863,6 +1869,24 @@ def main() -> None:
     # JSON shape and progress-line format, so the GUI dialog needs no second path.
     if args.param_report:
         sys.exit(param_report(Path(args.param_report).expanduser().resolve()))
+
+    if args.prepare_backport_libs:
+        target = args.prepare_backport_libs
+        fw = Path(args.fw_libs_root).expanduser().resolve() if args.fw_libs_root else None
+        out = Path(args.backport_libs).expanduser().resolve() if args.backport_libs else None
+        if fw is None or out is None:
+            print("[ERROR] --prepare-backport-libs needs --fw-libs-root (your 10.01 libraries) "
+                  "and --backport-libs (where the patched files land)", flush=True)
+            sys.exit(2)
+        import backport_libs as _bpl
+        cache = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT" / "backport-patches"
+        try:
+            r = _bpl.prepare_target(target, fw, out, cache_dir=cache,
+                                    log=lambda m: print(m, flush=True))
+        except _bpl.BackportLibsError as e:
+            print(f"[ERROR] {e}", flush=True); sys.exit(1)
+        print(f"[prepare] {r.summary()}", flush=True)
+        sys.exit(0 if not r.failed else 1)
 
     if args.backport_analyze:
         if not args.backport_target:

@@ -46,3 +46,6 @@ backend/native/src/ffpfsc-pkg-tool/publish.log
 # backend/native/src/ffpfsc-pkg-tool; they are release artefacts, not sources.
 /backend/native/ffpfsc-pkg-tool
 /backend/native/*.dylib
+
+# BPS patch fetched by the BPS reference test; regenerated on demand
+backend/tests/_backpork_*.bps

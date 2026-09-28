@@ -1093,6 +1093,26 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
                       command=_browse_bl).pack(side="left")
 
+        # One-click prepare: BestPig BackPork patches (small, ~1 KB total per target) →
+        # applied to the user's 10.01 libraries → written into the patched-libraries
+        # folder above, in a target subfolder. Runs in a thread; log lines go to the app
+        # log so the user sees per-library progress.
+        _prep_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _prep_row.pack(fill="x", padx=14, pady=(6, 0))
+        ctk.CTkLabel(_prep_row, text="Prepare from BestPig BackPork patches:",
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        for _t in ("7.61", "6.02"):
+            ctk.CTkButton(_prep_row, text=f"Prepare {_t}", width=100, height=26,
+                           fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                           command=lambda t=_t: self.app.prepare_backport_libs(t)).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(ds, text="Downloads the current .bps patches for the target from BackPork's public "
+                              "GitHub repo, applies them to your 10.01 libraries in the folder ABOVE, and "
+                              "writes the patched files into the patched-libraries folder in a <target> "
+                              "subfolder. The patches are small and cached; the libraries never leave your "
+                              "machine.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14, pady=(4, 4))
+
         ctk.CTkLabel(ds, text="Backport — original firmware libraries (for the compatibility check):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
         ctk.CTkLabel(ds, text="The unmodified system libraries of the target firmware. The job dialog's Check "
@@ -5660,6 +5680,47 @@ class App:
     def open_job_dialog(self, init_src: str | None = None):
         """The one door for every job: source → change the content → output (JobDialog)."""
         JobDialog(self, init_src=init_src)
+
+    def prepare_backport_libs(self, target: str) -> None:
+        """Prepare the patched-libraries folder for *target* from BestPig BackPork.
+        Runs in a background thread; per-library progress goes to the app log. The user
+        must have set the two Settings folders first — otherwise a clear line says which
+        one is missing and where to set it."""
+        fw = (self.fw_libs_var.get() or "").strip()
+        out = (self.backport_libs_var.get() or "").strip()
+        if not fw or not Path(fw).is_dir():
+            self.log("ERROR", f"Prepare {target}: set the ORIGINAL firmware libraries folder in Settings first "
+                              f"(“Backport — original firmware libraries”).")
+            return
+        if not out:
+            self.log("ERROR", f"Prepare {target}: set the PATCHED libraries folder in Settings first "
+                              f"(“Backport — patched libraries folder”).")
+            return
+        pycmd = get_backend_python_command()
+        if not pycmd:
+            self.log("ERROR", "Backend not found; cannot run Prepare.")
+            return
+        cli_py = backend_base_dir() / "cli.py"
+        head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
+        argv = head + ["--prepare-backport-libs", target,
+                       "--fw-libs-root", fw, "--backport-libs", out]
+        self.log("INFO", f"Prepare {target}: downloading BackPork patches and applying them to {fw} → {out}/{target}…")
+
+        def work():
+            try:
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, errors="replace")
+                for line in proc.stdout or ():
+                    self.root.after(0, self.log, "INFO", line.rstrip())
+                proc.wait()
+                if proc.returncode == 0:
+                    self.root.after(0, self.log, "OK", f"Prepare {target} finished — the job dialog will pick up "
+                                                       f"{out}/{target}/ as Patched libraries.")
+                else:
+                    self.root.after(0, self.log, "ERROR", f"Prepare {target} finished with exit code {proc.returncode}.")
+            except Exception as e:
+                self.root.after(0, self.log, "ERROR", f"Prepare {target} failed: {e}")
+        threading.Thread(target=work, daemon=True).start()
 
     def fake_sign_folder(self):
         """Fake Sign job: pick a decrypted PS5 dump folder and ADD it to the queue as a

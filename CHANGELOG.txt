@@ -6,6 +6,40 @@
   v1.1.19  (current)
 ────────────────────────────────────────────────────────────────────────
 
+PREPARE THE PATCHED LIBRARIES IN ONE CLICK
+
+  Settings gets a "Prepare 7.61" and a "Prepare 6.02" button that
+  download BestPig's BackPork BPS patches from GitHub, apply them to
+  your own 10.01 libraries in the folder above, and write the patched
+  files into the patched-libraries folder in a target subfolder. The
+  BPS patches are small (about a kilobyte per target) and cached; the
+  libraries themselves never leave your machine and are not bundled.
+  Also on the command line:
+    --prepare-backport-libs 7.61 --fw-libs-root DIR --backport-libs DIR
+  The BPS format is implemented from byuu's public specification
+  (backend/bps_patch.py). BackPork itself is GPL-3.
+
+ERROR DIALOG: PLAIN WORDS, NOT A CHECKLIST
+
+  A failed job used to open a big red "Compression Failed" dialog with
+  a six-item "Possible Causes" list that repeated for every job kind,
+  so the one line that mattered — e.g. "Permission denied '/Volumes/
+  SAMSUNG'" — was pushed below the fold. The dialog now leads with the
+  backend's own message, adds a plain-words explanation for the
+  shapes we recognise (a drive that dropped from /Volumes, permission
+  denied, ENOSPC, EROFS, a wrong archive password, a SIGKILL, a folder
+  without eboot.bin), and shows the log condensed to its last lines.
+
+FPKG BUILD: NO STRAY INTERMEDIATES IN THE TEMP FOLDER
+
+  The package tool wrote its inner pfs_image.dat (about the size of the
+  package) straight into whatever folder --temp received, so a build
+  left a file next to the user's own files on the temp drive; a crashed
+  build left it there for good. Every fPKG build now gets its own
+  tmpXXXXXXXX subfolder (the same shape mkpfs runs use), the folder is
+  removed after the build, and a leftover after a crash is reclaimed
+  by the app's startup sweep.
+
 ONE DOOR FOR EVERY JOB
 
   The seven verb buttons (Pack, Convert, Patch, Sign, fPKG⇢, Browse,

@@ -2249,6 +2249,13 @@ def main() -> None:
             print(f"[INFO] fPKG build ({args.fpkg_inner}, {args.fpkg_kraken_backend}, level {args.compression_level}; {_opts}): "
                   f"{build_src} -> {out_dir}   [temp: {fpkg_temp}]", flush=True)
             _set_phase("Scanning Files")
+            # The package tool writes its intermediates (the inner pfs_image.dat, about the
+            # size of the package, plus CNT and outer-image files) straight into the folder it
+            # is given. Give it a run-owned "tmpXXXXXXXX" subfolder of the temp drive — the
+            # same shape mkpfs runs use — so nothing lands loose next to the user's temp
+            # contents, the folder is removed when the build ends, and a leftover after a
+            # crash is reclaimed by the GUI's startup sweep (_is_app_tmp_dir).
+            build_temp = Path(tempfile.mkdtemp(prefix="tmp", dir=str(fpkg_temp)))
             try:
                 rc = _fpkg.build(build_src, out_dir,
                                  content_id=_cid,
@@ -2260,7 +2267,7 @@ def main() -> None:
                                  kraken_backend=args.fpkg_kraken_backend,
                                  publishing_tools_dll=args.fpkg_pubtools_dll,
                                  deterministic=bool(args.fpkg_deterministic),
-                                 temp_dir=str(fpkg_temp),
+                                 temp_dir=str(build_temp),
                                  level=int(args.compression_level),
                                  retail_normalize=not args.fpkg_no_retail_normalize,
                                  hdr_flag=args.fpkg_hdr_flag,
@@ -2269,6 +2276,7 @@ def main() -> None:
                                  ampr_index=not args.fpkg_no_ampr_index,
                                  on_line=_gui_line)
             finally:
+                shutil.rmtree(build_temp, ignore_errors=True)
                 if staged is not None:
                     shutil.rmtree(staged, ignore_errors=True)
                     print(f"[INFO] Removed unwrap scratch {staged}", flush=True)

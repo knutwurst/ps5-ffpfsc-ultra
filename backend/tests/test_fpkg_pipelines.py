@@ -676,6 +676,43 @@ def test_gui_progress_translation(r: Runner):
     r.check("gui.bars", len(bars) >= 4, f"{len(bars)} progress bars", f"only {len(bars)} bars: {bars[:3]}")
 
 
+def test_build_temp_is_contained(r: Runner):
+    """The package tool's intermediates (libprospero-publisher-*.pfs_image.dat and friends)
+    must live in a run-owned tmpXXXXXXXX subfolder of --temp-dir, never loose in the temp
+    root, and nothing may be left behind after the build."""
+    hbt = fetch_hbt(r.work / "hbt")
+    temp = r.work / "tmpcheck_temp"; out = r.work / "tmpcheck_out"
+    for d in (temp, out):
+        if d.exists(): shutil.rmtree(d)
+        d.mkdir(parents=True)
+    (temp / "user-file.txt").write_text("the user's own file")
+    argv = [sys.executable, "-u", str(CLI), str(hbt), str(out), "--fpkg-build", str(hbt),
+            "--content-id", "UP9000-PPSA99099_00-PROSPERO00000000", "--title-id", "PPSA99099",
+            "--fpkg-inner", "kraken", "--fpkg-kraken-backend", "builtin", "--temp-dir", str(temp)]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    loose, inside = set(), set()
+    while proc.poll() is None:
+        try:
+            for e in os.scandir(temp):
+                if e.name.startswith("libprospero-") or e.name.startswith("ffpfsc-stage-"):
+                    loose.add(e.name)
+                elif e.is_dir() and re.fullmatch(r"tmp[a-z0-9_]{8}", e.name):
+                    try:
+                        inside.update(x.name for x in os.scandir(e.path) if x.name.startswith("libprospero-"))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        time.sleep(0.02)
+    log = proc.stdout.read() if proc.stdout else ""
+    r.check("temp.build.rc", proc.returncode == 0, "exit 0", log[-400:])
+    r.check("temp.no-loose-intermediates", not loose,
+            "nothing loose in the temp root while building" + (f" (seen inside a tmp folder: {len(inside)})" if inside else ""),
+            f"loose in temp root: {sorted(loose)}")
+    left = sorted(p.name for p in temp.iterdir())
+    r.check("temp.cleaned-after-build", left == ["user-file.txt"], "only the user's own file remains", f"left: {left}")
+
+
 def test_deterministic_build(r: Runner):
     """Two --deterministic builds must produce byte-identical fPKGs."""
     hbt = fetch_hbt(r.work / "hbt")
@@ -1006,6 +1043,7 @@ def main():
         ("list-inner + selective extract",  test_list_and_selective_extract),
         ("ampr index rebuilt in staging",   test_ampr_index_rebuilt),
         ("publishing rules in staging",     test_publishing_rules),
+        ("build temp contained",            test_build_temp_is_contained),
     ]:
         if args.only and args.only.lower() not in name.lower():
             continue

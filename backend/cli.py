@@ -1703,6 +1703,14 @@ def main() -> None:
     parser.add_argument("--param-report", type=str, default=None, metavar="PATH",
                         help="List every game under PATH (folders, .ffpfsc/.ffpfs, .pkg) with its title "
                              "id, version and whether param.json declares HDR support, then exit. Read-only.")
+    parser.add_argument("--backport-analyze", type=str, default=None, metavar="SRC",
+                        help="BACKPORT: read every eboot/prx/sprx under SRC, list the libraries and "
+                             "NIDs it imports, and (with --fw-libs-root) compare them to the target "
+                             "firmware and your --backport-libs. Read-only; nothing is built.")
+    parser.add_argument("--fw-libs-root", type=str, default=None, metavar="DIR",
+                        help="BACKPORT: folder holding ORIGINAL target-firmware libraries (never "
+                             "bundled with this app); used by --backport-analyze to determine which "
+                             "NIDs the console can supply on its own.")
     parser.add_argument("--list-image", type=str, default=None, metavar="IMG",
                         help="PFS BROWSE: print the directory tree of a .ffpfs/.ffpfsc as JSON "
                              "(only metadata blocks are decompressed), then exit.")
@@ -1723,6 +1731,33 @@ def main() -> None:
     # JSON shape and progress-line format, so the GUI dialog needs no second path.
     if args.param_report:
         sys.exit(param_report(Path(args.param_report).expanduser().resolve()))
+
+    if args.backport_analyze:
+        if not args.backport_target:
+            print("[ERROR] --backport-analyze needs --backport-target 7.61|6.02|10.xx", flush=True)
+            sys.exit(2)
+        src = Path(args.backport_analyze).expanduser().resolve()
+        if not src.is_dir():
+            print(f"[ERROR] --backport-analyze: not a folder: {src}", flush=True)
+            sys.exit(1)
+        import backport as _bp
+        fw = Path(args.fw_libs_root).expanduser().resolve() if args.fw_libs_root else None
+        fk = Path(args.backport_libs).expanduser().resolve() if args.backport_libs else None
+        report = _bp.analyse_backport(src, args.backport_target, fw_libs_root=fw, backport_libs_root=fk)
+        # human-readable, one line per library
+        print(f"[analyse] {report.summary()}", flush=True)
+        print(f"{'STATUS':<8} {'LIBRARY':<32} {'USED':>5} {'FW':>5} {'FAKE':>5} {'MISS':>5}")
+        for lr in report.per_library:
+            print(f"{lr.status:<8} {lr.library:<32} "
+                  f"{len(lr.used_nids):>5} {len(lr.firmware_covers):>5} "
+                  f"{len(lr.fakelib_covers):>5} {len(lr.unresolved):>5}")
+        if report.unnamed_imports:
+            print(f"[warn] {report.unnamed_imports} import(s) had no resolvable library name")
+        # exit 0 when every library is fully covered, 1 otherwise — the shell can chain
+        blockers = report.blocking_libraries()
+        if blockers:
+            print(f"[analyse] blocked by: {', '.join(blockers)}")
+        sys.exit(0 if not blockers else 1)
 
     if args.list_image:
         img = Path(args.list_image).resolve()

@@ -95,7 +95,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.18"
+APP_VERSION = "1.1.19"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -1029,6 +1029,55 @@ class SettingsWindow(ctk.CTkToplevel):
         _ampr_entry.bind("<FocusOut>", lambda e: _save_ampr())
         ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
                       command=_browse_ampr).pack(side="left")
+
+        # ── Backport folders ─────────────────────────────────────────────────
+        ctk.CTkLabel(ds, text="Backport — patched libraries folder (default for new jobs):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Your own patched system libraries for the target firmware (you extract them from "
+                              "your firmware and apply the public patches yourself; nothing ships with this app). "
+                              "Copied into the game's fakelib/ when a job backports.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14)
+        _bl_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _bl_row.pack(fill="x", padx=14, pady=(4, 4))
+        _bl_entry = ctk.CTkEntry(_bl_row, textvariable=self.app.backport_libs_var,
+                                 placeholder_text="Folder with patched .sprx files…")
+        _bl_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_bl(*_):
+            save_settings({"backport_libs_root": self.app.backport_libs_var.get().strip()})
+        def _browse_bl():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select the folder with your patched PS5 libraries")
+            if c:
+                self.app.backport_libs_var.set(c)
+                _save_bl()
+        _bl_entry.bind("<FocusOut>", lambda e: _save_bl())
+        ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
+                      command=_browse_bl).pack(side="left")
+
+        ctk.CTkLabel(ds, text="Backport — original firmware libraries (for the compatibility check):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="The unmodified system libraries of the target firmware. The job dialog's Check "
+                              "reads which functions they export and compares them with what a game imports, "
+                              "so you see before building whether the game can run there.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                      wraplength=440).pack(anchor="w", padx=14)
+        _fw_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _fw_row.pack(fill="x", padx=14, pady=(4, 4))
+        _fw_entry = ctk.CTkEntry(_fw_row, textvariable=self.app.fw_libs_var,
+                                 placeholder_text="Folder with the firmware's .sprx files…")
+        _fw_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_fw(*_):
+            save_settings({"fw_libs_root": self.app.fw_libs_var.get().strip()})
+        def _browse_fw():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select the folder with the firmware's system libraries")
+            if c:
+                self.app.fw_libs_var.set(c)
+                _save_fw()
+        _fw_entry.bind("<FocusOut>", lambda e: _save_fw())
+        ctk.CTkButton(_fw_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
+                      command=_browse_fw).pack(side="left")
 
         # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
         ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional, Windows only):",
@@ -4778,6 +4827,11 @@ class App:
         self.output_compressed_var = self._persisted_bool(settings, "output_compressed", True)
         # AMPR/APR emu folder (PlayGo titles): holds libSceAmpr.sprx + libScePlayGo.sprx.
         self.ampr_var = tk.StringVar(value=settings.get("ampr_folder", ""))
+        # Backport folders (both user-supplied, never bundled): the patched libraries the
+        # job dialog offers by default, and the original target-firmware libraries the
+        # compatibility check reads.
+        self.backport_libs_var = tk.StringVar(value=settings.get("backport_libs_root", "") or "")
+        self.fw_libs_var = tk.StringVar(value=settings.get("fw_libs_root", "") or "")
         # Optional Sony Publishing Tools DLL for the fPKG 'publishingtools' Kraken backend.
         # Never bundled — the user points at their own copy. Empty = built-in encoder only.
         self.pubtools_dll_var = tk.StringVar(value=settings.get("pubtools_dll", ""))
@@ -4827,12 +4881,15 @@ class App:
         self._pending_fpkg_identity = None   # (source path, identity dict) handed from the dialog to the scan result
         # (legacy comment kept for context:) output_compressed_var persists the last choice
         # as the default the submenu pre-fills.
-        ctk.CTkLabel(self._toolbar, text="Build jobs into .ffpfsc / .ffpfs — or an installable .pkg (fPKG) — format is set per job",
+        ctk.CTkLabel(self._toolbar, text="Every job: a source, what to change in it, what comes out — folder, .ffpfs, .ffpfsc or .pkg",
                       text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 0))
         # Tools, grouped on the right. (Job entry points — Pack/Convert/Patch/Sign —
         # live in the 'Add job' bar below.)
         self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
         self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
+        # Utilities, not jobs: look inside an image/package, tidy a library.
+        self._button(self._toolbar, "🗂  Organize", self.organize_folder_dialog, width=110).pack(side="right", padx=(0, 8))
+        self._button(self._toolbar, "🔎  Browse", self.open_pfs_browser, width=110).pack(side="right", padx=(0, 8))
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
         # Auto-patch: when a release folder holds a base game plus a clearly-smaller
@@ -4889,16 +4946,12 @@ class App:
         jobbar.pack(fill="x", padx=14, pady=(12, 6))
         ctk.CTkLabel(jobbar, text="Add job:", text_color=WHITE,
                       font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 12))
-        self._button(jobbar, "➕  Add job", self.open_job_dialog,    green=True, width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "📦  Pack",    self.open_pack_dialog,               width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "🔄  Convert", self.open_converter,                 width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "🩹  Patch",   self._open_patch_dialog,             width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "📥  fPKG⇢", self.fpkg_extract_dialog,              width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "🔎  Browse",  self.open_pfs_browser,               width=118).pack(side="left", padx=(0, 8))
-        self._button(jobbar, "🗂  Organize", self.organize_folder_dialog,        width=118).pack(side="left", padx=(0, 8))
-        # (Building an fPKG is the Pack dialog's third output format — no separate door.)
-        ctk.CTkLabel(jobbar, text="…or drag & drop a folder/archive/image (Pack, remembered format) or a .pkg file (fPKG⇢)",
+        # One door. Every job is a source, what to change in it and what comes out; the
+        # dialog derives the rest (see JobDialog). Look inside and Organize are not jobs —
+        # they sit top-right with Settings. The legacy dialogs remain reachable by
+        # double-clicking a job that was queued through them.
+        self._button(jobbar, "➕  Add job", self.open_job_dialog, green=True, width=140).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(jobbar, text="…or drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg anywhere in this window",
                       text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
 
         # Output + format are per job (each submenu); the shared Temp folder lives in
@@ -4979,8 +5032,8 @@ class App:
         qbtns.grid(row=0, column=0, sticky="ew", padx=14, pady=(4, 10))
         qbtns.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        self._button(qbtns, "SCAN / ADD", self.add_source_to_queue, green=True).grid(
-            row=0, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 2))
+        # (No SCAN / ADD here any more: "Add job" in the job bar — or a drop — is the one
+        # door; add_source_to_queue stays as the classifier behind it and multi-drops.)
 
         self._button(qbtns, "↑",         self.queue_move_up,         width=40).grid(
             row=1, column=0, sticky="ew", padx=(4, 2), pady=(2, 4))
@@ -5014,7 +5067,7 @@ class App:
         # per-job password field here was redundant and just took up space (password_var
         # stays as a fallback override, still editable in Settings). Unpacking/decompressing
         # is via the 🔄 Converter (top); the old "Unpack PFS images" checkbox is gone.
-        ctk.CTkLabel(body, text="To unpack / decompress an image, use  🔄 Converter (top).\n"
+        ctk.CTkLabel(body, text="Double-click a job to change it.  Look inside an image or package with  🔎 Browse (top-right).\n"
                                 "Archive passwords & all other options live in  ⚙ Settings (top-right).",
                       text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
                           row=4, column=0, sticky="w", padx=14, pady=(4, 2))

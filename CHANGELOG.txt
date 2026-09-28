@@ -3,7 +3,62 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.18  (current)
+  v1.1.19  (current)
+────────────────────────────────────────────────────────────────────────
+
+ONE DOOR FOR EVERY JOB
+
+  The seven verb buttons (Pack, Convert, Patch, Sign, fPKG⇢, Browse,
+  Organize) are gone. Every job the app can run is the same three
+  things, and the new "Add job" dialog asks for exactly those:
+    1. Source — a game folder, a parent folder of games, an archive, a
+       disk image, a .ffpfs, a .ffpfsc or a .pkg. One line says what
+       was detected (kind, title id, version, SDK version). For an
+       image or package, "Look inside…" opens the browser: a peek, not
+       a job.
+    2. Change the content — optional, applied in this order: integrate
+       a patch, backport to an older firmware, sign the executables.
+       Each shows its options only when checked.
+    3. Output — Folder, .ffpfs, .ffpfsc or .pkg, for any source. A
+       .pkg shows its retail switches.
+  A sentence above the button says what the queue will do ("Backport
+  to 7.61, then build .ffpfsc"), and the queue row and the details
+  panel carry the same sentence. Same format with nothing to change is
+  a copy or move; a folder to a folder with nothing to change is
+  refused. Choices are remembered per kind of source, a dropped path
+  opens the dialog with it, Enter adds, double-click edits a queued
+  job in the same dialog. A parent folder makes one job per game.
+  Browse and Organize sit top-right with Settings.
+
+BACKPORT: RUN A GAME ON AN OLDER FIRMWARE
+
+  A new content change lowers the SDK version in eboot.bin and every
+  prx/sprx to a published target and copies your own patched system
+  libraries into the game's fakelib/ folder. Targets: 7.61 (public
+  library patches exist), 6.02 (experimental, a smaller public set),
+  10.xx (SDK only, for a game newer than the console). Nothing above
+  10.xx is offered: no public SDK values exist for it. No library is
+  bundled with the app; you extract them from your own firmware and
+  apply the public patches yourself. Two Settings fields hold the
+  default folders. "Check" in the dialog reads which functions the
+  game imports and compares them with the target firmware's libraries
+  and your fakelib, and reports per library whether it is covered,
+  before anything is built. Also from the command line:
+    --backport-target 7.61 [--backport-libs DIR]   with any build
+    --backport-analyze SRC --backport-target 7.61 [--fw-libs-root DIR]
+
+ANY SOURCE TO ANY OUTPUT IN ONE JOB
+
+  The backend gained a chain mode (--to folder|ffpfs|ffpfsc|pkg). A
+  container is unpacked into scratch, the changes are applied, and the
+  result is packed by the same code as before, so a plain pack is
+  byte-for-byte what it was. New in one step: .ffpfsc → change →
+  .ffpfsc, .pkg → .ffpfsc, .pkg → change → .pkg, and image → change →
+  folder. A folder source is changed in place, as Sign always was; a
+  container source is never touched.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.18
 ────────────────────────────────────────────────────────────────────────
 
 fPKG HELPER: NO MORE COPIES UNDER ~/.net

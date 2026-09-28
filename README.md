@@ -37,7 +37,7 @@
 - **Validate checklist** runs after every build: container, metadata signature, PlayGo set, presentation images and their DDS, license, NP files, sound, param.json identity, titles, versions, firmware and the eboot. If the console rejects the package the log tells you which invariant failed.
 - **Damaged dumps are repaired in the staging copy, never in the source.** A presentation image in the wrong form is converted (icon0 to 512×512 RGB, pic2 RGBA), one that is no image at all is rebuilt from its DDS, a stale DDS is regenerated, and a PlayGo set that does not describe the packed files is rebuilt. A `param.json` that is not JSON or an empty `eboot.bin` stops the build with a clear message.
 - **Auto-organize** names the result `<Title> [TITLEID] [vXX.YYY].pkg` in a per-title folder, straight from `param.json`.
-- **fPKG⇢** goes the other direction: extract a finalized `.pkg` into a `/app0`-style folder (inner PFS + all `sce_sys` CNT metadata merged), ready to pack, patch, or turn back into a `.pkg`. Package → folder → package is a fixed point: a deterministic build of the extracted folder gives the same bytes.
+- **The other direction is the same dialog:** a `.pkg` with **Folder** as the output extracts the whole `/app0` tree (inner PFS + all `sce_sys` CNT metadata merged), ready to pack, patch, or turn back into a `.pkg`. Package → folder → package is a fixed point: a deterministic build of the extracted folder gives the same bytes.
 - **Browse** a `.pkg` without extracting the rest: the tree, plus surgical extract of a single file or folder. Decodes only the blocks it touches.
 
 The firmware ceiling on any given day is the console-side jailbreak stack, not this builder. As newer `kstuff` variants land for 11.7x / 12.xx, packages built here are expected to launch there too — the format hasn't changed, only how far the jailbreak reaches.
@@ -73,7 +73,7 @@ Built by Knutwurst on a backend that grew out of Bizkut's `ps5-ffpfs-cli`, with 
 - A disk image: `.exfat` or `.ffpkg`.
 - An existing `.ffpfs`, re-wrapped into its compressed `.ffpfsc`.
 - An archive: ZIP, RAR, or 7z. It extracts the archive, finds the game inside, and packs that. Multi-part RAR sets collapse to one job. A 7z extracts through the native `7z` / `7zz` CLI when present (3-10x faster), and falls back to pure-Python `py7zr` otherwise.
-- A finalized PS5 fake package (`.pkg`) — drop it in, or use the **📥 fPKG⇢** job, and the app pulls the whole `/app0` tree out (inner PFS + `sce_sys/param.json`, `icon0.png`, PlayGo files from the CNT container) into a folder you can then pack, patch, or turn back into a `.pkg` with the Pack job's `.pkg` format.
+- A finalized PS5 fake package (`.pkg`) — drop it in and choose **Folder** as the output, and the app pulls the whole `/app0` tree out (inner PFS + `sce_sys/param.json`, `icon0.png`, PlayGo files from the CNT container) into a folder you can then pack, patch, or turn back into a `.pkg`.
 
 Saved archive passwords are tried automatically, so a recurring saved archive password is never retyped. When no saved password unlocks an archive's header, the app asks once at add time and remembers the answer, which also lets the router size the job correctly up front.
 
@@ -81,7 +81,7 @@ Saved archive passwords are tried automatically, so a recurring saved archive pa
 
 - **`.ffpfsc`** — the compressed container, or **`.ffpfs`** the uncompressed image (faster to mount, full size). Per-job switch.
 - **`.pkg`** — an installable PS5 debug fake package. Pick it as the **Format** in the Pack job — any source works. The identity is read from the game's own `sce_sys/param.json` when the job runs; identity fields in the dialog are fallbacks for game folders without a `param.json`. The tool auto-generates `sce_sys/icon0.dds` via Magick.NET (the console needs it to launch). See [What's new](#-new-in-1110--ps5-fpkg-that-actually-launches-on-1160) for the firmware story.
-- **Auto-organize** (Pack dialog, default on) names the result from the game's own `param.json`, whatever the source was called: `<Output>/<Title> [TITLEID] [vXX.YYY.ZZZ]/<Title> [TITLEID] [vXX.YYY].ffpfsc` (or `.pkg`), bundle extras copied into that folder — throw in a folder named `convert` with a third-party archive inside and you still get `Example Quest Deluxe Edition [PPSA00001] [v01.200.007]/Example Quest Deluxe Edition [PPSA00001] [v01.200].ffpfsc`. Names that would break ShadowMountPlus's byte limit are shortened on a byte budget, dropping edition fluff ("Remastered", "Complete Edition") before truncating. For a release folder, the folder layout is recreated at the destination with the DLCs and extras sitting next to the finished container.
+- **Auto-organize** (Add job dialog, default on) names the result from the game's own `param.json`, whatever the source was called: `<Output>/<Title> [TITLEID] [vXX.YYY.ZZZ]/<Title> [TITLEID] [vXX.YYY].ffpfsc` (or `.pkg`), bundle extras copied into that folder — throw in a folder named `convert` with a third-party archive inside and you still get `Example Quest Deluxe Edition [PPSA00001] [v01.200.007]/Example Quest Deluxe Edition [PPSA00001] [v01.200].ffpfsc`. Names that would break ShadowMountPlus's byte limit are shortened on a byte budget, dropping edition fluff ("Remastered", "Complete Edition") before truncating. For a release folder, the folder layout is recreated at the destination with the DLCs and extras sitting next to the finished container.
 
 ## Why this one
 
@@ -92,22 +92,46 @@ A plain packer asks you to prepare a clean folder, then writes a single image to
 - **It builds images the console actually reads.** Packing forces the 64 KiB PFS block size the PS5 expects. A smaller block passes a local build and verify, then the console misreads the filesystem and crashes on launch. Boot-tested on firmware 11.60: 64 KiB boots, a 4 KiB build of the same game crashes.
 - **You feed it the download, not a prepared folder.** It reads ZIP, RAR, and 7z straight through, including multi-part RAR sets and archives with encrypted headers. When a header is locked, it asks for the password once and remembers it. macOS carries a self-contained native UnRAR module, so nothing external is required for RAR.
 - **It cleans the dump without throwing your files away.** Tooling junk like a `_bundle_` group folder, loose `.nfo`, and `.sfv` never enters the image, yet none of it is deleted: the app moves it next to the finished `.ffpfsc` so the nfo and the extras stay with you. OS junk (`.DS_Store`, `._*`, `__MACOSX`) is dropped outright.
-- **It runs a real queue, not a one-shot.** Mix pack, convert, patch, fake-sign, fPKG extract, and fPKG build jobs, each with its own source, output folder, and format. Double-click a row to edit it. A failed job stays in the queue and the batch keeps going.
+- **It runs a real queue, not a one-shot.** Every job is a source, what to change in it, and what comes out — mix them freely, each with its own source, output folder, and format. Double-click a row to edit it. A failed job stays in the queue and the batch keeps going.
 - **It opens a packed image and pulls one file out.** The Browse view lists what is inside a `.ffpfs`, a `.ffpfsc`, or a `.pkg` (fPKG) and extracts a single file or a whole folder without unpacking the rest. It decompresses only the blocks it touches, so opening a 100 GB container does not wait on a full decompression and pulling one file out costs a fraction of a full unpack.
 
 ## The job queue
 
-Add work through seven buttons and run it in one pass:
+One button, **➕ Add job**, or drop a path anywhere in the window. Every job the app can run is the same three things, and the dialog asks for exactly those:
 
-- **📦 Pack** a folder, image, `.ffpfs`, or archive into a `.ffpfsc` / `.ffpfs` — **or into a `.pkg`** by picking `.pkg` as the Format.
-- **🔄 Convert** an existing image: decompress a `.ffpfsc` to its inner `.ffpfs`, or unpack either to a folder.
-- **🩹 Patch** a game by overlaying a patch (folder or archive) and repacking, into a new copy or over the original.
-- **🖊 Sign** a folder's executables (fake-sign) so they boot on a jailbroken console.
-- **📥 fPKG⇢** extract a finalized PS5 `.pkg` into a `/app0`-style folder (inner PFS + CNT metadata merged).
-- **🔎 Browse** peek inside a `.ffpfs` / `.ffpfsc` / `.pkg` and pull out a single file or folder.
-- **🗂 Organize** batch-rename a folder tree of existing containers into the auto-organize layout.
+1. **Source** — a game folder, a parent folder of games (one job each), an archive (`.zip` / `.rar` / `.7z`), a disk image (`.exfat` / `.ffpkg`), a `.ffpfs`, a `.ffpfsc` or a `.pkg`. One line says what was detected: kind, title id, version, SDK version. For an image or a package, **Look inside…** opens the browser — a peek, not a job.
+2. **Change the content** — optional, applied in this order: **integrate a patch** (folder or archive), **backport** to an older firmware (see below), **sign** the executables (fake-sign). Each shows its options only when checked.
+3. **Output** — **Folder**, **`.ffpfs`**, **`.ffpfsc`** or **`.pkg`**, for any source. `.pkg` shows its retail switches.
+
+A sentence above the button says what the queue will do — *Backport to 7.61, then build .ffpfsc*, *Unpack to folder*, *Build .pkg*, *Sign in place* — and the queue row carries the same sentence. Same format with nothing to change is a copy or move; a folder to a folder with nothing to change is refused. The dialog remembers your choices per kind of source, so the next drop is source → Enter. **🔎 Browse** and **🗂 Organize** (batch-rename a library into the auto-organize layout) sit top-right, next to Settings, because they are not jobs.
 
 Each job carries its own source, output folder, and format. Double-click a queued row to edit it. A failed or cancelled job stays in the queue marked as such, so the rest of the batch keeps running and a later Start retries it. The status panel shows the active phase, per-file detail, speed, ETA, compression ratio, temp usage, and CPU/RAM, with a live log alongside.
+
+## Backport: run a game on an older firmware
+
+A backport lowers the SDK version a game declares in `eboot.bin` and every `prx`/`sprx`, and ships the newer system libraries the old firmware lacks in the game's `fakelib/` folder, where ShadowMountPlus mounts them over the system's own. The app does the first part and copies the second from a folder you own — **no system library is bundled with or linked from this app**; you extract them from your own firmware and apply the public patches yourself.
+
+Targets offered, and why only these (all from public sources as of September 2026):
+
+| Target | Status |
+|---|---|
+| **7.61** | Public library patches exist for this target; the community's documented path. |
+| **6.02** | Experimental — a smaller public library set; only some titles run. |
+| **10.xx** | SDK only, no library bundle — for a game newer than the console. |
+
+Nothing above 10.xx is offered: no public SDK constant exists for it, and the app does not guess one.
+
+**Check before building.** With the target firmware's original libraries in Settings, **Check** in the dialog reads which functions the game imports, compares them with what the firmware and your patched libraries export, and reports per library *covered*, *partial* or *missing* — so a title that cannot run on the target is caught before a single byte is packed. The same from the command line:
+
+```bash
+python3 backend/cli.py --backport-analyze <game folder> --backport-target 7.61 --fw-libs-root <firmware libs> --backport-libs <patched libs>
+```
+
+Any build takes `--backport-target 7.61 [--backport-libs DIR]`, and the chain mode does the whole thing on a container in one call:
+
+```bash
+python3 backend/cli.py <game>.ffpfsc <output folder> --to ffpfsc --backport-target 7.61 --backport-libs <patched libs>
+```
 
 ## Browse inside an image
 

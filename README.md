@@ -1,7 +1,7 @@
 # PS5 UltraPack
 
 <p align="center">
-  <img src="images/full-app.jpg" alt="PS5 UltraPack main window" width="900">
+  <img src="images/main-window.jpg" alt="PS5 UltraPack main window: sidebar, job queue, and the card of the running job" width="900">
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
 **Build console-installable PS5 `.pkg` files on macOS, in-process, no Wine, no Sony DLL.** The bundled `ffpfsc-pkg-tool` (a self-contained .NET 9 build of drakmor's LibProsperoPkg 1.2.0, GPL-3) turns any pack source — a decrypted game folder, a third-party archive, a `.ffpfsc`, an `.exfat` image — into a debug `.pkg` that installs and launches on a jailbroken PS5.
 
 <p align="center">
-  <img src="images/fpkg-pack.jpg" alt="Pack dialog set to .pkg format — identity read from param.json, launches on FW 11.60+ with kstuff-lite 1.13" width="720">
+  <img src="images/add-job-pkg.jpg" alt="Add job, a panel of the main window, with .pkg as the output: identity read from param.json, retail switches below" width="760">
 </p>
 
 **Verified 2026-09-24 on retail PS5, firmware 11.60, kstuff-lite 1.13-dr-test3:** the `HomebrewTest` fPKG produced by this tool launches — no `CE-100096-6`, no `beschädigte Daten` sequence, just the app coming up. Byte-diff against a `libScePubTools.dll` reference build: the inner PFS is byte-identical, only the outer PFS wrap differs in non-load-critical timestamp/ICV bytes. The old "≤ 11.40 only" firmware ceiling that shipped in every earlier build was a single wrong outer-PFS wrap mode in our builder — not a Sony patch, not something Wine could have fixed.
@@ -55,18 +55,16 @@ Built by Knutwurst on a backend that grew out of Bizkut's `ps5-ffpfs-cli`, with 
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="images/fpkg-browse.jpg" width="400" alt="Browse dialog opened on a .pkg (fPKG), tree fully expanded"><br><sub><b>🔎 Browse a .pkg</b> &nbsp;·&nbsp; the whole tree of a fake-package — inner PFS + CNT metadata (param.json, icon, PlayGo, keystone) — decoded block by block, no full unpack</sub></td>
-    <td align="center" width="50%"><img src="images/settings.jpg" width="400" alt="Settings: drive routing and packing options"><br><sub><b>⚙️ Settings</b> &nbsp;·&nbsp; smart drive routing, per-job format, fake-sign, and more</sub></td>
+    <td align="center" width="50%"><img src="images/add-job.jpg" width="400" alt="Add job: source, changes, output"><br><sub><b>Add job</b> &nbsp;·&nbsp; a panel in the main window: a source, what to change in it, what comes out</sub></td>
+    <td align="center" width="50%"><img src="images/look-inside.jpg" width="400" alt="Look inside a .ffpfsc"><br><sub><b>Look inside</b> &nbsp;·&nbsp; the tree of a .ffpfs, .ffpfsc or .pkg; pull single files out without unpacking the rest</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/browse.jpg" width="400" alt="Browse and extract from a packed image"><br><sub><b>🔎 Browse a .ffpfsc</b> &nbsp;·&nbsp; same tree view for a compressed PFS image — pick one file out without unpacking the rest</sub></td>
-    <td align="center" width="50%"><img src="images/convert.jpg" width="400" alt="Image converter"><br><sub><b>🔄 Convert</b> &nbsp;·&nbsp; decompress or unpack an image, step by step</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="images/patch.jpg" width="400" alt="Integrate a patch into a game"><br><sub><b>🩹 Patch</b> &nbsp;·&nbsp; overlay an update onto a game and repack</sub></td>
-    <td align="center" width="50%">&nbsp;</td>
+    <td align="center" width="50%"><img src="images/settings.jpg" width="400" alt="Settings, drives and space page"><br><sub><b>Settings</b> &nbsp;·&nbsp; a view of the main window, one page each for folders, compression, archives, drives and backport libraries</sub></td>
+    <td align="center" width="50%"><img src="images/main-window-light.jpg" width="400" alt="Main window in light mode"><br><sub><b>Light mode</b> &nbsp;·&nbsp; Settings → General → Appearance</sub></td>
   </tr>
 </table>
+
+The 1.1.x interface is kept for comparison in [docs/screenshots](docs/screenshots/README.md).
 
 ## What it packs
 
@@ -81,7 +79,7 @@ Saved archive passwords are tried automatically, so a recurring saved archive pa
 ## What it produces
 
 - **`.ffpfsc`** — the compressed container, or **`.ffpfs`** the uncompressed image (faster to mount, full size). Per-job switch.
-- **`.pkg`** — an installable PS5 debug fake package. Pick it as the **Format** in the Pack job — any source works. The identity is read from the game's own `sce_sys/param.json` when the job runs; identity fields in the dialog are fallbacks for game folders without a `param.json`. The tool auto-generates `sce_sys/icon0.dds` via Magick.NET (the console needs it to launch). See [What's new](#-new-in-1110--ps5-fpkg-that-actually-launches-on-1160) for the firmware story.
+- **`.pkg`** — an installable PS5 debug fake package. Pick **.pkg** as the output in Add job; any source works. The identity is read from the game's own `sce_sys/param.json` when the job runs; identity fields in the dialog are fallbacks for game folders without a `param.json`. The tool auto-generates `sce_sys/icon0.dds` via Magick.NET (the console needs it to launch). See [What's new](#-new-in-1110--ps5-fpkg-that-actually-launches-on-1160) for the firmware story.
 - **Auto-organize** (Add job dialog, default on) names the result from the game's own `param.json`, whatever the source was called: `<Output>/<Title> [TITLEID] [vXX.YYY.ZZZ]/<Title> [TITLEID] [vXX.YYY].ffpfsc` (or `.pkg`), bundle extras copied into that folder — throw in a folder named `convert` with a third-party archive inside and you still get `Example Quest Deluxe Edition [PPSA00001] [v01.200.007]/Example Quest Deluxe Edition [PPSA00001] [v01.200].ffpfsc`. Names that would break ShadowMountPlus's byte limit are shortened on a byte budget, dropping edition fluff ("Remastered", "Complete Edition") before truncating. For a release folder, the folder layout is recreated at the destination with the DLCs and extras sitting next to the finished container.
 
 ## Why this one
@@ -94,19 +92,19 @@ A plain packer asks you to prepare a clean folder, then writes a single image to
 - **You feed it the download, not a prepared folder.** It reads ZIP, RAR, and 7z straight through, including multi-part RAR sets and archives with encrypted headers. When a header is locked, it asks for the password once and remembers it. macOS carries a self-contained native UnRAR module, so nothing external is required for RAR.
 - **It cleans the dump without throwing your files away.** Tooling junk like a `_bundle_` group folder, loose `.nfo`, and `.sfv` never enters the image, yet none of it is deleted: the app moves it next to the finished `.ffpfsc` so the nfo and the extras stay with you. OS junk (`.DS_Store`, `._*`, `__MACOSX`) is dropped outright.
 - **It runs a real queue, not a one-shot.** Every job is a source, what to change in it, and what comes out — mix them freely, each with its own source, output folder, and format. Double-click a row to edit it. A failed job stays in the queue and the batch keeps going.
-- **It opens a packed image and pulls one file out.** The Browse view lists what is inside a `.ffpfs`, a `.ffpfsc`, or a `.pkg` (fPKG) and extracts a single file or a whole folder without unpacking the rest. It decompresses only the blocks it touches, so opening a 100 GB container does not wait on a full decompression and pulling one file out costs a fraction of a full unpack.
+- **It opens a packed image and pulls one file out.** **Look inside** lists what is inside a `.ffpfs`, a `.ffpfsc`, or a `.pkg` (fPKG) and extracts a single file or a whole folder without unpacking the rest. It decompresses only the blocks it touches, so opening a 100 GB container does not wait on a full decompression and pulling one file out costs a fraction of a full unpack.
 
 ## The job queue
 
-One button, **➕ Add job**, or drop a path anywhere in the window. Every job the app can run is the same three things, and the dialog asks for exactly those:
+One button, **Add job** (⌘N), or drop a path anywhere in the window. Every job the app can run is the same three things, and the dialog asks for exactly those:
 
 1. **Source** — a game folder, a parent folder of games (one job each), an archive (`.zip` / `.rar` / `.7z`), a disk image (`.exfat` / `.ffpkg`), a `.ffpfs`, a `.ffpfsc` or a `.pkg`. One line says what was detected: kind, title id, version, SDK version. For an image or a package, **Look inside…** opens the browser — a peek, not a job.
 2. **Change the content** — optional, applied in this order: **integrate a patch** (folder or archive), **backport** to an older firmware (see below), **sign** the executables (fake-sign). Each shows its options only when checked.
 3. **Output** — **Folder**, **`.ffpfs`**, **`.ffpfsc`** or **`.pkg`**, for any source. `.pkg` shows its retail switches.
 
-A sentence above the button says what the queue will do — *Backport to 7.61, then build .ffpfsc*, *Unpack to folder*, *Build .pkg*, *Sign in place* — and the queue row carries the same sentence. Same format with nothing to change is a copy or move; a folder to a folder with nothing to change is refused. The dialog remembers your choices per kind of source, so the next drop is source → Enter. **🔎 Browse** and **🗂 Organize** (batch-rename a library into the auto-organize layout) sit top-right, next to Settings, because they are not jobs.
+A sentence above the button says what the queue will do — *Backport to 7.61, then build .ffpfsc*, *Unpack to folder*, *Build .pkg*, *Sign in place* — and the queue row carries the same sentence. Same format with nothing to change is a copy or move; a folder to a folder with nothing to change is refused. The dialog remembers your choices per kind of source, so the next drop is source → Enter. **Look inside** and **Organize** (batch-rename a library into the auto-organize layout) sit under Tools in the sidebar, because they are not jobs.
 
-Each job carries its own source, output folder, and format. Double-click a queued row to edit it. A failed or cancelled job stays in the queue marked as such, so the rest of the batch keeps running and a later Start retries it. The status panel shows the active phase, per-file detail, speed, ETA, compression ratio, temp usage, and CPU/RAM, with a live log alongside.
+Each job carries its own source, output folder, and format. Double-click a queued row to edit it. A failed or cancelled job stays in the queue marked as such, so the rest of the batch keeps running and a later Start retries it. The window has three parts. The sidebar switches between **Queue**, **History** (past jobs and totals) and **Log** (everything the backend printed), ⌘1 to ⌘3. In the queue, the card next to the list shows the selected job: its recipe, its target folder and, while it runs, its stages, speed, elapsed and remaining time, and the last log lines. The status bar shows RAM and the free space on the temp and output drives. Settings is a view of the window too, and the work surfaces (Add job, Edit job, Look inside) open as panels over the content. Messages such as a job's result, an error report or a password prompt come up in a small window of their own, centred over the main window.
 
 ## Backport: run a game on an older firmware
 
@@ -122,7 +120,7 @@ Targets offered, and why only these (all from public sources as of September 202
 
 Nothing above 10.xx is offered: no public SDK constant exists for it, and the app does not guess one.
 
-**One-click prepare.** Point Settings at your 10.01 libraries (the ones from your firmware) and at a folder for the patched result, then click **Prepare 7.61** or **Prepare 6.02**. The app downloads the current BPS patches from [BestPig/BackPork](https://github.com/BestPig/BackPork), applies each one to the matching library from your folder, and writes the patched files into `<patched folder>/<target>/`. Small download, cached; nothing Sony-copyrighted leaves your machine, and nothing is bundled with this app. The same from the command line:
+**One-click prepare.** In Settings → Backport & libraries, point the app at your 10.01 libraries (the ones from your firmware) and at a folder for the patched result, then click **Prepare 7.61** or **Prepare 6.02**. The app downloads the current BPS patches from [BestPig/BackPork](https://github.com/BestPig/BackPork), applies each one to the matching library from your folder, and writes the patched files into `<patched folder>/<target>/`. Small download, cached; nothing Sony-copyrighted leaves your machine, and nothing is bundled with this app. The same from the command line:
 
 ```bash
 python3 backend/cli.py --prepare-backport-libs 7.61 --fw-libs-root <10.01 libs> --backport-libs <where to write>
@@ -140,9 +138,9 @@ Any build takes `--backport-target 7.61 [--backport-libs DIR]`, and the chain mo
 python3 backend/cli.py <game>.ffpfsc <output folder> --to ffpfsc --backport-target 7.61 --backport-libs <patched libs>
 ```
 
-## Browse inside an image
+## Look inside an image
 
-The 🔎 Browse button opens a `.ffpfs`, a `.ffpfsc`, or a `.pkg` (fPKG) and shows its contents as a tree, with multi-select and a live name filter. Pick a file, a folder, or several at once, and extract just those to a folder you choose. The rest of the image stays packed — a `.pkg` is decrypted and decoded block by block (a 240 MB package lists in about a tenth of a second reading 1.5 MiB), and the `sce_sys` metadata the package keeps outside its inner image (`param.json`, icons, PlayGo files) shows up in the tree like any other file.
+**Look inside** (in the sidebar, the link under the source in Add job, or a double-click on the file in Finder) opens a `.ffpfs`, a `.ffpfsc`, or a `.pkg` (fPKG) and shows its contents as a tree, with multi-select and a live name filter. Pick a file, a folder, or several at once, and extract just those to a folder you choose. The rest of the image stays packed — a `.pkg` is decrypted and decoded block by block (a 240 MB package lists in about a tenth of a second reading 1.5 MiB), and the `sce_sys` metadata the package keeps outside its inner image (`param.json`, icons, PlayGo files) shows up in the tree like any other file.
 
 It reads only the blocks it touches: listing the tree decompresses just the filesystem metadata, and extracting a file decompresses only that file's blocks. Neither costs a full unpack, even on a compressed `.ffpfsc` (which it reads by descending into the inner image and decoding blocks on demand). What comes out is byte-for-byte identical to the original, audited and sha256-verified against mkpfs's own extractor in both formats. The view is read-only and never changes the image.
 

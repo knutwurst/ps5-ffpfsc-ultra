@@ -25,6 +25,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
+# Never touch the real profile: the app dir is computed (and an old one migrated) at
+# import time, so point it at a scratch folder first.
+os.environ.setdefault("PS5_FFPFSC_APP_DIR", tempfile.mkdtemp(prefix="ultrapack-test-profile-"))
 _spec = importlib.util.spec_from_file_location("ultra_under_test", str(REPO / "PS5_UltraPack.py"))
 m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(m)

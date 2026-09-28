@@ -114,6 +114,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import ultra_core  # noqa: E402
 from ultra_core import *  # noqa: E402,F401,F403
+from ui_kit import (Kit, IconButton, IconView, ArtView, ProgressBar, QueueList,  # noqa: E402
+                    Chips, StepStrip, LogText, Tile, RoundBox, ctk_pair, apply_ctk_theme, PALETTE)
 
 
 def _augment_path_for_gui() -> None:
@@ -139,32 +141,337 @@ def _augment_path_for_gui() -> None:
 
 _augment_path_for_gui()
 
-# Each constant is a (light_mode, dark_mode) tuple.
-# CTk reads the correct value automatically when set_appearance_mode() is called —
-# no manual recoloring needed anywhere in the app.
-BLACK   = ("#f0f0f0", "#050505")   # main background
-PANEL   = ("#e2e2e2", "#111111")   # panel / card background
-CARD    = ("#d4d4d4", "#151515")   # entry / inner card
-CARD2   = ("#cacaca", "#1a1a1a")   # secondary card / normal button fill
-BORDER  = ("#b0b0b0", "#2a2a2a")   # panel border
-BORDER2 = ("#999999", "#3a3a3a")   # entry / button border
-GREEN   = "#4ade80"                 # accent — looks fine on both backgrounds
-GREEN2  = "#22c55e"                 # accent hover
-YELLOW  = "#facc15"
-RED     = "#ef4444"
-WHITE   = ("#111111", "#f8fafc")   # primary text  (dark text in light mode)
-MUTED   = ("#555555", "#a1a1aa")   # secondary text
+# Each constant is a (light_mode, dark_mode) tuple taken from the ui_kit palette, so the
+# CTk dialogs and the main window share one set of colours. CTk picks the right value on
+# set_appearance_mode(); the main window's Tk widgets are recoloured by the kit.
+BLACK   = ctk_pair("surface")         # dialog background
+PANEL   = ctk_pair("surface2")        # group box / panel
+CARD    = ctk_pair("control")         # entry / inner card
+CARD2   = ctk_pair("control")         # inner field / label fill
+BTN     = ctk_pair("btn")             # a normal button, the same as the main window's
+BTN_HOVER = ctk_pair("btn_hover")
+BTN_BORDER = ctk_pair("btn_border")   # a hairline in light mode, the fill colour in dark
+BORDER  = ctk_pair("border")          # panel border
+BORDER2 = ctk_pair("border_strong")   # entry / button border
+ACCENT  = ctk_pair("accent_fill")     # the one primary action per window (PS5 blue)
+ACCENT_HOVER = ctk_pair("accent_hover")
+ON_ACCENT = "#ffffff"                 # text on ACCENT
+HOVER   = ctk_pair("control_hover")   # hover of a normal button
+SUCCESS = ctk_pair("success")
+YELLOW  = ctk_pair("warning")
+RED     = ctk_pair("danger")
+DANGER_HOVER = ctk_pair("danger_hover")
+WHITE   = ctk_pair("text")            # primary text (dark text in light mode)
+MUTED   = ctk_pair("muted")           # secondary text
+MONO_FONT = "Menlo"                   # ships with macOS (Consolas does not)
+# The dialogs use the main window's type scale (see ui_kit.Fonts): logical pixels, which
+# is also what CTkFont sizes are. If a CTk scaling is ever set, set it before any window
+# exists: changing it pins every open CTk window to its current size for a second.
 
 
+# ─── Panels and message windows ────────────────────────────────────────────────
+
+def set_window_appearance(win, mode: str) -> None:
+    """Give a window's title bar the app's light or dark look; macOS draws it after the
+    system setting otherwise (Tk's unsupported MacWindowStyle, present in Tk 8.6.11+)."""
+    try:
+        win.tk.call("::tk::unsupported::MacWindowStyle", "appearance", win._w,
+                    "aqua" if str(mode).lower() == "light" else "darkaqua")
+    except tk.TclError:
+        pass
 
 
-# ─── First Run Wizard ──────────────────────────────────────────────────────────
+class ScrollFrame(ctk.CTkScrollableFrame):
+    """A CTkScrollableFrame whose scrollbar shows only while the content is taller than
+    the frame; CustomTkinter keeps it on screen even when there is nothing to scroll."""
 
-class FirstRunWizard(ctk.CTkToplevel):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._sb_shown = True
+        self._parent_canvas.configure(yscrollcommand=self._on_yscroll)
+
+    def _on_yscroll(self, first, last):
+        self._scrollbar.set(first, last)
+        need = float(first) > 0.0 or float(last) < 1.0
+        if need != self._sb_shown:
+            self._sb_shown = need
+            if need:
+                self._scrollbar.grid()
+            else:
+                self._scrollbar.grid_remove()
+
+
+class PanelHost:
+    """Shows the dialogs as panels over the main window's content area; the sidebar and the
+    status bar stay visible. Panels stack: the newest is shown, closing it shows the one
+    below. While any is open the sidebar is disabled, and Escape closes the top panel."""
+
+    MARGIN = 24
+    LARGE_MAX_W = 900
+
+    def __init__(self, app, content):
+        self.app, self.content = app, content
+        self.stack: list = []
+        self.frame = app.kit.frame(content, bg="bg")
+        self.frame.bind("<Configure>", lambda e: self._layout(), add="+")
+        for seq in ("<Escape>", "<Return>", "<KP_Enter>"):
+            app.root.bind(seq, lambda e, s=seq: self._on_key(s, e), add="+")
+
+    def push(self, panel):
+        if self.stack:
+            self.stack[-1]._slot.place_forget()
+        self.stack.append(panel)
+        if len(self.stack) == 1:
+            self.frame.place(in_=self.content, x=0, y=0, relwidth=1, relheight=1)
+            self.frame.lift()
+            self.app._set_nav_enabled(False)
+        self.frame.after_idle(self._layout)
+
+    def pop(self, panel):
+        if panel not in self.stack:
+            return
+        was_top = self.stack[-1] is panel
+        self.stack.remove(panel)
+        if not self.stack:
+            self.frame.place_forget()
+            self.app._set_nav_enabled(True)
+        elif was_top:
+            self._layout()
+
+    def _layout(self):
+        if not self.stack:
+            return
+        top = self.stack[-1]
+        try:
+            if not top.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        W, H = self.frame.winfo_width(), self.frame.winfo_height()
+        if W < 60 or H < 60:
+            self.frame.after(40, self._layout)
+            return
+        m = self.MARGIN
+        slot = top._slot
+        if top.LARGE:
+            slot.place(relx=0.5, y=m, anchor="n", width=min(self.LARGE_MAX_W, W - 2 * m), height=H - 2 * m)
+        else:
+            pw, ph = top.preferred_size()
+            slot.place(relx=0.5, rely=0.5, anchor="center", width=min(pw, W - 2 * m), height=min(ph, H - 2 * m))
+        slot.lift()
+        top.raise_close_button()
+
+    def _on_key(self, seq, event):
+        if not self.stack:
+            return None
+        top = self.stack[-1]
+        fn = top._keys.get(seq)
+        if fn is not None:
+            return fn(event)
+        if seq == "<Escape>":
+            top.request_close()
+            return "break"
+        return None
+
+
+class EmbeddedDialog(ctk.CTkFrame):
+    """A dialog shown as a panel of the main window instead of a separate window. It takes
+    the CTkToplevel calls the dialog classes make: title() is kept, geometry("WxH") sets the
+    panel's preferred size, the window-only calls (transient, grab_set, resizable, …) do
+    nothing, and Return/Escape bindings go through the panel host to the top panel.
+    Callers that wait for a result keep using root.wait_window(dialog)."""
+
+    LARGE = False          # large panels fill the content area; small ones keep their size
+    host = None            # the App's PanelHost
+
+    def __init__(self, master=None, **kw):
+        host = EmbeddedDialog.host
+        # Each panel sits in its own tk holder that goes away with it: CustomTkinter hooks
+        # the configure() of a CTk widget's tk master, and a hook left behind by a closed
+        # panel would break recolouring the shared backdrop.
+        self._slot = host.app.kit.frame(host.frame, bg="bg")
+        super().__init__(self._slot, fg_color=BLACK, corner_radius=12, border_width=1, border_color=BORDER2)
+        self.pack(fill="both", expand=True)
+        self._title, self._pref, self._close_cb, self._keys, self._gone = "", (560, 420), None, {}, False
+        self._close_btn = IconButton(self, host.app.kit, icon="x", command=self.request_close, variant="ghost",
+                                     height=26, width=26, padx=0, icon_size=14, bg="surface", tooltip="Close  (Esc)")
+        self._close_btn.place(relx=1.0, x=-12, y=12, anchor="ne")
+        host.push(self)
+
+    def raise_close_button(self):
+        try:
+            self._close_btn.tk.call("raise", self._close_btn._w)
+        except tk.TclError:
+            pass
+
+    def title(self, text=None):
+        if text is None:
+            return self._title
+        self._title = str(text)
+
+    def geometry(self, spec=None):
+        if spec is None:
+            return f"{self.winfo_width()}x{self.winfo_height()}+0+0"
+        m = re.match(r"\s*(\d+)x(\d+)", str(spec))
+        if m:
+            self._pref = (int(m.group(1)), int(m.group(2)))
+            if EmbeddedDialog.host:
+                EmbeddedDialog.host.frame.after_idle(EmbeddedDialog.host._layout)
+
+    def preferred_size(self):
+        return self._pref
+
+    def protocol(self, name=None, func=None):
+        if name == "WM_DELETE_WINDOW" and func is not None:
+            self._close_cb = func
+
+    def request_close(self):
+        if self._close_cb:
+            self._close_cb()
+        else:
+            self.destroy()
+
+    def bind(self, sequence=None, command=None, add=True):
+        if sequence in ("<Return>", "<KP_Enter>", "<Escape>"):
+            self._keys[sequence] = command
+            return None
+        return super().bind(sequence, command, add)
+
+    def destroy(self):
+        if self._gone:
+            return
+        self._gone = True
+        if EmbeddedDialog.host:
+            EmbeddedDialog.host.pop(self)
+        super().destroy()
+        try:
+            self._slot.destroy()
+        except tk.TclError:
+            pass
+
+    # Window-only calls: there is no window of its own to manage.
+    def transient(self, *a, **k): pass
+    def grab_set(self, *a, **k): pass
+    def grab_release(self, *a, **k): pass
+    def resizable(self, *a, **k): pass
+    def minsize(self, *a, **k): pass
+    def maxsize(self, *a, **k): pass
+    def attributes(self, *a, **k): pass
+    wm_attributes = attributes
+    def focus_force(self, *a, **k): pass
+    def overrideredirect(self, *a, **k): pass
+    def deiconify(self, *a, **k): pass
+    def iconify(self, *a, **k): pass
+
+
+class MessageWindow(ctk.CTkToplevel):
+    """A message or a single question in a small window of its own: a job's result, an
+    error report, the space check before a start, a password or folder prompt. Work
+    surfaces (Add job, Look inside, Settings) are panels of the main window instead.
+
+    The window uses the main window's colours and opens centred over it, in the upper
+    third like a macOS alert. The heading inside the window names it, so the title bar
+    stays empty. Escape runs the close handler. It waits until the main window is on
+    screen, and a grab asked for before that is applied once it shows."""
+
+    def __init__(self, parent=None, **kw):
+        host = EmbeddedDialog.host
+        self._owner = parent if parent is not None else (host.app.root if host else None)
+        super().__init__(self._owner, fg_color=BLACK, **kw)
+        self._title, self._size, self._close_cb = "", None, None
+        self._want_grab = self._shown = False
+        self.withdraw()                      # placed before it shows, so it never jumps
+        if self._owner is not None:
+            super().transient(self._owner.winfo_toplevel())
+        super().title("")
+        self.bind("<Escape>", lambda e: self._escape())
+        self._show_job = self.after(1, self._show)
+
+    def _show(self):
+        self._show_job = None
+        if self._shown:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            owner = self._owner.winfo_toplevel() if self._owner is not None else None
+            if owner is not None and not owner.winfo_viewable():
+                self._show_job = self.after(250, self._show)  # main window hidden: wait for it
+                return
+            self.update_idletasks()          # the native window exists from here on
+            set_window_appearance(self, ctk.get_appearance_mode())
+            w, h = self._size or (self.winfo_reqwidth(), self.winfo_reqheight())
+            x, y = self._position(owner, w, h)
+            super().geometry(f"{w}x{h}+{x}+{y}")
+            self._shown = True
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            return
+        if self._want_grab:
+            self._grab_now()
+
+    def _position(self, owner, w, h):
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        if owner is not None:
+            ox, oy = owner.winfo_rootx(), owner.winfo_rooty()
+            x = ox + (owner.winfo_width() - w) // 2
+            y = oy + max(32, (owner.winfo_height() - h) // 3)
+        else:
+            x, y = (sw - w) // 2, (sh - h) // 3
+        return max(0, min(x, sw - w)), max(28, min(y, sh - h - 8))
+
+    def title(self, text=None):
+        if text is None:
+            return self._title
+        self._title = str(text)
+
+    def geometry(self, spec=None):
+        if spec is None:
+            return super().geometry()
+        m = re.match(r"\s*(\d+)x(\d+)\s*$", str(spec))
+        if m and not self._shown:
+            self._size = (int(m.group(1)), int(m.group(2)))
+            return None
+        return super().geometry(spec)
+
+    def protocol(self, name=None, func=None):
+        if name == "WM_DELETE_WINDOW" and func is not None:
+            self._close_cb = func
+        return super().protocol(name, func)
+
+    def _escape(self):
+        (self._close_cb or self.destroy)()
+        return "break"
+
+    def grab_set(self):
+        self._want_grab = True
+        if self._shown:
+            self._grab_now()
+
+    def _grab_now(self):
+        try:
+            if self.winfo_exists():
+                super().grab_set()
+        except tk.TclError:
+            pass
+
+    def destroy(self):
+        if self._show_job:
+            try:
+                self.after_cancel(self._show_job)
+            except tk.TclError:
+                pass
+            self._show_job = None
+        super().destroy()
+
+
+class FirstRunWizard(EmbeddedDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.title(f"{APP_NAME} — First Run Setup")
-        self.geometry("640x520")
+        self.geometry("620x400")
         self.resizable(False, False)
         self.grab_set()
         self.configure(fg_color=BLACK)
@@ -178,7 +485,7 @@ class FirstRunWizard(ctk.CTkToplevel):
         self._show_step(0)
 
     def _build(self):
-        self.header = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=22, weight="bold"), text_color=WHITE)
+        self.header = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE)
         self.header.pack(pady=(24, 6), padx=30, anchor="w")
 
         self.sub = ctk.CTkLabel(self, text="", text_color=MUTED, wraplength=580, justify="left")
@@ -190,11 +497,11 @@ class FirstRunWizard(ctk.CTkToplevel):
         nav = ctk.CTkFrame(self, fg_color=BLACK)
         nav.pack(fill="x", padx=30, pady=(0, 20))
         nav.grid_columnconfigure(1, weight=1)
-        self.back_btn = ctk.CTkButton(nav, text="← Back", width=100, fg_color=CARD2, text_color=WHITE,
-                                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._back)
+        self.back_btn = ctk.CTkButton(nav, text="← Back", width=100, fg_color=BTN, text_color=WHITE,
+                                       hover_color=BTN_HOVER, command=self._back, border_width=1, border_color=BTN_BORDER)
         self.back_btn.grid(row=0, column=0, padx=(0, 8))
-        self.next_btn = ctk.CTkButton(nav, text="Next →", width=100, fg_color=GREEN,
-                                       text_color="#061006", hover_color=GREEN2, command=self._next)
+        self.next_btn = ctk.CTkButton(nav, text="Next →", width=100, fg_color=ACCENT,
+                                       text_color=ON_ACCENT, hover_color=ACCENT_HOVER, command=self._next)
         self.next_btn.grid(row=0, column=2)
 
         self.step_var = tk.StringVar(value="Step 1 of 4")
@@ -212,30 +519,30 @@ class FirstRunWizard(ctk.CTkToplevel):
         self._clear_body()
 
         if n == 0:
-            self.header.configure(text="Step 1 — Select Temp Folder")
-            self.sub.configure(text="Choose a temp folder on a fast SSD or NVMe drive. Avoid mechanical HDDs for large games.")
-            ctk.CTkLabel(self.body, text="Temp Folder:", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
+            self.header.configure(text="Choose a temp folder")
+            self.sub.configure(text="Put it on a fast SSD or NVMe drive: a mechanical HDD slows large games down.")
+            ctk.CTkLabel(self.body, text="Temp folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
             row = ctk.CTkFrame(self.body, fg_color=PANEL)
             row.pack(fill="x", padx=14)
             row.grid_columnconfigure(0, weight=1)
             ctk.CTkEntry(row, textvariable=self.temp_path, fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            ctk.CTkButton(row, text="Browse", width=80, fg_color=CARD2, text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
-                           command=self._browse_temp).grid(row=0, column=1)
+            ctk.CTkButton(row, text="Browse", width=80, fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                           command=self._browse_temp, border_width=1, border_color=BTN_BORDER).grid(row=0, column=1)
 
         elif n == 1:
-            self.header.configure(text="Step 2 — Select Output Folder")
-            self.sub.configure(text="Choose where compressed .ffpfsc files will be saved. This can be an external drive or the same drive.")
-            ctk.CTkLabel(self.body, text="Output Folder:", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
+            self.header.configure(text="Choose an output folder")
+            self.sub.configure(text="Finished .ffpfsc files go here. An external drive works, and so does the temp drive.")
+            ctk.CTkLabel(self.body, text="Output folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
             row = ctk.CTkFrame(self.body, fg_color=PANEL)
             row.pack(fill="x", padx=14)
             row.grid_columnconfigure(0, weight=1)
             ctk.CTkEntry(row, textvariable=self.output_path, fg_color=CARD, border_color=BORDER2, text_color=WHITE).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            ctk.CTkButton(row, text="Browse", width=80, fg_color=CARD2, text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
-                           command=self._browse_output).grid(row=0, column=1)
+            ctk.CTkButton(row, text="Browse", width=80, fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                           command=self._browse_output, border_width=1, border_color=BTN_BORDER).grid(row=0, column=1)
 
         elif n == 2:
-            self.header.configure(text="Step 3 — Storage Check")
-            self.sub.configure(text="Checking your selected drives for speed and available space.")
+            self.header.configure(text="Check the drives")
+            self.sub.configure(text="Free space and drive type of the folders you picked.")
             lines = []
             tp = self.temp_path.get().strip()
             op = self.output_path.get().strip()
@@ -247,37 +554,37 @@ class FirstRunWizard(ctk.CTkToplevel):
                 # The SSD/HDD probe may shell out (diskutil / PowerShell) for seconds, so
                 # it runs off the UI thread and fills in this label — plus the HDD
                 # warning — when done (see _probe_temp_drive_type).
-                lines.append(f"Temp Drive:    {format_size(tfree)} free  |  Type: detecting…")
+                lines.append(f"Temp drive:    {format_size(tfree)} free  ·  type: detecting…")
             if op:
                 opath = Path(op)
                 ofree = get_free_space(opath)
-                lines.append(f"Output Drive:  {format_size(ofree)} free")
+                lines.append(f"Output drive:  {format_size(ofree)} free")
             if not lines:
                 lines.append("No paths selected. Go back and select folders.")
             for line in lines:
                 color = YELLOW if "⚠" in line else WHITE
                 lbl = ctk.CTkLabel(self.body, text=line, text_color=color, anchor="w",
-                                   font=ctk.CTkFont(family="Consolas", size=12),
+                                   font=ctk.CTkFont(family=MONO_FONT, size=11),
                                    justify="left")
                 lbl.pack(anchor="w", padx=14, pady=3)
-                if temp_label is None and line.startswith("Temp Drive:"):
+                if temp_label is None and line.startswith("Temp drive:"):
                     temp_label = lbl
             if tp and temp_label is not None:
                 self._probe_temp_drive_type(Path(tp), temp_label, tfree)
 
         elif n == 3:
-            self.header.configure(text="Step 4 — Ready!")
-            self.sub.configure(text="Setup is complete. These settings will be saved and pre-filled next time you launch.")
+            self.header.configure(text="Ready")
+            self.sub.configure(text="Setup is complete. You can change both folders later in Settings.")
             summary = []
             if self.temp_path.get():
-                summary.append(f"Temp Folder:    {self.temp_path.get()}")
+                summary.append(f"Temp folder:    {self.temp_path.get()}")
             if self.output_path.get():
-                summary.append(f"Output Folder:  {self.output_path.get()}")
+                summary.append(f"Output folder:  {self.output_path.get()}")
             summary.append("")
             summary.append(f"Click Finish to launch {APP_NAME}.")
             for line in summary:
                 ctk.CTkLabel(self.body, text=line, text_color=WHITE, anchor="w",
-                              font=ctk.CTkFont(family="Consolas", size=12)).pack(anchor="w", padx=14, pady=2)
+                              font=ctk.CTkFont(family=MONO_FONT, size=11)).pack(anchor="w", padx=14, pady=2)
 
     def _probe_temp_drive_type(self, tpath: Path, label, tfree: int) -> None:
         """Detect SSD/HDD for the temp drive on a worker thread (get_drive_type may block
@@ -287,13 +594,13 @@ class FirstRunWizard(ctk.CTkToplevel):
             try:
                 if not (self.winfo_exists() and label.winfo_exists()):
                     return
-                label.configure(text=f"Temp Drive:    {format_size(tfree)} free  |  Type: {dt}")
+                label.configure(text=f"Temp drive:    {format_size(tfree)} free  ·  type: {dt}")
                 if dt == "HDD":
                     ctk.CTkLabel(self.body,
-                                 text="  ⚠  Temp folder is on a mechanical HDD.\n     Large games may "
-                                      "process significantly slower.\n     SSD/NVMe recommended.",
+                                 text="  Temp folder is on a mechanical HDD.\n  Large games may "
+                                      "process significantly slower.\n  SSD/NVMe recommended.",
                                  text_color=YELLOW, anchor="w",
-                                 font=ctk.CTkFont(family="Consolas", size=12),
+                                 font=ctk.CTkFont(family=MONO_FONT, size=11),
                                  justify="left").pack(anchor="w", padx=14, pady=3, after=label)
             except Exception:
                 pass
@@ -308,12 +615,12 @@ class FirstRunWizard(ctk.CTkToplevel):
         threading.Thread(target=_detect, daemon=True).start()
 
     def _browse_temp(self):
-        p = filedialog.askdirectory(title="Select Temp Folder")
+        p = filedialog.askdirectory(title="Choose the temp folder")
         if p:
             self.temp_path.set(str(Path(p) / "_ffpfsc_temp"))
 
     def _browse_output(self):
-        p = filedialog.askdirectory(title="Select Output Folder")
+        p = filedialog.askdirectory(title="Choose the output folder")
         if p:
             self.output_path.set(p)
 
@@ -336,8 +643,8 @@ class FirstRunWizard(ctk.CTkToplevel):
 
 # ─── Detailed Error Dialog ─────────────────────────────────────────────────────
 
-class ErrorDialog(ctk.CTkToplevel):
-    """One error dialog: the window's title bar carries the job kind, the body leads with
+class ErrorDialog(MessageWindow):
+    """One error window: the heading names the job kind, the body leads with
     the short message the backend already wrote, an inline explanation says what that
     means in plain words, and the log is one paragraph — not fifty repeated lines. The
     generic 'possible causes' list is gone: whenever we can recognise the failure (a
@@ -360,7 +667,7 @@ class ErrorDialog(ctk.CTkToplevel):
         self._op = operation or "pack"
         self._heading = self._TITLES.get(self._op, "Job failed")
         self.title(self._heading)
-        self.geometry("640x460")
+        self.geometry("660x470")
         self.minsize(520, 380)
         self.resizable(True, True)
         self.grab_set()
@@ -369,6 +676,8 @@ class ErrorDialog(ctk.CTkToplevel):
         self._cmd = last_cmd
         self._log = log_lines or ""
         self._build()
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.bind(seq, lambda e: self.destroy())
 
     # ── diagnosis ────────────────────────────────────────────────────────────
     @staticmethod
@@ -415,7 +724,16 @@ class ErrorDialog(ctk.CTkToplevel):
         # one line, so the message underneath can read.
         ctk.CTkLabel(self, text=self._heading, font=ctk.CTkFont(size=15, weight="bold"),
                       text_color=RED).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=600, justify="left",
+        # The buttons go in first (at the bottom) so a short window never hides them.
+        btns = ctk.CTkFrame(self, fg_color=BLACK)
+        btns.pack(side="bottom", fill="x", padx=20, pady=(0, 14))
+        ctk.CTkButton(btns, text="Close", width=100, fg_color=ACCENT, text_color=ON_ACCENT,
+                       hover_color=ACCENT_HOVER, command=self.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Open log folder", width=132, fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._open_folder, border_width=1, border_color=BTN_BORDER).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(btns, text="Copy details", width=110, fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._copy, border_width=1, border_color=BTN_BORDER).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=560, justify="left",
                       font=ctk.CTkFont(size=13)).pack(anchor="w", padx=20, pady=(0, 8))
 
         note = self._diagnose(self._msg, self._log)
@@ -423,27 +741,19 @@ class ErrorDialog(ctk.CTkToplevel):
             box = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
             box.pack(fill="x", padx=20, pady=(0, 10))
             ctk.CTkLabel(box, text="What this means", text_color=YELLOW,
-                          font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=14, pady=(10, 2))
-            ctk.CTkLabel(box, text=note, text_color=("#dddddd", "#dddddd"), wraplength=580, justify="left",
+                          font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(box, text=note, text_color=WHITE, wraplength=530, justify="left",
                           font=ctk.CTkFont(size=12)).pack(anchor="w", padx=14, pady=(0, 10))
 
         ctk.CTkLabel(self, text="Backend log (last lines)", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 2))
-        log = ctk.CTkTextbox(self, fg_color=BLACK, text_color=("#1a7a40", "#4ade80"),
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=20, pady=(0, 2))
+        log = ctk.CTkTextbox(self, fg_color=PANEL, text_color=ctk_pair("log"),
                               border_width=1, border_color=BORDER,
                               font=ctk.CTkFont(family="Menlo", size=11), wrap="word")
         log.pack(fill="both", expand=True, padx=20, pady=(0, 10))
         log.insert("end", self._tail(self._log) or "(no log available)")
         log.configure(state="disabled")
 
-        btns = ctk.CTkFrame(self, fg_color=BLACK)
-        btns.pack(fill="x", padx=20, pady=(0, 14))
-        ctk.CTkButton(btns, text="Close", width=100, fg_color=RED, text_color=WHITE,
-                       hover_color=("#b91c1c", "#5a1a1a"), command=self.destroy).pack(side="right")
-        ctk.CTkButton(btns, text="Open log folder", width=132, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._open_folder).pack(side="right", padx=(0, 8))
-        ctk.CTkButton(btns, text="Copy details", width=110, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._copy).pack(side="right", padx=(0, 8))
 
     @staticmethod
     def _tail(text: str, n: int = 20) -> str:
@@ -472,29 +782,31 @@ class ErrorDialog(ctk.CTkToplevel):
 
 # ─── Summary Dialog ────────────────────────────────────────────────────────────
 
-class SummaryDialog(ctk.CTkToplevel):
+class SummaryDialog(MessageWindow):
     """Compression result summary with copy-to-clipboard button."""
 
     def __init__(self, parent, report: str):
         super().__init__(parent)
-        self.title("Compression Complete")
+        self.title("Job complete")
         self.configure(fg_color=BLACK)
         self.resizable(True, True)
-        self.geometry("580x460")
-        self.lift()
-        self.focus_force()
         self.grab_set()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(self, text="✅  Compression Complete",
-                      text_color=GREEN, font=ctk.CTkFont(size=18, weight="bold"),
+        ctk.CTkLabel(self, text="Job complete",
+                      text_color=WHITE, font=ctk.CTkFont(size=17, weight="bold"),
                       anchor="w").grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
 
+        # The window takes the report's height (4 to 24 lines), so a short result gets
+        # a short window; the text box scrolls beyond that.
+        mono = ctk.CTkFont(family=MONO_FONT, size=11)
+        per_row = max(40, 490 // max(1, mono.measure("0")))
+        rows = sum(max(1, -(-len(ln) // per_row)) for ln in (report.splitlines() or [""]))
         box = ctk.CTkTextbox(self, fg_color=CARD, border_width=1, border_color=BORDER2,
-                              text_color=WHITE, font=ctk.CTkFont(family="Consolas", size=12),
-                              wrap="word")
+                              text_color=WHITE, font=mono, wrap="word", width=508,
+                              height=min(24, max(4, rows)) * mono.metrics("linespace") + 14)
         box.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
         box.insert("1.0", report)
         box.configure(state="disabled")
@@ -507,28 +819,30 @@ class SummaryDialog(ctk.CTkToplevel):
         def _copy():
             self.clipboard_clear()
             self.clipboard_append(report)
-            copy_btn.configure(text="✓ Copied!")
-            self.after(2000, lambda: copy_btn.winfo_exists() and copy_btn.configure(text="📋  Copy Result"))
+            copy_btn.configure(text="Copied")
+            self.after(2000, lambda: copy_btn.winfo_exists() and copy_btn.configure(text="Copy result"))
 
-        copy_btn = ctk.CTkButton(btn_row, text="📋  Copy Result", command=_copy,
-                                  fg_color=CARD2, hover_color=("#b0b0b0", "#2a2a2a"),
-                                  text_color=WHITE, border_width=1, border_color=BORDER2)
+        copy_btn = ctk.CTkButton(btn_row, text="Copy result", command=_copy,
+                                  fg_color=BTN, hover_color=BTN_HOVER,
+                                  text_color=WHITE, border_width=1, border_color=BTN_BORDER)
         copy_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkButton(btn_row, text="Close", command=self.destroy,
-                       fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006").grid(row=0, column=1, sticky="ew")
+                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT).grid(row=0, column=1, sticky="ew")
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.bind(seq, lambda e: self.destroy())
 
 
 # ─── Space Diagnostics Dialog ──────────────────────────────────────────────────
 
-class SpaceDiagnosticsDialog(ctk.CTkToplevel):
+class SpaceDiagnosticsDialog(MessageWindow):
     """Pre-flight space check shown before compression starts.
     Opens instantly — drive-type detection runs in a background thread."""
 
     def __init__(self, parent, item, temp_dir: Path, out_dir: Path):
         super().__init__(parent)
-        self.title("Drive Space Diagnostics")
-        self.geometry("520x520")
+        self.title("Drive space check")
+        self.geometry("520x500")
         self.resizable(False, False)
         self.configure(fg_color=BLACK)
         self.proceed = False
@@ -537,10 +851,9 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         self._proceed_btn = None   # set in _build
         self._build(item, temp_dir, out_dir)
         self.geometry(f"520x{300 + 28 * getattr(self, '_row_count', 8)}")
-        # Keep dialog above the main window on all platforms
-        self.transient(parent)
-        self.lift()
-        self.focus_force()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.bind(seq, lambda e: self._ok())
         self.after(50, self.grab_set)
         # Auto-proceed after 4 s only when BOTH temp and output drives have room
         if _space_preflight_ok(item, temp_dir, out_dir):
@@ -548,8 +861,8 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
             self.after(1000, self._tick_countdown)
 
     def _build(self, item, temp_dir: Path, out_dir: Path):
-        ctk.CTkLabel(self, text="Drive Space Diagnostics",
-                      font=ctk.CTkFont(size=20, weight="bold"),
+        ctk.CTkLabel(self, text="Drive space check",
+                      font=ctk.CTkFont(size=17, weight="bold"),
                       text_color=WHITE).pack(anchor="w", padx=20, pady=(18, 2))
         ctk.CTkLabel(self, text="Pre-flight check before compression starts.",
                       text_color=MUTED).pack(anchor="w", padx=20, pady=(0, 10))
@@ -562,7 +875,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         out_fs  = get_filesystem_type(out_dir)
 
         def _color(status):
-            if status == "ok":   return ("#1a7a40", "#4ade80")
+            if status == "ok":   return SUCCESS
             if status == "warn": return YELLOW
             return WHITE
 
@@ -582,14 +895,14 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         dt_row = ctk.CTkFrame(panel, fg_color=PANEL)
         dt_row.pack(fill="x", padx=14, pady=2)
         dt_row.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(dt_row, text="Temp Drive Type:", text_color=MUTED,
+        ctk.CTkLabel(dt_row, text="Temp drive type:", text_color=MUTED,
                       anchor="w", width=200).grid(row=0, column=0, sticky="w")
         self._dt_label = ctk.CTkLabel(dt_row, text="Detecting…", text_color=MUTED,
                                        anchor="e")
         self._dt_label.grid(row=0, column=1, sticky="e")
 
         # ── Space result banner ────────────────────────────────────────────────
-        result_color = ("#1a7a40", "#4ade80") if space_ok else YELLOW
+        result_color = SUCCESS if space_ok else YELLOW
         ctk.CTkLabel(panel, text=result_text, text_color=result_color,
                       font=ctk.CTkFont(size=13, weight="bold")
                      ).pack(anchor="w", padx=14, pady=(8, 2))
@@ -597,18 +910,18 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         # Filesystem warnings (fast — already have temp_fs / out_fs)
         if temp_fs in ("exFAT", "FAT32", "FAT"):
             ctk.CTkLabel(panel,
-                          text=f"⚠  Temp drive is {temp_fs} — no hardlink support. Slower copy mode will be used.",
+                          text=f"Temp drive is {temp_fs} — no hardlink support. Slower copy mode will be used.",
                           text_color=YELLOW, justify="left", wraplength=460
                          ).pack(anchor="w", padx=14, pady=(0, 2))
         if out_fs in ("exFAT", "FAT32", "FAT"):
             ctk.CTkLabel(panel,
-                          text=f"⚠  Output drive is {out_fs}. NTFS recommended.",
+                          text=f"Output drive is {out_fs}. NTFS recommended.",
                           text_color=YELLOW, justify="left", wraplength=460
                          ).pack(anchor="w", padx=14, pady=(0, 2))
 
         # HDD warning label — shown/hidden by background thread result
         self._hdd_warn = ctk.CTkLabel(panel,
-                                       text="⚠  Temp folder is on a mechanical HDD — will be significantly slower.",
+                                       text="Temp folder is on a mechanical HDD — will be significantly slower.",
                                        text_color=YELLOW, justify="left", wraplength=460)
         # packed conditionally in background callback
 
@@ -616,18 +929,18 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         btns = ctk.CTkFrame(self, fg_color=BLACK)
         btns.pack(fill="x", padx=20, pady=(0, 16))
 
-        self._proceed_btn = ctk.CTkButton(btns, text="▶  START NOW",
-                       fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006",
-                       font=ctk.CTkFont(size=14, weight="bold"),
+        self._proceed_btn = ctk.CTkButton(btns, text="Start now",
+                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT,
+                       font=ctk.CTkFont(size=13),
                        height=38,
                        command=self._ok
                       )
         self._proceed_btn.pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Cancel",
-                       fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"),
-                       command=self._cancel
+                       fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER,
+                       command=self._cancel, border_width=1, border_color=BTN_BORDER
                       ).pack(side="right")
 
         # ── Background thread: drive type detection ───────────────────────────
@@ -648,9 +961,9 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         except Exception:
             return
         if dt == "SSD":
-            self._dt_label.configure(text="SSD / NVMe", text_color=("#1a7a40", "#4ade80"))
+            self._dt_label.configure(text="SSD / NVMe", text_color=SUCCESS)
         elif dt == "HDD":
-            self._dt_label.configure(text="HDD  ⚠", text_color=YELLOW)
+            self._dt_label.configure(text="HDD", text_color=YELLOW)
             self._hdd_warn.pack(anchor="w", padx=14, pady=(0, 2))
         else:
             self._dt_label.configure(text="Unknown", text_color=MUTED)
@@ -664,7 +977,7 @@ class SpaceDiagnosticsDialog(ctk.CTkToplevel):
         if self._countdown > 0:
             if self._proceed_btn:
                 self._proceed_btn.configure(
-                    text=f"▶  START NOW  (auto in {self._countdown}s)")
+                    text=f"Start now  (auto in {self._countdown} s)")
             self._countdown -= 1
             self._auto_timer = self.after(1000, self._tick_countdown)
         else:
@@ -773,45 +1086,111 @@ def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | No
 
 # ─── Settings Window ──────────────────────────────────────────────────────────
 
-class SettingsWindow(ctk.CTkToplevel):
-    def __init__(self, parent_widget, app):
-        super().__init__(parent_widget)
+class SettingsView:
+    """Settings as a view of the main window: a page list, then the chosen page. A page
+    is built the first time it is shown. Everything applies immediately."""
+
+    PAGES = [
+        ("general", "General", "settings",
+         "Where new jobs write, and how the app tells you it is done. Changes apply immediately."),
+        ("compression", "Compression", "package", "Defaults for .ffpfsc and .ffpfs builds."),
+        ("archives", "Archives", "key", "Passwords for protected archives."),
+        ("drives", "Drives & space", "drive",
+         "Where archives are unpacked, how much free space a job needs, and how drives are kept awake."),
+        ("backport", "Backport & libraries", "layers",
+         "Libraries for backports and PlayGo titles, and the optional Windows fPKG backend. You supply "
+         "all of them; none ship with the app."),
+        ("about", "About", "info", ""),
+    ]
+
+    def __init__(self, parent, app):
         self.app = app
-        self.title(f"{APP_NAME} — Settings")
-        self.geometry("600x680")
-        self.resizable(False, True)
-        self.grab_set()
-        self.configure(fg_color=BLACK)
-        self._build()
+        self._page_frames = {}
+        kit = app.kit
+        self.frame = kit.frame(parent)
+        self.frame.grid_columnconfigure(2, weight=1)
+        self.frame.grid_rowconfigure(0, weight=1)
+        nav = kit.frame(self.frame, bg="inspector", width=208)
+        nav.grid(row=0, column=0, sticky="nsw")
+        nav.pack_propagate(False)
+        kit.label(nav, bg="inspector", text="Settings", font=kit.fonts.view).pack(anchor="w", padx=18, pady=(18, 12))
+        self._nav = {}
+        for key, title, icon, _sub in self.PAGES:
+            b = IconButton(nav, kit, text=title, icon=icon, command=lambda k=key: self.show(k), variant="nav",
+                           height=28, bg="inspector", icon_size=15, padx=10)
+            b.pack(fill="x", padx=8, pady=1)
+            self._nav[key] = b
+        kit.rule(self.frame, bg_token="border_strong", horizontal=False).grid(row=0, column=1, sticky="ns")
+        self._body = kit.frame(self.frame)
+        self._body.grid(row=0, column=2, sticky="nsew")
+        self.show("general")
 
-    def _build(self):
-        ctk.CTkLabel(self, text="Settings",
-                      font=ctk.CTkFont(size=24, weight="bold"), text_color=WHITE).pack(anchor="w", padx=20, pady=(20, 2))
-        ctk.CTkLabel(self, text="Changes apply immediately.", text_color=MUTED).pack(anchor="w", padx=20, pady=(0, 12))
+    def show(self, key):
+        for f in self._page_frames.values():
+            f.pack_forget()
+        f = self._page_frames.get(key)
+        if f is None:
+            _k, title, _icon, sub = next(pg for pg in self.PAGES if pg[0] == key)
+            f = ScrollFrame(self._body, fg_color=BLACK, corner_radius=0)
+            ctk.CTkLabel(f, text=title, font=ctk.CTkFont(size=15, weight="bold"), text_color=WHITE).pack(
+                anchor="w", padx=4, pady=(22, 2))
+            if sub:
+                ctk.CTkLabel(f, text=sub, text_color=MUTED, font=ctk.CTkFont(size=13), wraplength=620,
+                             justify="left").pack(anchor="w", padx=4, pady=(0, 12))
+            getattr(self, "_page_" + key)(f)
+            self._page_frames[key] = f
+        f.pack(fill="both", expand=True, padx=(24, 12))
+        for k, b in self._nav.items():
+            b.configure(selected=(k == key))
 
-        scroll = ctk.CTkScrollableFrame(self, fg_color=BLACK)
-        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 8))
-
+    def _page_general(self, scroll):
         # FOLDERS
-        self._section_label(scroll, "FOLDERS")
+        self._section_label(scroll, "Folders")
         fold = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
         fold.pack(fill="x", pady=(4, 12))
         fold.grid_columnconfigure(1, weight=1)
         for row_i, (lbl, var, key, title) in enumerate([
-            ("Default Output Folder", self.app.output_var, "output_folder", "Select Output Folder"),
-            ("Default Temp Folder",   self.app.temp_var,   "temp_folder",   "Select Temp Folder"),
+            ("Default output folder", self.app.output_var, "output_folder", "Choose the default output folder"),
+            ("Default temp folder",   self.app.temp_var,   "temp_folder",   "Choose the default temp folder"),
         ]):
             ctk.CTkLabel(fold, text=lbl + ":", text_color=MUTED, anchor="w", width=170).grid(
                 row=row_i, column=0, padx=14, pady=8, sticky="w")
             ctk.CTkEntry(fold, textvariable=var, fg_color=CARD, border_color=BORDER2,
                           text_color=WHITE).grid(row=row_i, column=1, sticky="ew", padx=(0, 8), pady=8)
-            ctk.CTkButton(fold, text="Browse", width=80, fg_color=CARD2, text_color=WHITE,
-                           hover_color=("#b0b0b0", "#2a2a2a"),
-                           command=lambda v=var, k=key, t=title: self._browse_folder(v, k, t)).grid(
+            ctk.CTkButton(fold, text="Browse", width=80, fg_color=BTN, text_color=WHITE,
+                           hover_color=BTN_HOVER,
+                           command=lambda v=var, k=key, t=title: self._browse_folder(v, k, t), border_width=1, border_color=BTN_BORDER).grid(
                 row=row_i, column=2, padx=(0, 14), pady=8)
+        _ct = ctk.CTkFrame(fold, fg_color="transparent")
+        _ct.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 10))
+        ctk.CTkLabel(_ct, text="Leftovers from cancelled or failed jobs stay in the temp folder until cleaned.",
+                     text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkButton(_ct, text="Clean temp now", width=120, fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                      border_width=1, border_color=BTN_BORDER, command=self.app.clear_temp_files).pack(side="right")
 
-        # COMPRESSION
-        self._section_label(scroll, "COMPRESSION")
+        # USER INTERFACE
+        self._section_label(scroll, "Interface")
+        ui = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
+        ui.pack(fill="x", pady=(4, 12))
+        for text, var in [
+            ("Show the result when a job is done", self.app.summary_popup_var),
+            ("Play sound on completion",     self.app.sound_complete_var),
+            ("Play sound on errors",         self.app.sound_error_var),
+            ("Open output folder when done", self.app.open_output_var),
+            ("Auto-integrate patch from release folder", self.app.auto_integrate_patch_var),
+        ]:
+            ctk.CTkCheckBox(ui, text=text, variable=var, fg_color=ACCENT,
+                             hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=6)
+        theme_row = ctk.CTkFrame(ui, fg_color=PANEL)
+        theme_row.pack(fill="x", padx=14, pady=(4, 10))
+        ctk.CTkLabel(theme_row, text="Appearance", text_color=WHITE).pack(side="left", padx=(0, 12))
+        _mode = ctk.CTkSegmentedButton(theme_row, values=["Dark", "Light"],
+                                       command=lambda v: self.app._set_theme(v.lower()))
+        _mode.set("Light" if self.app._theme == "light" else "Dark")
+        _mode.pack(side="left")
+
+
+    def _page_compression(self, scroll):
         comp = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
         comp.pack(fill="x", pady=(4, 12))
         for text, var, key in [
@@ -820,8 +1199,8 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Auto-clear temp folder after success",  self.app.auto_clear_temp_var,  "auto_clear_temp"),
             ("Verbose mkpfs output (debug)",          self.app.verbose_var,           None),
         ]:
-            cb = ctk.CTkCheckBox(comp, text=text, variable=var, fg_color=GREEN,
-                                  hover_color=GREEN2, text_color=WHITE)
+            cb = ctk.CTkCheckBox(comp, text=text, variable=var, fg_color=ACCENT,
+                                  hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18)
             if key:
                 cb.configure(command=lambda k=key, v=var: save_settings({k: v.get()}))
             cb.pack(anchor="w", padx=14, pady=6)
@@ -832,13 +1211,13 @@ class SettingsWindow(ctk.CTkToplevel):
         _st.columnconfigure(1, weight=1)
 
         ctk.CTkLabel(_st, text="Compression level (0-9):", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w", pady=4)
+                      font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky="w", pady=4)
         ctk.CTkSlider(_st, from_=0, to=9, number_of_steps=9,
                        variable=self.app.compression_level_var,
-                       fg_color=BORDER2, progress_color=GREEN, button_color=GREEN,
-                       button_hover_color=GREEN2).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+                       fg_color=BORDER2, progress_color=ACCENT, button_color=ACCENT,
+                       button_hover_color=ACCENT_HOVER).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
         _cl_lbl = ctk.CTkLabel(_st, text=str(self.app.compression_level_var.get()),
-                                 text_color=GREEN, font=ctk.CTkFont(size=11, weight="bold"), width=24)
+                                 text_color=ACCENT, font=ctk.CTkFont(size=12, weight="bold"), width=24)
         _cl_lbl.grid(row=0, column=2)
         def _cl_cb(*_):
             # The app-level var already persists on write (trace added at creation);
@@ -849,13 +1228,13 @@ class SettingsWindow(ctk.CTkToplevel):
         self.app.compression_level_var.trace_add("write", _cl_cb)
 
         ctk.CTkLabel(_st, text="CPU cores (0=auto):", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).grid(row=1, column=0, sticky="w", pady=4)
+                      font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", pady=4)
         ctk.CTkSlider(_st, from_=0, to=16, number_of_steps=16,
                        variable=self.app.cpu_count_var,
-                       fg_color=BORDER2, progress_color=GREEN, button_color=GREEN,
-                       button_hover_color=GREEN2).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+                       fg_color=BORDER2, progress_color=ACCENT, button_color=ACCENT,
+                       button_hover_color=ACCENT_HOVER).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
         _cpu_lbl = ctk.CTkLabel(_st, text="auto" if self.app.cpu_count_var.get() == 0 else str(self.app.cpu_count_var.get()),
-                                  text_color=GREEN, font=ctk.CTkFont(size=11, weight="bold"), width=24)
+                                  text_color=ACCENT, font=ctk.CTkFont(size=12, weight="bold"), width=24)
         _cpu_lbl.grid(row=1, column=2)
         def _cpu_cb(*_):
             if _cpu_lbl.winfo_exists():
@@ -864,37 +1243,52 @@ class SettingsWindow(ctk.CTkToplevel):
         self.app.cpu_count_var.trace_add("write", _cpu_cb)
 
         ctk.CTkLabel(_st, text="Block size:", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).grid(row=2, column=0, sticky="w", pady=4)
+                      font=ctk.CTkFont(size=12)).grid(row=2, column=0, sticky="w", pady=4)
         _bs_opts = ["auto", "65536"]
         _bs_menu = ctk.CTkOptionMenu(
             _st, values=_bs_opts, variable=self.app.block_size_var,
-            fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2,
-            text_color=WHITE, dropdown_fg_color=CARD2, dropdown_text_color=WHITE,
-            dropdown_hover_color=GREEN, width=110, height=28,
-            font=ctk.CTkFont(size=11),
+            width=110, height=28,
+            font=ctk.CTkFont(size=12),
             command=lambda v: save_settings({"block_size": v}),
         )
         _bs_menu.grid(row=2, column=1, sticky="w", padx=8, pady=4)
         ctk.CTkLabel(_st, text="PS5 needs 64 KiB. auto = 65536 (recommended). Smaller blocks crash the console.",
-                      text_color=MUTED, font=ctk.CTkFont(size=10)).grid(
+                      text_color=MUTED, font=ctk.CTkFont(size=11)).grid(
             row=2, column=2, sticky="w", pady=4)
 
-        ctk.CTkLabel(comp, text="Default Archive Password (optional):", text_color=MUTED, anchor="w").pack(
+        # ── Folder bundles ───────────────────────────────────────────────────
+        _cs_cb = ctk.CTkCheckBox(
+            comp,
+            text="Copy extra files (DLCs etc.) next to the .ffpfsc when packing a folder",
+            variable=self.app.copy_siblings_var, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
+            command=lambda: save_settings({"copy_bundle_siblings": self.app.copy_siblings_var.get()}), checkbox_width=18, checkbox_height=18
+        )
+        _cs_cb.pack(anchor="w", padx=14, pady=(2, 4))
+        ctk.CTkLabel(comp, text="When a folder holds one game plus extras, the source folder is recreated "
+                                "at the destination with the .ffpfsc and the extras inside.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left").pack(
+            anchor="w", padx=14, pady=(0, 10))
+
+
+    def _page_archives(self, scroll):
+        comp = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
+        comp.pack(fill="x", pady=(4, 12))
+        ctk.CTkLabel(comp, text="Default archive password (optional):", text_color=MUTED, anchor="w").pack(
             anchor="w", padx=14, pady=(8, 2))
         ctk.CTkLabel(comp, text="Tried FIRST. A one-off password for the next extraction.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w").pack(
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w").pack(
             anchor="w", padx=14)
         ctk.CTkEntry(comp, textvariable=self.app.password_var, show="*",
                       fg_color=CARD, border_color=BORDER2, text_color=WHITE).pack(
             fill="x", padx=14, pady=(4, 10))
 
         # ── Global auto-tried password list ──────────────────────────────────
-        ctk.CTkLabel(comp, text="Saved Archive Passwords (auto-tried, one per line):",
+        ctk.CTkLabel(comp, text="Saved archive passwords (tried in order, one per line):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
         ctk.CTkLabel(comp, text="Every password here is tried automatically, in order — handy for a "
                                 "queue of differently-protected archives. The list is empty until "
                                 "you add passwords.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left").pack(
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left").pack(
             anchor="w", padx=14)
         self._pw_list_box = ctk.CTkTextbox(comp, height=110, fg_color=CARD,
                                             border_width=1, border_color=BORDER2, text_color=WHITE,
@@ -914,44 +1308,12 @@ class SettingsWindow(ctk.CTkToplevel):
             save_settings({"archive_passwords": pwds})
 
         self._pw_list_box.bind("<FocusOut>", _save_pw_list, add="+")
-        ctk.CTkButton(comp, text="Save Passwords", fg_color=GREEN, text_color="#061006",
-                       hover_color=GREEN2, width=150, command=_save_pw_list).pack(
+        ctk.CTkButton(comp, text="Save passwords", fg_color=ACCENT, text_color=ON_ACCENT,
+                       hover_color=ACCENT_HOVER, width=150, command=_save_pw_list).pack(
             anchor="w", padx=14, pady=(0, 10))
 
-        # ── Folder bundles ───────────────────────────────────────────────────
-        _cs_cb = ctk.CTkCheckBox(
-            comp,
-            text="Copy extra files (DLCs etc.) next to the .ffpfsc when packing a folder",
-            variable=self.app.copy_siblings_var, fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-            command=lambda: save_settings({"copy_bundle_siblings": self.app.copy_siblings_var.get()}),
-        )
-        _cs_cb.pack(anchor="w", padx=14, pady=(2, 4))
-        ctk.CTkLabel(comp, text="When a folder holds one game plus extras, the source folder is recreated "
-                                "at the destination with the .ffpfsc and the extras inside.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left").pack(
-            anchor="w", padx=14, pady=(0, 10))
 
-        # USER INTERFACE
-        self._section_label(scroll, "USER INTERFACE")
-        ui = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
-        ui.pack(fill="x", pady=(4, 12))
-        for text, var in [
-            ("Show summary popup when done", self.app.summary_popup_var),
-            ("Play sound on completion",     self.app.sound_complete_var),
-            ("Play sound on errors",         self.app.sound_error_var),
-            ("Open output folder when done", self.app.open_output_var),
-            ("Auto-integrate patch from release folder", self.app.auto_integrate_patch_var),
-        ]:
-            ctk.CTkCheckBox(ui, text=text, variable=var, fg_color=GREEN,
-                             hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=6)
-        theme_row = ctk.CTkFrame(ui, fg_color=PANEL)
-        theme_row.pack(fill="x", padx=14, pady=(4, 10))
-        ctk.CTkLabel(theme_row, text="Theme:", text_color=WHITE).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(theme_row, text="Toggle Dark / Light", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), width=160, command=self.app._toggle_theme).pack(side="left")
-
-        # DRIVE & SPACE
-        self._section_label(scroll, "DRIVE & SPACE")
+    def _page_drives(self, scroll):
         ds = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
         ds.pack(fill="x", pady=(4, 12))
         s = load_settings()
@@ -1005,12 +1367,12 @@ class SettingsWindow(ctk.CTkToplevel):
         sd_menu.set(sd_labels.get(s.get("same_drive_rw", "auto"), sd_labels["auto"]))
         sd_menu.pack(side="left")
 
-        ctk.CTkCheckBox(ds, text="Show drive-space dialog before each pack",
-                         variable=self.app.show_space_dialog_var, fg_color=GREEN,
-                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
+        ctk.CTkCheckBox(ds, text="Show the drive space check before each pack",
+                         variable=self.app.show_space_dialog_var, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=(6, 4))
         ctk.CTkCheckBox(ds, text="Build via exFAT intermediate — PSBrew's most-stable path (cross-platform)",
-                         variable=self.app.build_via_exfat_var, fg_color=GREEN,
-                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
+                         variable=self.app.build_via_exfat_var, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=(0, 4))
         def _confirm_fake_sign():
             # Warn once when ENABLING: every pack will then mutate the source folder
             # in place (the toolbar button asks per-run; the setting is persistent).
@@ -1024,12 +1386,12 @@ class SettingsWindow(ctk.CTkToplevel):
                     "Enable this?"):
                 self.app.fake_sign_before_pack_var.set(False)
         ctk.CTkCheckBox(ds, text="Fake-sign executables before packing (folder sources; in place)",
-                         variable=self.app.fake_sign_before_pack_var, fg_color=GREEN,
-                         hover_color=GREEN2, text_color=WHITE,
-                         command=_confirm_fake_sign).pack(anchor="w", padx=14, pady=(0, 4))
+                         variable=self.app.fake_sign_before_pack_var, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, text_color=WHITE,
+                         command=_confirm_fake_sign, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=(0, 4))
         ctk.CTkCheckBox(ds, text="Keep external drives spun-up during a run (bridges gaps between games)",
-                         variable=self.app.keep_drives_awake_var, fg_color=GREEN,
-                         hover_color=GREEN2, text_color=WHITE).pack(anchor="w", padx=14, pady=(0, 4))
+                         variable=self.app.keep_drives_awake_var, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=(0, 4))
         ka_labels = {5: "every 5 s", 8: "every 8 s (recommended)", 10: "every 10 s", 15: "every 15 s"}
         ka_rev = {v: k for k, v in ka_labels.items()}
         ka_menu = ctk.CTkOptionMenu(
@@ -1042,128 +1404,6 @@ class SettingsWindow(ctk.CTkToplevel):
         ka_menu.set(ka_labels.get(_cur_ka, "every 8 s (recommended)"))
         ka_menu.pack(side="left")
 
-        # ── AMPR / APR emu folder (PlayGo titles) ────────────────────────────
-        ctk.CTkLabel(ds, text="AMPR / APR (PlayGo) — emu files folder:",
-                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="Folder holding libSceAmpr.sprx + libScePlayGo.sprx (you supply these). "
-                              "PlayGo/APR games are auto-detected (sce_sys/playgo-chunk.dat); the two "
-                              "files are injected into a fakelib/ folder and an ampr_emu.index is built "
-                              "before packing, so the game boots from the compressed container.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14)
-        _ampr_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _ampr_row.pack(fill="x", padx=14, pady=(4, 4))
-        _ampr_entry = ctk.CTkEntry(_ampr_row, textvariable=self.app.ampr_var,
-                                   placeholder_text="Folder with the two .sprx files…")
-        _ampr_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        def _save_ampr(*_):
-            save_settings({"ampr_folder": self.app.ampr_var.get().strip()})
-        def _browse_ampr():
-            from tkinter import filedialog
-            c = filedialog.askdirectory(title="Select AMPR Emu Folder")
-            if c:
-                self.app.ampr_var.set(c)
-                _save_ampr()
-        _ampr_entry.bind("<FocusOut>", lambda e: _save_ampr())
-        ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
-                      command=_browse_ampr).pack(side="left")
-
-        # ── Backport folders ─────────────────────────────────────────────────
-        ctk.CTkLabel(ds, text="Backport — patched libraries folder (default for new jobs):",
-                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="Your own patched system libraries for the target firmware (you extract them from "
-                              "your firmware and apply the public patches yourself; nothing ships with this app). "
-                              "Copied into the game's fakelib/ when a job backports.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14)
-        _bl_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _bl_row.pack(fill="x", padx=14, pady=(4, 4))
-        _bl_entry = ctk.CTkEntry(_bl_row, textvariable=self.app.backport_libs_var,
-                                 placeholder_text="Folder with patched .sprx files…")
-        _bl_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        def _save_bl(*_):
-            save_settings({"backport_libs_root": self.app.backport_libs_var.get().strip()})
-        def _browse_bl():
-            from tkinter import filedialog
-            c = filedialog.askdirectory(title="Select the folder with your patched PS5 libraries")
-            if c:
-                self.app.backport_libs_var.set(c)
-                _save_bl()
-        _bl_entry.bind("<FocusOut>", lambda e: _save_bl())
-        ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
-                      command=_browse_bl).pack(side="left")
-
-        # One-click prepare: BestPig BackPork patches (small, ~1 KB total per target) →
-        # applied to the user's 10.01 libraries → written into the patched-libraries
-        # folder above, in a target subfolder. Runs in a thread; log lines go to the app
-        # log so the user sees per-library progress.
-        _prep_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _prep_row.pack(fill="x", padx=14, pady=(6, 0))
-        ctk.CTkLabel(_prep_row, text="Prepare from BestPig BackPork patches:",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
-        for _t in ("7.61", "6.02"):
-            ctk.CTkButton(_prep_row, text=f"Prepare {_t}", width=100, height=26,
-                           fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                           command=lambda t=_t: self.app.prepare_backport_libs(t)).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(ds, text="Downloads the current .bps patches for the target from BackPork's public "
-                              "GitHub repo, applies them to your 10.01 libraries in the folder ABOVE, and "
-                              "writes the patched files into the patched-libraries folder in a <target> "
-                              "subfolder. The patches are small and cached; the libraries never leave your "
-                              "machine.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14, pady=(4, 4))
-
-        ctk.CTkLabel(ds, text="Backport — original firmware libraries (for the compatibility check):",
-                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="The unmodified system libraries of the target firmware. The job dialog's Check "
-                              "reads which functions they export and compares them with what a game imports, "
-                              "so you see before building whether the game can run there.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14)
-        _fw_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _fw_row.pack(fill="x", padx=14, pady=(4, 4))
-        _fw_entry = ctk.CTkEntry(_fw_row, textvariable=self.app.fw_libs_var,
-                                 placeholder_text="Folder with the firmware's .sprx files…")
-        _fw_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        def _save_fw(*_):
-            save_settings({"fw_libs_root": self.app.fw_libs_var.get().strip()})
-        def _browse_fw():
-            from tkinter import filedialog
-            c = filedialog.askdirectory(title="Select the folder with the firmware's system libraries")
-            if c:
-                self.app.fw_libs_var.set(c)
-                _save_fw()
-        _fw_entry.bind("<FocusOut>", lambda e: _save_fw())
-        ctk.CTkButton(_fw_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
-                      command=_browse_fw).pack(side="left")
-
-        # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
-        ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional, Windows only):",
-                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="Path to your own libScePubTools.dll (Sony SDK, not bundled). Only used on Windows "
-                              "when an fPKG job selects the 'publishingtools' Kraken backend — LibProsperoPkg "
-                              "refuses that backend on macOS (the build would fail), so here the built-in "
-                              "managed Kraken encoder is always used.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14)
-        _pt_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _pt_row.pack(fill="x", padx=14, pady=(4, 4))
-        _pt_entry = ctk.CTkEntry(_pt_row, textvariable=self.app.pubtools_dll_var,
-                                 placeholder_text="…/libScePubTools.dll")
-        _pt_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        def _save_pt(*_):
-            save_settings({"pubtools_dll": self.app.pubtools_dll_var.get().strip()})
-        def _browse_pt():
-            from tkinter import filedialog
-            c = filedialog.askopenfilename(title="Select libScePubTools.dll",
-                                           filetypes=[("DLL", "*.dll"), ("All files", "*.*")])
-            if c:
-                self.app.pubtools_dll_var.set(c)
-                _save_pt()
-        _pt_entry.bind("<FocusOut>", lambda e: _save_pt())
-        ctk.CTkButton(_pt_row, text="Browse", width=80, fg_color=GREEN, hover_color=GREEN2,
-                      command=_browse_pt).pack(side="left")
-
         # ── Extra temp drives (pool) ─────────────────────────────────────────
         ctk.CTkLabel(ds, text="Extra temp drives (pool, one path per line):",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
@@ -1171,8 +1411,8 @@ class SettingsWindow(ctk.CTkToplevel):
                               "game that won't fit one drive, the source is extracted to one and the inner "
                               "image built on another — so pass 1 stays SSD↔SSD instead of reading off the "
                               "HDD. The main Temp folder is the first pool drive; these are added to it.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left",
-                      wraplength=440).pack(anchor="w", padx=14)
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
         self._pool_box = ctk.CTkTextbox(ds, height=70, fg_color=CARD, border_width=1,
                                          border_color=BORDER2, text_color=WHITE,
                                          font=ctk.CTkFont(size=12))
@@ -1201,51 +1441,172 @@ class SettingsWindow(ctk.CTkToplevel):
                 self._pool_box.delete("1.0", "end")
                 self._pool_box.insert("1.0", (cur + "\n" + p).strip("\n"))
                 _save_pool()
-        ctk.CTkButton(_pool_btns, text="Add Drive…", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), width=120,
-                       command=_add_pool_dir).pack(side="left")
-        ctk.CTkButton(_pool_btns, text="Save Pool", fg_color=GREEN, text_color="#061006",
-                       hover_color=GREEN2, width=120, command=_save_pool).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(_pool_btns, text="Add drive…", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, width=120,
+                       command=_add_pool_dir, border_width=1, border_color=BTN_BORDER).pack(side="left")
+        ctk.CTkButton(_pool_btns, text="Save pool", fg_color=ACCENT, text_color=ON_ACCENT,
+                       hover_color=ACCENT_HOVER, width=120, command=_save_pool).pack(side="left", padx=(8, 0))
 
-        ctk.CTkLabel(ds, text="Safety factor scales only the temp headroom; the output drive must always "
-                              "fit the finished .ffpfsc. 'Skip' applies per game during batch runs. "
-                              "exFAT mode wraps a real exFAT volume instead of the folder PFS builder "
-                              "(slower to build; try it if folder-built .ffpfsc crash the console). "
-                              "Keep-awake only runs WHILE a job is packing: a fast tiny write keeps "
-                              "bus-powered HDDs (WD Elements) spun-up across the gaps between games, so "
-                              "each game skips a fresh spin-up. It pings only the drive the job ISN'T "
-                              "currently using (the busy one can't sleep and a write there just costs a "
-                              "seek). Keep it under ~8 s (the IntelliPark park timer) or it adds head-"
-                              "parking instead of preventing it. When idle the drive sleeps normally.",
-                      text_color=MUTED, justify="left", wraplength=440).pack(anchor="w", padx=14, pady=(0, 10))
+        ctk.CTkLabel(ds, text="The safety factor scales only the temp headroom; the output drive always has to "
+                              "fit the finished .ffpfsc, and 'Skip' applies per game in a batch. The exFAT mode "
+                              "builds through a real exFAT volume instead of the folder builder: slower, and "
+                              "worth a try when a folder-built .ffpfsc crashes the console.\n\n"
+                              "Keep-awake runs only while a job packs. A tiny write every few seconds keeps "
+                              "bus-powered HDDs spinning between games, on the drive the job is not using. Keep "
+                              "the interval under about 8 s, the drive's park timer; when idle the drive sleeps "
+                              "normally.",
+                      text_color=MUTED, justify="left", wraplength=640).pack(anchor="w", padx=14, pady=(0, 10))
 
-        # ABOUT
-        self._section_label(scroll, "ABOUT")
+
+    def _page_backport(self, scroll):
+        ds = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
+        ds.pack(fill="x", pady=(4, 12))
+        # ── AMPR / APR emu folder (PlayGo titles) ────────────────────────────
+        ctk.CTkLabel(ds, text="AMPR / APR (PlayGo) — emu files folder:",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Folder holding libSceAmpr.sprx + libScePlayGo.sprx (you supply these). "
+                              "PlayGo/APR games are auto-detected (sce_sys/playgo-chunk.dat); the two "
+                              "files are injected into a fakelib/ folder and an ampr_emu.index is built "
+                              "before packing, so the game boots from the compressed container.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
+        _ampr_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _ampr_row.pack(fill="x", padx=14, pady=(4, 4))
+        _ampr_entry = ctk.CTkEntry(_ampr_row, textvariable=self.app.ampr_var,
+                                   placeholder_text="Folder with the two .sprx files…")
+        _ampr_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_ampr(*_):
+            save_settings({"ampr_folder": self.app.ampr_var.get().strip()})
+        def _browse_ampr():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select AMPR Emu Folder")
+            if c:
+                self.app.ampr_var.set(c)
+                _save_ampr()
+        _ampr_entry.bind("<FocusOut>", lambda e: _save_ampr())
+        ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=_browse_ampr).pack(side="left")
+
+        # ── Backport folders ─────────────────────────────────────────────────
+        ctk.CTkLabel(ds, text="Backport — patched libraries folder (default for new jobs):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Your own patched system libraries for the target firmware (you extract them from "
+                              "your firmware and apply the public patches yourself; nothing ships with this app). "
+                              "Copied into the game's fakelib/ when a job backports.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
+        _bl_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _bl_row.pack(fill="x", padx=14, pady=(4, 4))
+        _bl_entry = ctk.CTkEntry(_bl_row, textvariable=self.app.backport_libs_var,
+                                 placeholder_text="Folder with patched .sprx files…")
+        _bl_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_bl(*_):
+            save_settings({"backport_libs_root": self.app.backport_libs_var.get().strip()})
+        def _browse_bl():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select the folder with your patched PS5 libraries")
+            if c:
+                self.app.backport_libs_var.set(c)
+                _save_bl()
+        _bl_entry.bind("<FocusOut>", lambda e: _save_bl())
+        ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=_browse_bl).pack(side="left")
+
+        # One-click prepare: BestPig BackPork patches (small, ~1 KB total per target) →
+        # applied to the user's 10.01 libraries → written into the patched-libraries
+        # folder above, in a target subfolder. Runs in a thread; log lines go to the app
+        # log so the user sees per-library progress.
+        _prep_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _prep_row.pack(fill="x", padx=14, pady=(6, 0))
+        ctk.CTkLabel(_prep_row, text="Prepare from BestPig BackPork patches:",
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
+        for _t in ("7.61", "6.02"):
+            ctk.CTkButton(_prep_row, text=f"Prepare {_t}", width=100, height=26,
+                           fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                           command=lambda t=_t: self.app.prepare_backport_libs(t), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(ds, text="Downloads the current .bps patches for the target from BackPork's public "
+                              "GitHub repo, applies them to your 10.01 libraries in the folder ABOVE, and "
+                              "writes the patched files into the patched-libraries folder in a <target> "
+                              "subfolder. The patches are small and cached; the libraries never leave your "
+                              "machine.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14, pady=(4, 4))
+
+        ctk.CTkLabel(ds, text="Backport — original firmware libraries (for the compatibility check):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="The unmodified system libraries of the target firmware. The job dialog's Check "
+                              "reads which functions they export and compares them with what a game imports, "
+                              "so you see before building whether the game can run there.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
+        _fw_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _fw_row.pack(fill="x", padx=14, pady=(4, 4))
+        _fw_entry = ctk.CTkEntry(_fw_row, textvariable=self.app.fw_libs_var,
+                                 placeholder_text="Folder with the firmware's .sprx files…")
+        _fw_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_fw(*_):
+            save_settings({"fw_libs_root": self.app.fw_libs_var.get().strip()})
+        def _browse_fw():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select the folder with the firmware's system libraries")
+            if c:
+                self.app.fw_libs_var.set(c)
+                _save_fw()
+        _fw_entry.bind("<FocusOut>", lambda e: _save_fw())
+        ctk.CTkButton(_fw_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=_browse_fw).pack(side="left")
+
+        # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
+        ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional, Windows only):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Path to your own libScePubTools.dll (Sony SDK, not bundled). Only used on Windows "
+                              "when an fPKG job selects the 'publishingtools' Kraken backend — LibProsperoPkg "
+                              "refuses that backend on macOS (the build would fail), so here the built-in "
+                              "managed Kraken encoder is always used.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
+        _pt_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _pt_row.pack(fill="x", padx=14, pady=(4, 4))
+        _pt_entry = ctk.CTkEntry(_pt_row, textvariable=self.app.pubtools_dll_var,
+                                 placeholder_text="…/libScePubTools.dll")
+        _pt_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        def _save_pt(*_):
+            save_settings({"pubtools_dll": self.app.pubtools_dll_var.get().strip()})
+        def _browse_pt():
+            from tkinter import filedialog
+            c = filedialog.askopenfilename(title="Select libScePubTools.dll",
+                                           filetypes=[("DLL", "*.dll"), ("All files", "*.*")])
+            if c:
+                self.app.pubtools_dll_var.set(c)
+                _save_pt()
+        _pt_entry.bind("<FocusOut>", lambda e: _save_pt())
+        ctk.CTkButton(_pt_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=_browse_pt).pack(side="left")
+
+
+    def _page_about(self, scroll):
         about = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
         about.pack(fill="x", pady=(4, 12))
         for line in [
-            f"Version:  {APP_VERSION}",
-            f"Backend:  {BACKEND_NAME}",
-            f"MkPFS:    {MKPFS_NAME} v{MKPFS_VERSION}",
-            f"Config:   {SETTINGS_FILE}",
-            f"History:  {HISTORY_FILE}",
-            f"Log:      {RAW_LOG_FILE}",
+            f"Version   {APP_VERSION}",
+            f"MkPFS     {MKPFS_NAME} {MKPFS_VERSION}",
+            f"Config    {SETTINGS_FILE}",
+            f"History   {HISTORY_FILE}",
+            f"Log       {RAW_LOG_FILE}",
         ]:
             ctk.CTkLabel(about, text=line, text_color=MUTED, anchor="w",
-                          font=ctk.CTkFont(family="Consolas", size=11)).pack(anchor="w", padx=14, pady=3)
-
-        # Bottom buttons
-        btns = ctk.CTkFrame(self, fg_color=BLACK)
-        btns.pack(fill="x", padx=20, pady=(0, 16))
-        ctk.CTkButton(btns, text="Close", fg_color=GREEN, text_color="#061006",
-                       hover_color=GREEN2, command=self.destroy).pack(side="right")
-        ctk.CTkButton(btns, text="Open Config Folder", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"),
-                       command=lambda: open_path(APP_DIR)).pack(side="left")
+                         font=ctk.CTkFont(family=MONO_FONT, size=11)).pack(anchor="w", padx=14, pady=3)
+        ctk.CTkLabel(about, text="By Knutwurst. The backend grew out of Bizkut's ps5-ffpfs-cli; images are built "
+                                 "with PSBrew's MkPFS and packages with LibProsperoPkg. See NOTICES.md.",
+                     text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=520, justify="left").pack(
+            anchor="w", padx=14, pady=(8, 12))
+        ctk.CTkButton(scroll, text="Open config folder", fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                      border_width=1, border_color=BTN_BORDER, width=160,
+                      command=lambda: open_path(APP_DIR)).pack(anchor="w", pady=(0, 12))
 
     def _section_label(self, parent, text):
-        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=12, weight="bold"),
-                      text_color=("#1a7a40", "#4ade80")).pack(anchor="w", pady=(10, 4))
+        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=WHITE).pack(anchor="w", padx=4, pady=(10, 4))
 
     def _browse_folder(self, var, settings_key, title):
         p = filedialog.askdirectory(title=title)
@@ -1836,7 +2197,7 @@ class CLIWorker(threading.Thread):
             if not getattr(self, "_mem_error_shown", False):
                 self._mem_error_shown = True
                 self.app.log("ERROR",
-                    "❌  Out of RAM — mkpfs ran out of memory during parallel compression.\n"
+                    "Out of RAM — mkpfs ran out of memory during parallel compression.\n"
                     "\n"
                     "  What happened:\n"
                     "    mkpfs spawns one worker process per CPU core. Each worker holds\n"
@@ -1861,7 +2222,7 @@ class CLIWorker(threading.Thread):
             "errno 22" in lower or "invalid argument" in lower
         ):
             self.app.log("ERROR",
-                "❌  Write failed — OS error 22 (Invalid argument).\n"
+                "Write failed — OS error 22 (Invalid argument).\n"
                 "\n"
                 "  Most likely cause:  output drive is exFAT or FAT32\n"
                 "    exFAT / FAT32 has a 4 GB per-file limit.\n"
@@ -1878,7 +2239,7 @@ class CLIWorker(threading.Thread):
         if ("errno 28" in lower or "no space left" in lower
                 or "there is not enough space" in lower):
             self.app.log("ERROR",
-                "❌  Disk full — the output or temp drive ran out of space.\n"
+                "Disk full — the output or temp drive ran out of space.\n"
                 "\n"
                 "  ╔═ Settings to check: ════════════════════════════════════════╗\n"
                 "  ║  OUTPUT folder  →  point to a drive with more free space    ║\n"
@@ -1889,7 +2250,7 @@ class CLIWorker(threading.Thread):
             return
 
         if "calledprocesserror" in lower and "non-zero exit status" in lower:
-            self.app.log("ERROR", "❌  mkpfs exited with an error — see messages above.")
+            self.app.log("ERROR", "mkpfs exited with an error — see messages above.")
             if not getattr(self, "_mem_error_shown", False):
                 # Generic hint only when a more specific error wasn't already shown.
                 self.app.log("ERROR",
@@ -1974,7 +2335,7 @@ class CLIWorker(threading.Thread):
         # Hardlink / symlink failure — warn immediately, don't wait for exit code
         if "unable to stage source file" in lower or "hard link and symlink both failed" in lower:
             self.app.log("WARN",
-                "⚠  Temp drive does not support hardlinks/symlinks. "
+                "Temp drive does not support hardlinks/symlinks. "
                 "Fallback to copy mode — compression will be slower and needs extra space.")
 
         # Inner image auto-rename (MkPFS) — informational, not an error
@@ -2183,20 +2544,20 @@ class CLIWorker(threading.Thread):
         name_lower = p.name.lower()
         if name_lower.endswith(".ffpfsc.ffpfsc"):
             warns.append(
-                f"⚠ Double extension detected: {p.name}\n"
+                f"Double extension detected: {p.name}\n"
                 "   Rename the file — remove one '.ffpfsc' suffix before mounting in ShadowMount."
             )
         elif not name_lower.endswith(".ffpfsc"):
             warns.append(
-                f"⚠ Unexpected output extension '{p.suffix}' — expected .ffpfsc\n"
+                f"Unexpected output extension '{p.suffix}' — expected .ffpfsc\n"
                 "   ShadowMount may not recognise this file."
             )
         sz = p.stat().st_size
         if sz == 0:
-            warns.append("⚠ Output file is 0 bytes — compression may have failed silently.")
+            warns.append("Output file is 0 bytes — compression may have failed silently.")
         elif sz < 1 * 1024 * 1024:
             warns.append(
-                f"⚠ Output file is very small ({format_size(sz)}) — "
+                f"Output file is very small ({format_size(sz)}) — "
                 "the source dump may be incomplete or empty."
             )
         return warns
@@ -2308,7 +2669,7 @@ def _hdr_mode(v) -> str:
     return s if s in ("auto", "on", "off") else "auto"
 
 
-class PackDialog(ctk.CTkToplevel):
+class PackDialog(EmbeddedDialog):
     """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
 
     Three formats: '.ffpfsc' (compressed), '.ffpfs' (uncompressed) and '.pkg' — an
@@ -2326,9 +2687,10 @@ class PackDialog(ctk.CTkToplevel):
     / format (+ fPKG parameters for an fPKG job). Saving mutates it in place, or swaps a
     fresh GameItem in at the same queue index when the source or the job kind changes
     (pack ↔ fPKG)."""
+    LARGE = True
 
     FORMATS = ("ffpfsc", "ffpfs", "pkg")
-    _FMT_LABEL = {"ffpfsc": "📦  .ffpfsc", "ffpfs": "⚡  .ffpfs", "pkg": "🎮  .pkg (fPKG)"}
+    _FMT_LABEL = {"ffpfsc": ".ffpfsc", "ffpfs": ".ffpfs", "pkg": ".pkg (fPKG)"}
     _FMT_HINT = {
         "ffpfsc": "Compressed — smaller; mounted by ShadowMountPlus / MicroMount.",
         "ffpfs":  "Uncompressed — faster to build and to mount, full size. (Disk images .exfat/.ffpkg "
@@ -2445,8 +2807,8 @@ class PackDialog(ctk.CTkToplevel):
         if not self._backend_shown:
             self.back_var.set("builtin")
 
-        head = "📦  Pack — edit job" if item else "📦  Pack — add job"
-        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        head = "Pack — edit job" if item else "Pack — add job"
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=20, pady=(16, 2))
         sub = ("Change this job's source, output folder, format or fPKG parameters. The job stays at "
                "its current queue position." if item else
@@ -2459,45 +2821,45 @@ class PackDialog(ctk.CTkToplevel):
         # ── Source ──
         srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(srow, text="Source  (folder OR file — archive, .exfat/.ffpkg, .ffpfs; a .ffpfsc for the .pkg format):",
-                      text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                      text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
         # Tk can't pick a file AND a folder in one native dialog, so two buttons — but no
         # archive-vs-image triage: ONE broad file filter covers them all, and the kind is
         # auto-detected from the path at save time.
-        ctk.CTkButton(sinner, text="📄  File…", width=76, fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
+        ctk.CTkButton(sinner, text="File…", width=76, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=self._pick_file).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="📁  Folder…", width=88, fg_color=CARD2, hover_color=GREEN2,
-                       text_color=WHITE, command=self._pick_folder).pack(side="left", padx=(6, 0))
-        ctk.CTkLabel(srow, textvariable=self.src_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkButton(sinner, text="Folder…", width=88, fg_color=BTN, hover_color=BTN_HOVER,
+                       text_color=WHITE, command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(srow, textvariable=self.src_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
 
         # ── Output ──
         orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(orow, textvariable=self.out_label, text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 4))
         ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_out).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(oinner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_out, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
         # Auto-organize: the one switch that makes any source land as
         # <Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y].ffpfsc|.pkg, named from the game itself.
         ctk.CTkCheckBox(orow, text="Auto-organize — folder and file named from the game's own metadata (pattern above)",
                         variable=self.organize_var, command=self._apply_format,
-                        checkbox_width=18, checkbox_height=18, fg_color=GREEN, hover_color=GREEN2,
-                        text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 8))
+                        checkbox_width=18, checkbox_height=18, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── Format ──
         frow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); frow.pack(fill="x", padx=20, pady=4)
         finner = ctk.CTkFrame(frow, fg_color=PANEL); finner.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkLabel(finner, text="Format:", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 10))
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 10))
         self._fmt_seg = ctk.CTkSegmentedButton(finner, values=[self._FMT_LABEL[k] for k in self.FORMATS],
-                                                variable=self.fmt_var, selected_color=GREEN,
-                                                selected_hover_color=GREEN2, command=self._on_fmt_selected)
+                                                variable=self.fmt_var, selected_color=ACCENT,
+                                                selected_hover_color=ACCENT_HOVER, command=self._on_fmt_selected)
         self._fmt_seg.pack(side="left")
-        ctk.CTkLabel(frow, textvariable=self.fmt_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(frow, textvariable=self.fmt_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── Same-format copy row (shown only when the source suffix matches the target ──
@@ -2506,15 +2868,15 @@ class PackDialog(ctk.CTkToplevel):
         self.copy_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
         self.copy_hint = tk.StringVar(value="")
         ctk.CTkLabel(self.copy_row, text="Same format — no re-encode",
-                      text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold")).pack(
+                      text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold")).pack(
             anchor="w", padx=10, pady=(6, 0))
         ctk.CTkLabel(self.copy_row, textvariable=self.copy_hint, text_color=MUTED,
-                      font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(
+                      font=ctk.CTkFont(size=12), wraplength=620, justify="left").pack(
             anchor="w", padx=10, pady=(0, 4))
         ctk.CTkCheckBox(self.copy_row, text="Delete source after successful copy (cross-drive only; same-drive is always a move)",
                         variable=self.copy_delete_source_var, checkbox_width=18, checkbox_height=18,
-                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 8))
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
+                        font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(0, 8))
 
         # ── fPKG block (shown for the .pkg format only; packed before the button row) ──
         # Compact by default: ONE summary line plus "Edit…". The defaults are the best values
@@ -2527,17 +2889,17 @@ class PackDialog(ctk.CTkToplevel):
         sline = ctk.CTkFrame(srow_sum, fg_color=PANEL); sline.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkLabel(sline, textvariable=self.sum_var, text_color=WHITE, font=ctk.CTkFont(size=12),
                       wraplength=500, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
-        self._edit_btn = ctk.CTkButton(sline, text="✎  Edit…", width=92, fg_color=CARD2, hover_color=GREEN2,
-                                       text_color=WHITE, command=self._toggle_advanced)
+        self._edit_btn = ctk.CTkButton(sline, text="Edit…", width=92, fg_color=BTN, hover_color=BTN_HOVER,
+                                       text_color=WHITE, command=self._toggle_advanced, border_width=1, border_color=BTN_BORDER)
         self._edit_btn.pack(side="right", padx=(8, 0))
         self._sum_hint = ctk.CTkLabel(srow_sum, text="These defaults give the smallest, most compatible package. Edit only for a game "
                                                     "folder without sce_sys/param.json, or to trade a little size for speed.",
-                                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left")
+                                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left")
         self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
 
         # Identity rows (packed by _layout_fpkg when revealed or required)
         self.irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self.irow, textvariable=self.ident_head, text_color=WHITE, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(self.irow, textvariable=self.ident_head, text_color=WHITE, font=ctk.CTkFont(size=12),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(6, 2))
         grid = ctk.CTkFrame(self.irow, fg_color=PANEL); grid.pack(fill="x", padx=10, pady=(0, 2))
         grid.grid_columnconfigure(1, weight=1); grid.grid_columnconfigure(3, weight=1)
@@ -2548,39 +2910,39 @@ class PackDialog(ctk.CTkToplevel):
         _cell(0, 2, "Title ID",   self.tid_var)
         _cell(1, 0, "Title",      self.title_var)
         _cell(1, 2, "Version",    self.ver_var)
-        ctk.CTkLabel(self.irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(self.irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
 
         # Compression rows (packed by _layout_fpkg when revealed)
         self.crow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
         ctk.CTkLabel(self.crow, text="Compression:", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 2))
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 2))
         r1 = ctk.CTkFrame(self.crow, fg_color=PANEL); r1.pack(fill="x", padx=10, pady=2)
         ctk.CTkLabel(r1, text="Codec layer:", text_color=MUTED, width=110, anchor="w").pack(side="left")
         ctk.CTkSegmentedButton(r1, values=list(self._INNER), variable=self.inner_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
                                 command=lambda *_: self._refresh_hints()).pack(side="left")
         ctk.CTkLabel(r1, text="  kraken = default, the layout verified on the console",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
         if self._backend_shown:
             r2 = ctk.CTkFrame(self.crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
             ctk.CTkLabel(r2, text="Kraken backend:", text_color=MUTED, width=110, anchor="w").pack(side="left")
             ctk.CTkSegmentedButton(r2, values=list(self._BACKEND), variable=self.back_var,
-                                    selected_color=GREEN, selected_hover_color=GREEN2,
+                                    selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
                                     command=lambda *_: self._refresh_hints()).pack(side="left")
             ctk.CTkLabel(self.crow, textvariable=self.back_hint, text_color=MUTED,
-                          font=ctk.CTkFont(size=11), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
+                          font=ctk.CTkFont(size=12), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
         r3 = ctk.CTkFrame(self.crow, fg_color=PANEL); r3.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkLabel(r3, text="Kraken speed:", text_color=MUTED, width=110, anchor="w").pack(side="left")
         ctk.CTkSegmentedButton(r3, values=list(self._SPEED), variable=self.speed_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
                                 command=lambda *_: self._refresh_hints()).pack(side="left")
         ctk.CTkLabel(r3, text="  normal = smallest (default)  ·  fast = quicker, a little larger",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkLabel(self.crow, text="Every file is Kraken-packed whatever the codec layer. The tuning bar does not "
                                      "apply to fPKG builds (single-worker outer pass, format-fixed blocks); only its "
                                      "temp drive is used.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(4, 8))
         # Retail options row (packed by _layout_fpkg when revealed). One line of switches
         # plus one hint line: the expanded dialog has to stay within a laptop screen.
@@ -2590,33 +2952,33 @@ class PackDialog(ctk.CTkToplevel):
         for _var, _text in ((self.retail_var, "Retail fixes"),
                             (self.regen_var, "Rebuild PlayGo"), (self.sign_var, "Fake-sign ELFs")):
             ctk.CTkCheckBox(r4, text=_text, variable=_var, checkbox_width=18, checkbox_height=18,
-                            fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-                            font=ctk.CTkFont(size=11), command=self._update_summary).pack(side="left", padx=(0, 14))
+                            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
+                            font=ctk.CTkFont(size=12), command=self._update_summary).pack(side="left", padx=(0, 14))
         # HDR is a three-way choice, not a bool: the source's own param.json declares whether
         # the title supports HDR, and "auto" keeps exactly that (the publisher's intent).
         r5 = ctk.CTkFrame(self.orow, fg_color=PANEL); r5.pack(fill="x", padx=10, pady=2)
         ctk.CTkLabel(r5, text="HDR flag:", text_color=MUTED, width=110, anchor="w").pack(side="left")
         ctk.CTkSegmentedButton(r5, values=["auto", "on", "off"], variable=self.hdr_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
                                 command=lambda *_: self._update_summary()).pack(side="left")
         ctk.CTkLabel(r5, text="  auto = as the source declares  ·  on = force HDR output  ·  off = clear the flag",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkLabel(self.orow, text="Defaults are the configuration verified on the console · Rebuild PlayGo also drops a "
                                      "valid set (a corrupt one is always rebuilt) · sce_sys/keystone, the save-data key, "
                                      "is always kept.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left"
                       ).pack(anchor="w", padx=10, pady=(0, 8))
         for _v in (self.cid_var, self.tid_var):
             _v.trace_add("write", lambda *_: self._update_summary())
 
         # ── Buttons ──
         self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
-        save_text = "💾  Save changes" if item else "➕  Add to queue"
-        ctk.CTkButton(self._btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+        save_text = "Save changes" if item else "Add to queue"
+        ctk.CTkButton(self._btns, text=save_text, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=self._add).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(self._btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+        ctk.CTkButton(self._btns, text="Cancel", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
 
         self._apply_format()
         self._refresh_hints()
@@ -2735,7 +3097,7 @@ class PackDialog(ctk.CTkToplevel):
             self.orow.pack(fill="x", pady=4)
         else:
             self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
-        self._edit_btn.configure(text=("▲  Hide" if self._adv_shown else "✎  Edit…"))
+        self._edit_btn.configure(text=("Hide" if self._adv_shown else "Edit…"))
         self._update_summary()
 
     def _fit(self) -> None:
@@ -2847,10 +3209,10 @@ class PackDialog(ctk.CTkToplevel):
             return
         if self.fmt_key != "pkg":
             if suf == ".ffpfsc":
-                self.src_hint.set("⚠ A .ffpfsc is already packed — choose the .pkg format to build an fPKG from it, "
+                self.src_hint.set("A .ffpfsc is already packed — choose the .pkg format to build an fPKG from it, "
                                   "or use Convert to unpack it.")
             elif suf == ".pkg":
-                self.src_hint.set("⚠ A .pkg is a PS5 fake package — use fPKG⇢ to extract it.")
+                self.src_hint.set("A .pkg is a PS5 fake package — use fPKG⇢ to extract it.")
             else:
                 self.src_hint.set("")
             self._apply_format()
@@ -2869,7 +3231,7 @@ class PackDialog(ctk.CTkToplevel):
                                   "becomes its own .pkg job.")
                 self.ident_note.set(self._IDENT_AUTO_MULTI)
             if is_game_folder(p) and not (p / "eboot.bin").is_file():
-                self.src_hint.set(self.src_hint.get() + "  ⚠ no eboot.bin — the package will not launch.")
+                self.src_hint.set(self.src_hint.get() + "  No eboot.bin — the package will not launch.")
         elif suf in self._ARCHIVE_SUFFIXES:
             self.src_hint.set("Archive · extracted when its turn comes, then built into a .pkg.")
             self.ident_note.set(self._IDENT_AUTO)
@@ -2877,9 +3239,9 @@ class PackDialog(ctk.CTkToplevel):
             self.src_hint.set(f"Image ({suf}) · unwrapped on the temp drive first, then built into a .pkg.")
             self.ident_note.set(self._IDENT_AUTO)
         elif suf == ".pkg":
-            self.src_hint.set("⚠ Already a .pkg — use fPKG⇢ to extract it.")
+            self.src_hint.set("Already a .pkg — use fPKG⇢ to extract it.")
         else:
-            self.src_hint.set("⚠ Not a game folder, archive or .ffpfsc/.ffpfs/.exfat/.ffpkg image.")
+            self.src_hint.set("Not a game folder, archive or .ffpfsc/.ffpfs/.exfat/.ffpkg image.")
         # A game folder without param.json cannot get its identity from anywhere else:
         # the identity rows open by themselves and are marked required.
         self._set_ident_forced(p.is_dir() and is_game_folder(p) and not (p / "sce_sys" / "param.json").is_file())
@@ -2940,12 +3302,12 @@ class PackDialog(ctk.CTkToplevel):
         dll = (self.app.pubtools_dll_var.get() or "").strip()
         if self.back_var.get() == "publishingtools":
             if sys.platform != "win32":
-                self.back_hint.set("⚠ Windows only: LibProsperoPkg's Publishing Tools (Reduced Oodle) backend refuses "
+                self.back_hint.set("Windows only: LibProsperoPkg's Publishing Tools (Reduced Oodle) backend refuses "
                                    "to run on this OS — the build fails, it does not fall back. Use builtin.")
             elif dll and Path(dll).is_file():
                 self.back_hint.set(f"Uses your Sony libScePubTools.dll: {dll}")
             else:
-                self.back_hint.set("⚠ No Publishing Tools DLL set (Settings → Folders) — the build will fail. "
+                self.back_hint.set("No Publishing Tools DLL set (Settings → Folders) — the build will fail. "
                                    "Use builtin, or point Settings at your DLL.")
         else:
             self.back_hint.set("Built-in managed Kraken encoder — needs no external file. Console-install is what "
@@ -3168,7 +3530,7 @@ class PackDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-class JobDialog(ctk.CTkToplevel):
+class JobDialog(EmbeddedDialog):
     """One job, three groups: 1. source → 2. change the content → 3. output.
 
     Every job the app can run is a source (folder, parent folder, archive, disk image,
@@ -3178,6 +3540,7 @@ class JobDialog(ctk.CTkToplevel):
     backend's --to chain does the work (see cli.py CHAIN MODE); GameItem.from_chain is the
     item. Look inside (the PFS browser) is a peek, not a job — a link under the source.
     Edit mode (item given) refills the dialog and swaps the item in place."""
+    LARGE = True
 
     _TARGET_LABEL = {"folder": "Folder", "ffpfs": ".ffpfs", "ffpfsc": ".ffpfsc", "pkg": ".pkg"}
     _TARGET_KEY = {v: k for k, v in _TARGET_LABEL.items()}
@@ -3247,8 +3610,8 @@ class JobDialog(ctk.CTkToplevel):
         self.app = app
         self.edit_item = item
         self.title("Edit job" if item else "Add job")
-        self.geometry("820x900")
-        self.minsize(700, 620)
+        self.geometry("780x600")
+        self.minsize(660, 420)
         self.configure(fg_color=BLACK)
         self.transient(app.root)
         self.lift()
@@ -3310,37 +3673,61 @@ class JobDialog(ctk.CTkToplevel):
         row = ctk.CTkFrame(self.body, fg_color=PANEL, corner_radius=8)
         row.pack(fill="x", padx=20, pady=5)
         head = ctk.CTkFrame(row, fg_color=PANEL); head.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(head, text=number, width=22, height=22, corner_radius=11, fg_color=GREEN,
-                      text_color="#061006", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+        ctk.CTkLabel(head, text=number, width=22, height=22, corner_radius=11, fg_color=ACCENT,
+                      text_color=ON_ACCENT, font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
         ctk.CTkLabel(head, text=title, text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold")
                       ).pack(side="left", padx=(8, 10))
         if hint:
-            ctk.CTkLabel(head, text=hint, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+            ctk.CTkLabel(head, text=hint, text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
         return row
 
+    def _fit_to_content(self):
+        """Size the window to its content (options that open grow it), within the screen,
+        until the user resizes it by hand; then leave the size alone."""
+        try:
+            if not self.winfo_exists():
+                return
+            self.update_idletasks()
+            canvas = self.body._parent_canvas
+            chrome = self.winfo_reqheight() - canvas.winfo_reqheight()
+            need = chrome + self.body.winfo_reqheight() + 28
+            limit = self.winfo_screenheight() - 120
+            h = max(420, min(need, limit))
+            last = getattr(self, "_fit_h", None)
+            if last is not None and abs(self.winfo_height() - last) > 4:
+                return                       # the user resized the window
+            if last != h:
+                self._fit_h = h
+                self.geometry(f"{max(self.winfo_width(), 660)}x{h}")
+        except Exception:
+            pass
+
     def _build(self):
-        head = "✎  Edit job" if self.edit_item else "➕  Add job"
-        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        head = "Edit job" if self.edit_item else "Add job"
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text="Pick a source, choose what to change in it, choose what comes out. "
-                                "The line above the button says what the queue will do.",
+        ctk.CTkLabel(self, text="Pick a source, what to change in it and what comes out.",
                       text_color=MUTED, wraplength=720, justify="left").pack(anchor="w", padx=20, pady=(0, 6))
-        self.body = ctk.CTkScrollableFrame(self, fg_color=BLACK)
-        self.body.pack(fill="both", expand=True)
+        # Packed at the end of _build: filling a scrollable frame that is already on screen
+        # redraws its CTk scrollbar for every widget added (~0.4 s for this dialog).
+        self.body = ScrollFrame(self, fg_color=BLACK)
+        if not self.LARGE:   # a large panel fills the content area; only a window fits its content
+            self.after(60, self._fit_to_content)
+            self.body.bind("<Configure>", lambda e: self.after_idle(self._fit_to_content), add="+")
 
         # 1 · Source
         srow = self._group("1", "Source", "folder, parent folder, archive, disk image, .ffpfs, .ffpfsc or .pkg")
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(sinner, text="📄  File…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_file).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="📁  Folder…", width=88, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_folder).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="File…", width=76, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_file, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="Folder…", width=88, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
         dline = ctk.CTkFrame(srow, fg_color=PANEL); dline.pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkLabel(dline, textvariable=self.detect_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(dline, textvariable=self.detect_var, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=560, justify="left").pack(side="left")
-        self._look_btn = ctk.CTkButton(dline, text="🔎  Look inside…", width=120, height=24, fg_color="transparent",
-                                       hover_color=CARD2, text_color=GREEN, font=ctk.CTkFont(size=11),
+        self._look_btn = ctk.CTkButton(dline, text="Look inside…", width=120, height=24, fg_color="transparent",
+                                       hover_color=CARD2, text_color=ACCENT, font=ctk.CTkFont(size=12),
                                        command=self._look_inside)
         self._bind_help(self._HELP["source"], sinner)
         self._bind_help(self._HELP["look"], self._look_btn)
@@ -3350,16 +3737,19 @@ class JobDialog(ctk.CTkToplevel):
         crow = self._group("2", "Change the content", "optional · applied in this order")
         cin = ctk.CTkFrame(crow, fg_color=PANEL); cin.pack(fill="x", padx=10, pady=(2, 6))
 
+        opt_font = ctk.CTkFont(size=13)
+        opt_w = max(opt_font.measure(s) for s in ("Integrate a patch", "Backport", "Sign executables")) + 36
+
         def option(var, text, note, help_key):
             box = ctk.CTkFrame(cin, fg_color=PANEL); box.pack(fill="x", pady=(2, 2))
             line = ctk.CTkFrame(box, fg_color=PANEL); line.pack(fill="x")
-            cb = ctk.CTkCheckBox(line, text=text, variable=var, checkbox_width=18, checkbox_height=18,
-                                 fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12))
+            cb = ctk.CTkCheckBox(line, text=text, variable=var, checkbox_width=18, checkbox_height=18, width=opt_w,
+                                 fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE, font=opt_font)
             cb.pack(side="left")
-            nl = ctk.CTkLabel(line, text=note, text_color=MUTED, font=ctk.CTkFont(size=11))
+            nl = ctk.CTkLabel(line, text=note, text_color=MUTED, font=ctk.CTkFont(size=12))
             nl.pack(side="left", padx=(10, 0))
             opts = ctk.CTkFrame(box, fg_color=PANEL)              # packed by _refresh when checked
-            ctk.CTkFrame(opts, width=2, height=1, fg_color=GREEN2).pack(side="left", fill="y", padx=(8, 12), pady=2)   # height=1: a CTkFrame asks for 200 px otherwise
+            ctk.CTkFrame(opts, width=2, height=1, fg_color=ACCENT_HOVER).pack(side="left", fill="y", padx=(8, 12), pady=2)   # height=1: a CTkFrame asks for 200 px otherwise
             inner = ctk.CTkFrame(opts, fg_color=PANEL); inner.pack(side="left", fill="x", expand=True)
             self._bind_help(self._HELP[help_key], line)
             return types.SimpleNamespace(box=box, line=line, cb=cb, note=nl, opts=opts, inner=inner)
@@ -3368,112 +3758,130 @@ class JobDialog(ctk.CTkToplevel):
         po = option(self.patch_on_var, "Integrate a patch", "merge an update (folder, .zip or .rar) into the game", "patch")
         self._patch_opts = po.opts
         pin = ctk.CTkFrame(po.inner, fg_color=PANEL); pin.pack(fill="x", pady=(2, 4))
-        ctk.CTkLabel(pin, text="Patch:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(pin, text="Patch:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkEntry(pin, textvariable=self.patch_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(pin, text="File…", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_patch_file).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(pin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_patch_folder).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(pin, text="File…", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_patch_file, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(pin, text="Folder…", width=76, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_patch_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
         self._bind_help(self._HELP["patch"], pin)
 
         # Backport
         bo = option(self.backport_on_var, "Backport", "lower the SDK so the game runs on an older firmware", "backport")
         self._backport_opts = bo.opts
         b1 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b1.pack(fill="x", pady=(2, 2))
-        ctk.CTkLabel(b1, text="Target firmware:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(b1, text="Target firmware:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkSegmentedButton(b1, values=["7.61", "6.02", "10.xx"], variable=self.backport_target_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
-        ctk.CTkLabel(b1, textvariable=self.backport_hint_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER).pack(side="left")
+        ctk.CTkLabel(b1, textvariable=self.backport_hint_var, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=380, justify="left").pack(side="left", padx=(10, 0))
         self._bind_help(self._HELP["target"], b1)
         b2 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b2.pack(fill="x", pady=2)
-        ctk.CTkLabel(b2, text="Patched libraries:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(b2, text="Patched libraries:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkEntry(b2, textvariable=self.backport_libs_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(b2, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=self._pick_backport_libs).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(b2, text="Folder…", width=76, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=self._pick_backport_libs, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
         self._bind_help(self._HELP["libs"], b2)
         b3 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b3.pack(fill="x", pady=(2, 4))
-        ctk.CTkLabel(b3, text="Compatibility:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
-        self._check_btn = ctk.CTkButton(b3, text="Check", width=72, height=26, fg_color=CARD2, hover_color=GREEN2,
-                                        text_color=WHITE, command=self._check_compat)
+        ctk.CTkLabel(b3, text="Compatibility:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
+        self._check_btn = ctk.CTkButton(b3, text="Check", width=72, height=26, fg_color=BTN, hover_color=BTN_HOVER,
+                                        text_color=WHITE, command=self._check_compat, border_width=1, border_color=BTN_BORDER)
         self._check_btn.pack(side="left")
-        ctk.CTkLabel(b3, textvariable=self.check_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(b3, textvariable=self.check_var, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=440, justify="left").pack(side="left", padx=(10, 0))
         self._bind_help(self._HELP["check"], b3)
 
         # Sign — for a .pkg the checkbox gives way to a fixed line (the builder always signs)
         so = option(self.sign_var, "Sign executables", "fake-sign eboot.bin and every prx/sprx", "sign")
         self._sign_cb, self._sign_note_lbl, self._sign_line = so.cb, so.note, so.line
-        self._sign_fixed = ctk.CTkLabel(so.line, text="✓  Signed by the package builder — every executable in a .pkg is fake-signed",
+        self._sign_fixed = ctk.CTkLabel(so.line, text="Signed by the package builder — every executable in a .pkg is fake-signed",
                                         text_color=MUTED, font=ctk.CTkFont(size=12))
 
         # 3 · Output
         orow = self._group("3", "Output")
         oin = ctk.CTkFrame(orow, fg_color=PANEL); oin.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkSegmentedButton(oin, values=[self._TARGET_LABEL[k] for k in ("folder", "ffpfs", "ffpfsc", "pkg")],
-                                variable=self.to_var, selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
+                                variable=self.to_var, selected_color=ACCENT, selected_hover_color=ACCENT_HOVER).pack(side="left")
         self._to_hint = tk.StringVar(value="")
-        ctk.CTkLabel(oin, textvariable=self._to_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(oin, textvariable=self._to_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=420, justify="left").pack(side="left", padx=(10, 0))
         self._bind_help(self._HELP["output"], oin)
         fin = ctk.CTkFrame(orow, fg_color=PANEL); fin.pack(fill="x", padx=10, pady=(4, 2))
-        ctk.CTkLabel(fin, text="Save to:", text_color=MUTED, width=64, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(fin, text="Save to:", text_color=MUTED, width=64, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         self._out_entry = ctk.CTkEntry(fin, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE)
         self._out_entry.pack(side="left", fill="x", expand=True)
-        self._out_btn = ctk.CTkButton(fin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                                      command=self._pick_out)
+        self._out_btn = ctk.CTkButton(fin, text="Folder…", width=76, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                                      command=self._pick_out, border_width=1, border_color=BTN_BORDER)
         self._out_btn.pack(side="left", padx=(6, 0))
         self._bind_help(self._HELP["saveto"], fin)
         oline = ctk.CTkFrame(orow, fg_color=PANEL); oline.pack(fill="x", padx=10, pady=(2, 6))
         self._organize_cb = ctk.CTkCheckBox(oline, text="Auto-organize — folder and file named from the game's own metadata",
                                             variable=self.organize_var, checkbox_width=18, checkbox_height=18,
-                                            fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+                                            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE, font=ctk.CTkFont(size=12))
         self._organize_cb.pack(side="left")
         self._bind_help(self._HELP["organize"], self._organize_cb)
         self._keep_cb = ctk.CTkCheckBox(oline, text="Keep the source (cross-drive copy)", variable=self.keep_source_var,
-                                        checkbox_width=18, checkbox_height=18, fg_color=GREEN, hover_color=GREEN2,
-                                        text_color=WHITE, font=ctk.CTkFont(size=11))
+                                        checkbox_width=18, checkbox_height=18, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                        text_color=WHITE, font=ctk.CTkFont(size=12))
         self._bind_help(self._HELP["keep"], self._keep_cb)
         # .pkg options — two rows, shown only when .pkg is the output
         self._pkg_opts = ctk.CTkFrame(orow, fg_color=PANEL)
-        ctk.CTkFrame(self._pkg_opts, width=2, height=1, fg_color=GREEN2).pack(side="left", fill="y", padx=(10, 12), pady=2)
+        ctk.CTkFrame(self._pkg_opts, width=2, height=1, fg_color=ACCENT_HOVER).pack(side="left", fill="y", padx=(10, 12), pady=2)
         pk = ctk.CTkFrame(self._pkg_opts, fg_color=PANEL); pk.pack(side="left", fill="x", expand=True)
         p1 = ctk.CTkFrame(pk, fg_color=PANEL); p1.pack(fill="x", pady=(2, 2))
-        ctk.CTkLabel(p1, text=".pkg options:", text_color=MUTED, width=100, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(p1, text=".pkg options:", text_color=MUTED, width=100, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         _rc = ctk.CTkCheckBox(p1, text="Retail fixes", variable=self.retail_var, checkbox_width=18, checkbox_height=18,
-                              fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+                              fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE, font=ctk.CTkFont(size=12))
         _rc.pack(side="left", padx=(0, 18)); self._bind_help(self._HELP["retail"], _rc)
         _pc = ctk.CTkCheckBox(p1, text="Rebuild PlayGo", variable=self.regen_var, checkbox_width=18, checkbox_height=18,
-                              fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+                              fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE, font=ctk.CTkFont(size=12))
         _pc.pack(side="left", padx=(0, 18)); self._bind_help(self._HELP["playgo"], _pc)
         p2 = ctk.CTkFrame(pk, fg_color=PANEL); p2.pack(fill="x", pady=(2, 6))
         ctk.CTkLabel(p2, text="", width=100).pack(side="left")
         _h1 = ctk.CTkFrame(p2, fg_color=PANEL); _h1.pack(side="left")
-        ctk.CTkLabel(_h1, text="HDR:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
-        ctk.CTkSegmentedButton(_h1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=GREEN,
-                                selected_hover_color=GREEN2, height=24).pack(side="left")
+        ctk.CTkLabel(_h1, text="HDR:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+        ctk.CTkSegmentedButton(_h1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=ACCENT,
+                                selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
         self._bind_help(self._HELP["hdr"], _h1)
         _h2 = ctk.CTkFrame(p2, fg_color=PANEL); _h2.pack(side="left", padx=(18, 0))
-        ctk.CTkLabel(_h2, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
-        ctk.CTkSegmentedButton(_h2, values=["normal", "fast"], variable=self.speed_var, selected_color=GREEN,
-                                selected_hover_color=GREEN2, height=24).pack(side="left")
+        ctk.CTkLabel(_h2, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+        ctk.CTkSegmentedButton(_h2, values=["normal", "fast"], variable=self.speed_var, selected_color=ACCENT,
+                                selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
         self._bind_help(self._HELP["speed"], _h2)
 
         # Help line + summary + buttons (outside the scroll area, always visible)
-        foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(6, 12))
-        ctk.CTkLabel(foot, textvariable=self.help_var, text_color=MUTED, font=ctk.CTkFont(size=11),
-                      wraplength=760, justify="left", anchor="nw", height=48).pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(foot, textvariable=self.summary_var, text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold"),
-                      wraplength=760, justify="left").pack(anchor="w")
-        ctk.CTkLabel(foot, textvariable=self.summary_dest_var, text_color=MUTED, font=ctk.CTkFont(size=11),
-                      wraplength=760, justify="left").pack(anchor="w", pady=(0, 6))
-        btns = ctk.CTkFrame(foot, fg_color=BLACK); btns.pack(fill="x")
-        self._add_btn = ctk.CTkButton(btns, text="💾  Save changes" if self.edit_item else "➕  Add to queue",
-                                      fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
-                                      font=ctk.CTkFont(size=14, weight="bold"), command=self._add)
+        foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(0, 14))
+        ctk.CTkFrame(foot, height=1, corner_radius=0, fg_color=BORDER).pack(fill="x", pady=(0, 10))
+        # Two lines at the full width hold the longest hover text, so the footer never jumps.
+        help_lbl = ctk.CTkLabel(foot, textvariable=self.help_var, text_color=MUTED, font=ctk.CTkFont(size=12),
+                                justify="left", anchor="nw", height=34)
+        help_lbl.pack(fill="x", pady=(0, 8))
+        row = ctk.CTkFrame(foot, fg_color=BLACK); row.pack(fill="x")
+        btns = ctk.CTkFrame(row, fg_color=BLACK); btns.pack(side="right")
+        self._add_btn = ctk.CTkButton(btns, text="Save changes" if self.edit_item else "Add to queue",
+                                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+                                      font=ctk.CTkFont(size=13), command=self._add)
         self._add_btn.pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
-                       command=self.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                       command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
+        info = ctk.CTkFrame(row, fg_color=BLACK); info.pack(side="left", fill="x", expand=True, padx=(0, 16))
+        sum_lbl = ctk.CTkLabel(info, textvariable=self.summary_var, text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold"),
+                               justify="left", anchor="w")
+        sum_lbl.pack(anchor="w")
+        dest_lbl = ctk.CTkLabel(info, textvariable=self.summary_dest_var, text_color=MUTED, font=ctk.CTkFont(size=12),
+                                justify="left", anchor="w")
+        dest_lbl.pack(anchor="w")
+
+        def _wrap(_e=None):
+            try:
+                help_lbl.configure(wraplength=max(280, foot.winfo_width() - 8))
+                for lbl in (sum_lbl, dest_lbl):
+                    lbl.configure(wraplength=max(200, info.winfo_width() - 8))
+            except tk.TclError:
+                pass
+        foot.bind("<Configure>", _wrap, add="+")
+        info.bind("<Configure>", _wrap, add="+")
+        self.body.pack(fill="both", expand=True, before=foot)
 
     def _bind_help(self, text: str, *widgets):
         """Show *text* in the help line while the pointer is over any of *widgets* or their
@@ -3847,19 +4255,20 @@ class JobDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-class PatchDialog(ctk.CTkToplevel):
+class PatchDialog(EmbeddedDialog):
     """Collect a game (.ffpfsc / folder / archive) + a patch (folder / archive) and
     kick off 'patch into game' — unpack the game, overlay the patch files, repack.
 
     Edit mode (item=existing GameItem): opens pre-filled with that item's game/patch/
     output/mode; saving mutates the item in place."""
+    LARGE = True
 
     def __init__(self, app, item=None):
         super().__init__(app.root)
         self.app = app
         self.edit_item = item
         self.title("Integrate Patch — edit job" if item else "Integrate Patch into Game")
-        self.geometry("640x450")
+        self.geometry("620x440")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
@@ -3877,9 +4286,9 @@ class PatchDialog(ctk.CTkToplevel):
         self.mode_var = tk.StringVar(value=init_mode)
         self.out_var = tk.StringVar(value=init_out)
 
-        header_text = "🩹  Integrate Patch — edit job" if item else "🩹  Integrate Patch into Game"
+        header_text = "Integrate Patch — edit job" if item else "Integrate Patch into Game"
         ctk.CTkLabel(self, text=header_text,
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=20, pady=(16, 2))
         sub = ("Change this patch job's game, patch source, mode, or output. The job stays "
                "at its current queue position." if item else
@@ -3896,36 +4305,36 @@ class PatchDialog(ctk.CTkToplevel):
         mode_row = ctk.CTkFrame(self, fg_color=BLACK); mode_row.pack(fill="x", padx=20, pady=(10, 4))
         ctk.CTkLabel(mode_row, text="Output:", text_color=WHITE).pack(side="left", padx=(0, 10))
         ctk.CTkRadioButton(mode_row, text="New file ( … [patched].ffpfsc )", variable=self.mode_var,
-                            value="new", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+                            value="new", fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=6)
         ctk.CTkRadioButton(mode_row, text="Overwrite original", variable=self.mode_var,
-                            value="overwrite", fg_color=GREEN, hover_color=GREEN2).pack(side="left", padx=6)
+                            value="overwrite", fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=6)
 
         out_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); out_row.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(out_row, text="Output folder  (for the [patched] copy):", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         out_inner = ctk.CTkFrame(out_row, fg_color=PANEL); out_inner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(out_inner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
                       placeholder_text="defaults to the game's folder").pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(out_inner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=lambda: self._pick_dir(self.out_var)).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(out_inner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=lambda: self._pick_dir(self.out_var), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        save_text = "💾  Save changes" if item else "➕  Add to queue"
-        ctk.CTkButton(btns, text=save_text, fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+        save_text = "Save changes" if item else "Add to queue"
+        ctk.CTkButton(btns, text=save_text, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=self._go).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
 
     def _file_row(self, label, var, filetypes):
         row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); row.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(row, text=label, text_color=WHITE, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+        ctk.CTkLabel(row, text=label, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         inner = ctk.CTkFrame(row, fg_color=PANEL); inner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(inner, textvariable=var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(inner, text="File", width=58, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=lambda: self._pick_file(var, filetypes)).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(inner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                       command=lambda: self._pick_dir(var)).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(inner, text="File", width=58, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=lambda: self._pick_file(var, filetypes), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(inner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                       command=lambda: self._pick_dir(var), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
 
     def _pick_file(self, var, filetypes):
         p = filedialog.askopenfilename(filetypes=filetypes + [("All files", "*.*")])
@@ -3995,25 +4404,26 @@ class PatchDialog(ctk.CTkToplevel):
                                "Ready", 0, 0, "00:00", "—", "—")
 
 
-class ConverterDialog(ctk.CTkToplevel):
+class ConverterDialog(EmbeddedDialog):
     """Stepwise image converter: take a packed image apart one step at a time —
     .ffpfsc → .ffpfs (decompress, fast) → folder. The chosen conversion is added to the
     queue; the user then presses START (it reuses the normal unpack pipeline). Compressing
     a folder or a .ffpfs INTO a .ffpfsc is the normal queue + the top format switch."""
+    LARGE = True
 
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
         self.title("Image Converter")
-        self.geometry("880x460")
+        self.geometry("820x460")
         self.configure(fg_color=BLACK)
         self.resizable(False, False)
         self.transient(app.root); self.lift(); self.focus_force()
         self.after(50, self.grab_set)
         self.src_var = tk.StringVar()
 
-        ctk.CTkLabel(self, text="🔄  Image Converter",
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        ctk.CTkLabel(self, text="Image Converter",
+                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=24, pady=(18, 2))
         ctk.CTkLabel(self, text="Pick an image, then choose a step along the chain. The conversion is "
                                 "added to the queue — press ▶ START to run it.",
@@ -4024,14 +4434,14 @@ class ConverterDialog(ctk.CTkToplevel):
         ctk.CTkEntry(row, textvariable=self.src_var, fg_color=CARD, border_color=BORDER2,
                       text_color=WHITE, placeholder_text="Select a .ffpfsc / .ffpfs file or a folder…"
                       ).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(row, text="File…", width=66, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_file).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(row, text="Folder…", width=78, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._pick_folder).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(row, text="File…", width=66, fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._pick_file, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(row, text="Folder…", width=78, fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
 
         badge_row = ctk.CTkFrame(self, fg_color=BLACK); badge_row.pack(fill="x", padx=24, pady=(2, 2))
         self.badge = ctk.CTkLabel(badge_row, text="—", fg_color=CARD2, corner_radius=6,
-                                   text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold"),
+                                   text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold"),
                                    width=72, height=24)
         self.badge.pack(side="left")
         self.type_var = tk.StringVar(value="No file selected.")
@@ -4044,10 +4454,10 @@ class ConverterDialog(ctk.CTkToplevel):
 
         self.note_var = tk.StringVar(value="")
         ctk.CTkLabel(self, textvariable=self.note_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=11), wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
+                      font=ctk.CTkFont(size=12), wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
 
-        ctk.CTkButton(self, text="Close", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy
+        ctk.CTkButton(self, text="Close", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER
                        ).pack(side="right", padx=24, pady=16)
 
         self.src_var.trace_add("write", lambda *_: self._refresh())
@@ -4067,22 +4477,22 @@ class ConverterDialog(ctk.CTkToplevel):
     def _node(self, text, current=False):
         box = ctk.CTkFrame(self.pipe, fg_color=CARD, corner_radius=8,
                             border_width=2 if current else 1,
-                            border_color=GREEN if current else BORDER2)
+                            border_color=ACCENT if current else BORDER2)
         box.pack(side="left", padx=4, pady=14)
         ctk.CTkLabel(box, text=text, text_color=(WHITE if current else MUTED),
-                      font=ctk.CTkFont(size=14, weight="bold")).pack(padx=14, pady=(8, 0))
+                      font=ctk.CTkFont(size=13, weight="bold")).pack(padx=14, pady=(8, 0))
         ctk.CTkLabel(box, text=("you have this" if current else "result"),
-                      text_color=(GREEN if current else MUTED),
-                      font=ctk.CTkFont(size=10)).pack(padx=14, pady=(0, 8))
+                      text_color=(ACCENT if current else MUTED),
+                      font=ctk.CTkFont(size=11)).pack(padx=14, pady=(0, 8))
 
     def _transition(self, label, action, desc):
         cell = ctk.CTkFrame(self.pipe, fg_color=PANEL)
         cell.pack(side="left", padx=2, pady=8)
         ctk.CTkLabel(cell, text="→", text_color=MUTED, font=ctk.CTkFont(size=20)).pack()
-        ctk.CTkButton(cell, text=label, fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
-                       width=118, height=30, font=ctk.CTkFont(size=12, weight="bold"),
+        ctk.CTkButton(cell, text=label, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+                       width=118, height=30, font=ctk.CTkFont(size=13),
                        command=lambda a=action: self._go(a)).pack(pady=(2, 2))
-        ctk.CTkLabel(cell, text=desc, text_color=MUTED, font=ctk.CTkFont(size=10),
+        ctk.CTkLabel(cell, text=desc, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=128, justify="center").pack()
 
     def _refresh(self):
@@ -4100,12 +4510,12 @@ class ConverterDialog(ctk.CTkToplevel):
         if p.is_dir():
             self.badge.configure(text="FOLDER", fg_color=CARD2)
             self.type_var.set(f"“{p.name}” — a folder; batch-unpack every image inside.")
-            self._node("📁 Images", current=True)
+            self._node("Images", current=True)
             self._transition("Unpack all", "batch", "each image → its own folder")
             self._node("Folders")
             self.note_var.set("Every .ffpfs / .ffpfsc found in the folder is unpacked to its own folder.")
         elif p.suffix.lower() == ".ffpfsc":
-            self.badge.configure(text=".ffpfsc", fg_color=GREEN)
+            self.badge.configure(text=".ffpfsc", fg_color=ACCENT)
             self.type_var.set(f"“{p.name}” — compressed image.")
             self._node(".ffpfsc", current=True)
             self._transition("Decompress", "decompress", "→ inner .ffpfs (fast, one level)")
@@ -4142,11 +4552,12 @@ class ConverterDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-class JobEditMiniDialog(ctk.CTkToplevel):
+class JobEditMiniDialog(EmbeddedDialog):
     """Lightweight edit dialog for jobs whose ConverterDialog/PackDialog/PatchDialog flows
     don't fit a simple two-field shape: an Unpack/Convert item (the .ffpfsc image source
     + an output folder) or a Fake-Sign item (just the folder to sign in place). For Pack
     and Patch use the full PackDialog / PatchDialog in edit mode instead."""
+    LARGE = True
 
     def __init__(self, app, item):
         super().__init__(app.root)
@@ -4164,23 +4575,23 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         self.after(50, self.grab_set)
 
         if op == "unpack":
-            head = "🔄  Convert — edit job"
+            head = "Convert — edit job"
             sub  = "Change this conversion's source image or output folder. The job stays at its current queue position."
             self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
             self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
         elif op == "fpkg-extract":
-            head = "📥  Extract fPKG — edit job"
+            head = "Extract fPKG — edit job"
             sub  = "Change the .pkg this job extracts or the folder it extracts into. The job stays at its current queue position."
             self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
             self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
         else:   # fake-sign
-            head = "🖊  Fake Sign — edit job"
+            head = "Fake Sign — edit job"
             sub  = "Change the folder this fake-sign job operates on. The job stays at its current queue position."
             self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
             self.out_var = None
 
         ctk.CTkLabel(self, text=head,
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=20, pady=(16, 2))
         ctk.CTkLabel(self, text=sub, text_color=MUTED, wraplength=600, justify="left"
                       ).pack(anchor="w", padx=20, pady=(0, 10))
@@ -4190,35 +4601,35 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         src_label = {"unpack": "Source image (.ffpfsc / .ffpfs):",
                      "fpkg-extract": "Source package (.pkg):"}.get(op, "Folder (to fake-sign in place):")
         ctk.CTkLabel(srow, text=src_label, text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE
                       ).pack(side="left", fill="x", expand=True)
         if op in ("unpack", "fpkg-extract"):
-            ctk.CTkButton(sinner, text="File", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                           command=(self._pick_pkg if op == "fpkg-extract" else self._pick_image)
+            ctk.CTkButton(sinner, text="File", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                           command=(self._pick_pkg if op == "fpkg-extract" else self._pick_image), border_width=1, border_color=BTN_BORDER
                            ).pack(side="left", padx=(6, 0))
         if op != "fpkg-extract":
-            ctk.CTkButton(sinner, text="Folder", width=72, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                           command=self._pick_folder).pack(side="left", padx=(6, 0))
+            ctk.CTkButton(sinner, text="Folder", width=72, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                           command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
 
         # Output row (unpack / fpkg-extract)
         if op in ("unpack", "fpkg-extract"):
             orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
             ctk.CTkLabel(orow, text="Output folder  (where extracted files land):", text_color=WHITE,
-                          font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                          font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
             oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
             ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE
                           ).pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(oinner, text="Folder", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
-                           command=self._pick_outdir).pack(side="left", padx=(6, 0))
+            ctk.CTkButton(oinner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                           command=self._pick_outdir, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="💾  Save changes", fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+        ctk.CTkButton(btns, text="Save changes", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=self._save).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
 
     def _pick_image(self):
         p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
@@ -4302,7 +4713,7 @@ class JobEditMiniDialog(ctk.CTkToplevel):
         self.app.log("OK", f"Job updated: {it.name}")
 
 
-class ArchivePasswordPrompt(ctk.CTkToplevel):
+class ArchivePasswordPrompt(MessageWindow):
     """Modal: ask the user for ONE archive's password when no saved candidate unlocks
     its header (so the routing pre-check has no honest extracted size to work with).
     Result is exposed via .password ('' = Skip)."""
@@ -4312,13 +4723,13 @@ class ArchivePasswordPrompt(ctk.CTkToplevel):
         self.app = app
         self.password = ""
         self.title("Archive password needed")
-        self.geometry("540x240")
+        self.geometry("540x230")
         self.configure(fg_color=BLACK); self.resizable(False, False)
-        self.transient(app.root); self.lift(); self.focus_force()
+        self.protocol("WM_DELETE_WINDOW", self._skip)
         self.after(50, self.grab_set)
 
-        ctk.CTkLabel(self, text="🔑  Archive password needed",
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        ctk.CTkLabel(self, text="Archive password needed",
+                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=20, pady=(16, 2))
         ctk.CTkLabel(self,
                       text=f"The header of '{archive_name}' is encrypted (or could not be read) — "
@@ -4331,7 +4742,7 @@ class ArchivePasswordPrompt(ctk.CTkToplevel):
         self.pw_var = tk.StringVar()
         prow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); prow.pack(fill="x", padx=20, pady=4)
         ctk.CTkLabel(prow, text="Password:", text_color=WHITE,
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(6, 0))
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
         pinner = ctk.CTkFrame(prow, fg_color=PANEL); pinner.pack(fill="x", padx=10, pady=(2, 8))
         self.entry = ctk.CTkEntry(pinner, textvariable=self.pw_var, fg_color=CARD2,
                                    text_color=WHITE, show="•")
@@ -4339,15 +4750,15 @@ class ArchivePasswordPrompt(ctk.CTkToplevel):
         self.entry.focus_set()
         self.show_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(pinner, text="Show", variable=self.show_var,
-                         fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-                         command=self._toggle_show).pack(side="left", padx=(6, 0))
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
+                         command=self._toggle_show, checkbox_width=18, checkbox_height=18).pack(side="left", padx=(6, 0))
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="OK", fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=14, weight="bold"),
+        ctk.CTkButton(btns, text="OK", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=self._ok).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Skip", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._skip).pack(side="right")
+        ctk.CTkButton(btns, text="Skip", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._skip, border_width=1, border_color=BTN_BORDER).pack(side="right")
         self.bind("<Return>", lambda e: self._ok())
         self.bind("<Escape>", lambda e: self._skip())
 
@@ -4363,10 +4774,11 @@ class ArchivePasswordPrompt(ctk.CTkToplevel):
         self.destroy()
 
 
-class PfsBrowserDialog(ctk.CTkToplevel):
+class PfsBrowserDialog(EmbeddedDialog):
     """Browse a packed (.ffpfs) or compressed (.ffpfsc) image: list its contents and
     pull out individual files or whole folders, WITHOUT unpacking the whole image. The
     backend reads only the blocks it needs (--list-image / --extract-from). Read-only."""
+    LARGE = True
 
     def __init__(self, app, image_path=None, standalone=False):
         super().__init__(app.root)
@@ -4377,8 +4789,8 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         self._iid_path = {}         # tree item id -> rel path
         self._proc = None           # running extract subprocess (for cancel)
         self._q = queue.Queue()
-        self.title("Browse PFS image / fPKG")
-        self.geometry("780x580")
+        self.title("Look inside")
+        self.geometry("780x560")
         self.configure(fg_color=BLACK)
         self.resizable(True, True)
         # When this IS the only window (browser-only launch), behave as a normal top-level
@@ -4389,8 +4801,8 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             self.transient(app.root); self.lift(); self.focus_force()
             self.after(50, self.grab_set)
 
-        ctk.CTkLabel(self, text="🔎  Browse PFS image / fPKG",
-                      font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+        ctk.CTkLabel(self, text="Look inside",
+                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
                       ).pack(anchor="w", padx=18, pady=(14, 2))
         ctk.CTkLabel(self, text="Open a .ffpfs, .ffpfsc or .pkg (fPKG), see what's inside, and extract "
                                 "individual files or folders. The image is never fully unpacked — a .pkg "
@@ -4401,8 +4813,9 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         sin = ctk.CTkFrame(srow, fg_color=PANEL); sin.pack(fill="x", padx=10, pady=8)
         self.src_var = tk.StringVar(value=str(image_path or ""))
         ctk.CTkEntry(sin, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(sin, text="Open image…", width=110, fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=12, weight="bold"),
+        # Secondary: Extract selected is the one primary action of this panel.
+        ctk.CTkButton(sin, text="Open image…", width=110, fg_color=BTN, hover_color=BTN_HOVER,
+                       text_color=WHITE, border_width=1, border_color=BTN_BORDER, font=ctk.CTkFont(size=13),
                        command=self._pick).pack(side="left", padx=(6, 0))
 
         frow = ctk.CTkFrame(self, fg_color="transparent"); frow.pack(fill="x", padx=18, pady=(2, 0))
@@ -4419,17 +4832,19 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             style.theme_use("default")
         except Exception:
             pass
-        style.configure("PFS.Treeview", background="#151515", fieldbackground="#151515",
-                         foreground="#f8fafc", rowheight=22, borderwidth=0)
-        style.configure("PFS.Treeview.Heading", background="#1a1a1a", foreground="#a1a1aa", borderwidth=0)
-        style.map("PFS.Treeview", background=[("selected", "#22c55e")], foreground=[("selected", "#061006")])
+        _pal = PALETTE["light" if ctk.get_appearance_mode().lower() == "light" else "dark"]
+        style.configure("PFS.Treeview", background=_pal["surface2"], fieldbackground=_pal["surface2"],
+                         foreground=_pal["text"], rowheight=24, borderwidth=0)
+        style.configure("PFS.Treeview.Heading", background=_pal["surface"], foreground=_pal["muted"], borderwidth=0)
+        style.map("PFS.Treeview", background=[("selected", _pal["select"])], foreground=[("selected", _pal["text"])])
         tframe = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); tframe.pack(fill="both", expand=True, padx=18, pady=6)
         self.tree = ttk.Treeview(tframe, columns=("size", "type"), style="PFS.Treeview", selectmode="extended")
-        self.tree.heading("#0", text="Name"); self.tree.heading("size", text="Size"); self.tree.heading("type", text="Type")
+        self.tree.heading("#0", text="Name", anchor="w"); self.tree.heading("size", text="Size", anchor="e")
+        self.tree.heading("type", text="Type", anchor="center")
         self.tree.column("#0", width=470, anchor="w")
         self.tree.column("size", width=110, anchor="e")
-        self.tree.column("type", width=70, anchor="w")
-        vsb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
+        self.tree.column("type", width=80, anchor="center")
+        vsb = ctk.CTkScrollbar(tframe, command=self.tree.yview)   # the dark one, not the Aqua bar
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         vsb.pack(side="right", fill="y", pady=6)
@@ -4440,15 +4855,15 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         self.progress = ctk.CTkProgressBar(bottom, width=180); self.progress.set(0)
 
         btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=18, pady=(0, 14))
-        self.extract_sel_btn = ctk.CTkButton(btns, text="⬇  Extract selected…", fg_color=GREEN, hover_color=GREEN2,
-                       text_color="#061006", font=ctk.CTkFont(size=13, weight="bold"),
+        self.extract_sel_btn = ctk.CTkButton(btns, text="Extract selected…", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
                        command=lambda: self._extract(False), state="disabled")
         self.extract_sel_btn.pack(side="right", padx=(8, 0))
-        self.extract_all_btn = ctk.CTkButton(btns, text="⬇  Extract all…", fg_color=CARD2, text_color=WHITE,
-                       hover_color=GREEN2, command=lambda: self._extract(True), state="disabled")
+        self.extract_all_btn = ctk.CTkButton(btns, text="Extract all…", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=lambda: self._extract(True), state="disabled", border_width=1, border_color=BTN_BORDER)
         self.extract_all_btn.pack(side="right")
-        self.close_btn = ctk.CTkButton(btns, text="Close", fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._cancel_or_close)
+        self.close_btn = ctk.CTkButton(btns, text="Close", fg_color=BTN, text_color=WHITE,
+                       hover_color=BTN_HOVER, command=self._cancel_or_close, border_width=1, border_color=BTN_BORDER)
         self.close_btn.pack(side="left")
 
         self.after(120, self._poll)
@@ -4468,6 +4883,8 @@ class PfsBrowserDialog(ctk.CTkToplevel):
         if not raw or not Path(raw).is_file():
             messagebox.showerror("Not found", "Pick a .ffpfs / .ffpfsc / .pkg file first.", parent=self); return
         self.image_path = Path(raw)
+        kind = "  (fPKG)" if self.image_path.suffix.lower() == ".pkg" else ""
+        self.title(f"Look inside  ·  {self.image_path.name}{kind}")
         self.status_var.set("Reading image…")
         self.extract_sel_btn.configure(state="disabled"); self.extract_all_btn.configure(state="disabled")
         cmd = self.app._backend_cmd("--list-image", str(self.image_path))
@@ -4523,7 +4940,8 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             self.status_var.set(f"Bad listing: {e}"); return
         self._entries = data.get("entries", [])
         self._render()
-        self.status_var.set(f"{data.get('file_count', 0)} files, {data.get('dir_count', 0)} folders.")
+        nf, nd = data.get("file_count", 0), data.get("dir_count", 0)
+        self.status_var.set(f"{nf} file{'' if nf == 1 else 's'}, {nd} folder{'' if nd == 1 else 's'}")
         self.extract_sel_btn.configure(state="normal"); self.extract_all_btn.configure(state="normal")
 
     def _render(self):
@@ -4544,14 +4962,14 @@ class PfsBrowserDialog(ctk.CTkToplevel):
                         key=lambda e: (e["path"].count("/"), e["path"])):
             path = e["path"]
             parent = path.rsplit("/", 1)[0] if "/" in path else ""
-            iid = self.tree.insert(node.get(parent, ""), "end", text="📁 " + path.rsplit("/", 1)[-1],
+            iid = self.tree.insert(node.get(parent, ""), "end", text="" + path.rsplit("/", 1)[-1],
                                    values=("", "dir"), open=bool(flt))
             node[path] = iid
             self._iid_path[iid] = path
         for e in sorted((e for e in entries if e["type"] == "file"), key=lambda e: e["path"]):
             path = e["path"]
             parent = path.rsplit("/", 1)[0] if "/" in path else ""
-            iid = self.tree.insert(node.get(parent, ""), "end", text="📄 " + path.rsplit("/", 1)[-1],
+            iid = self.tree.insert(node.get(parent, ""), "end", text="" + path.rsplit("/", 1)[-1],
                                    values=(format_size(e.get("size", 0)), "file"))
             self._iid_path[iid] = path
         self.count_var.set(f"{len(self._iid_path)} shown")
@@ -4613,7 +5031,7 @@ class PfsBrowserDialog(ctk.CTkToplevel):
             pass
         self.extract_sel_btn.configure(state="normal"); self.extract_all_btn.configure(state="normal")
         if rc == 0:
-            self.status_var.set("Extracted ✓")
+            self.status_var.set("Extracted")
         else:
             self.status_var.set(f"Extraction failed ({rc}).")
 
@@ -4734,65 +5152,40 @@ class App:
             pass
 
     def _save_sashes(self):
-        """Persist the divider positions: the horizontal content dividers (queue |
-        progress | details widths, sash_h) AND the vertical content↔log divider (log
-        height, sash_v), so the layout the user set sticks across launches. Called on
-        every divider release."""
-        h = getattr(self, "_paned_h", None)
-        if h:
+        """Persist the job card's width (job_card_width). The card keeps that width when
+        the window is resized, so the width, not the divider position, is what to remember.
+        Called on every divider release."""
+        card = getattr(self, "_card_pane", None)
+        if card is not None:
             try:
-                xs = [h.sash_coord(0)[0], h.sash_coord(1)[0]]
-                if all(isinstance(x, int) and x > 0 for x in xs):
-                    save_settings({"sash_h": xs})
-            except Exception:
-                pass
-        v = getattr(self, "_paned_v", None)
-        if v:
-            try:
-                y = v.sash_coord(0)[1]
-                if isinstance(y, int) and y > 0:
-                    save_settings({"sash_v": y})
+                w = int(card.winfo_width())
+                if w >= 300:
+                    save_settings({"job_card_width": w})
             except Exception:
                 pass
 
     def _restore_sashes(self):
-        """Reapply the saved divider positions: the 3-section content widths (sash_h)
-        and the content↔log split (sash_v). On first run (or invalid data) fall back to
-        sensible proportions of the current size; retry briefly if the layout has not
-        settled yet."""
-        h = getattr(self, "_paned_h", None)
-        v = getattr(self, "_paned_v", None)
-        if not h and not v:
+        """Give the job card its remembered width (first run: 560 px) once the window has
+        its final size. The window opens small and grows to the saved geometry a moment
+        later; placing the divider before that would leave the card squeezed, because the
+        list, not the card, takes the extra width."""
+        pw = getattr(self, "_paned_q", None)
+        if not pw:
             return
         try:
             self.root.update_idletasks()
-            W = h.winfo_width() if h else 0
-            if h and W < 200:
-                # Layout not settled yet — retry a bounded number of times, then give up
-                # (a degenerate <200px width must not arm a perpetual 300 ms timer).
-                self._sash_restore_tries = getattr(self, "_sash_restore_tries", 0) + 1
-                if self._sash_restore_tries <= 12:
-                    self.root.after(300, self._restore_sashes)
+            W = pw.winfo_width()
+            prev = getattr(self, "_sash_last_w", None)
+            self._sash_last_w = W
+            tries = self._sash_restore_tries = getattr(self, "_sash_restore_tries", 0) + 1
+            if (W < 626 or W != prev) and tries <= 20:
+                self.root.after(150, self._restore_sashes)   # not settled yet
                 return
-            if h:
-                sh = load_settings().get("sash_h")
-                if not (isinstance(sh, list) and len(sh) >= 2
-                        and all(isinstance(x, int) for x in sh)):
-                    sh = [int(W * 0.30), int(W * 0.63)]
-                # Clamp into the visible range and keep the two dividers apart.
-                a = max(120, min(int(sh[0]), W - 240))
-                b = max(a + 120, min(int(sh[1]), W - 120))
-                h.sash_place(0, a, 1)
-                h.sash_place(1, b, 1)
-            if v:
-                H = v.winfo_height()
-                if H >= 200:
-                    sv = load_settings().get("sash_v")
-                    if not isinstance(sv, int):
-                        sv = int(H * 0.62)          # ~content 62% / log 38% by default
-                    # Keep both panes usable: content ≥160 px tall, log ≥140 px.
-                    y = max(160, min(int(sv), H - 140))
-                    v.sash_place(0, 1, y)
+            card_w = load_settings().get("job_card_width")
+            if not isinstance(card_w, int):
+                card_w = 560
+            card_w = max(340, min(card_w, W - 286))
+            pw.sash_place(0, W - card_w - int(pw.cget("sashwidth")), 1)
         except Exception:
             pass
 
@@ -4835,10 +5228,12 @@ class App:
         settings = load_settings()
         self._theme = settings.get("appearance_mode", "dark")
         ctk.set_appearance_mode(self._theme)
-        ctk.set_default_color_theme("green")
+        ctk.set_default_color_theme("blue")
+        apply_ctk_theme(ctk)
+        set_window_appearance(self.root, self._theme)
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry("1400x960")
-        self.root.minsize(1100, 760)
+        self.root.geometry("1280x820")
+        self.root.minsize(900, 600)
 
         self._saved_output = settings.get("output_folder", "")
         self._saved_temp = settings.get("temp_folder", "")
@@ -4905,59 +5300,649 @@ class App:
 
     def _button(self, parent, text, command=None, green=False, red=False, yellow=False, **kw):
         if green:
-            color, hover, txt = GREEN, GREEN2, "#061006"
+            color, hover, txt = ACCENT, ACCENT_HOVER, ON_ACCENT
         elif red:
-            color, hover, txt = RED, ("#b91c1c", "#5a1a1a"), WHITE
+            color, hover, txt = RED, DANGER_HOVER, WHITE
         elif yellow:
-            color, hover, txt = YELLOW, ("#a37c10", "#c9a00e"), "#061006"
+            color, hover, txt = YELLOW, YELLOW, ("#ffffff", "#1b1300")
         else:
-            # Normal button: CARD2 fill, slightly darker hover in both modes
-            color, hover, txt = CARD2, ("#b0b0b0", "#2a2a2a"), WHITE
+            # A normal button looks like the main window's: a quiet fill, a hairline only in light mode
+            color, hover, txt = BTN, BTN_HOVER, WHITE
         return ctk.CTkButton(parent, text=text, command=command, fg_color=color, hover_color=hover,
                               text_color=txt, border_width=0 if (green or red or yellow) else 1,
-                              border_color=BORDER2, **kw)
+                              border_color=BTN_BORDER, **kw)
 
     def _build(self):
-        self.root.configure(fg_color=BLACK)
+        """The main window: sidebar (views + tools) | the active view | status bar.
+
+        Built from plain Tk widgets drawn by ui_kit, so it lays out and redraws fast. The
+        attribute names the rest of the app talks to (queue_listbox, start_btn, cancel_btn,
+        log_box, history_box, stats_box, command_label, overall_bar, stage_bar and every
+        *_var) keep their meaning."""
+        kit = self.kit = Kit(self.root, self._theme)
+        self.root.configure(fg_color=ctk_pair("bg"))
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
-
-        main = ctk.CTkFrame(self.root, fg_color=BLACK, corner_radius=0)
-        main.grid(row=0, column=0, sticky="nsew")
-        main.grid_columnconfigure(0, weight=1)
-        # Row 2 holds a VERTICAL paned window with the content area (top) and the log/tabs
-        # area (bottom) — the user drags the horizontal divider to size the log.
-        main.grid_rowconfigure(2, weight=1)
-
-        # ── Header ──────────────────────────────────────────────────────────
-        header = ctk.CTkFrame(main, fg_color=BLACK)
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
-        header.grid_columnconfigure(1, weight=1)
-
-        title_box = ctk.CTkFrame(header, fg_color=BLACK)
-        title_box.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_box, text=APP_NAME,
-                      font=ctk.CTkFont(size=26, weight="bold"), text_color=WHITE).pack(anchor="w")
-        ctk.CTkLabel(title_box, text=f"v{APP_VERSION}  ·  Bizkut backend  ·  {MKPFS_NAME} v{MKPFS_VERSION}  ·  by Knutwurst",
-                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=2)
-
-        # Kept for live stage writes (the stage itself is shown in the progress panel and
-        # the bottom status bar, so it is no longer crammed into the header).
+        # Kept for live stage writes (not shown; the stage sits in the job card).
         self.header_status_var = tk.StringVar(value=f"v{APP_VERSION}  |  Backend: Ready")
+        self._init_state_vars()
+        self._init_display_vars()
 
-        # START / CANCEL — primary actions, top-right.
-        self.start_btn = self._button(header, "▶  START QUEUE", self.start, green=True, width=160, height=38)
-        self.start_btn.grid(row=0, column=2, padx=(8, 6), sticky="e")
-        self.cancel_btn = self._button(header, "✕  CANCEL", self.cancel, red=True, width=110, height=38)
-        self.cancel_btn.grid(row=0, column=3, padx=(0, 2), sticky="e")
+        shell = kit.frame(self.root, bg="bg")
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.grid_columnconfigure(2, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+        self._build_sidebar(shell)
+        kit.rule(shell, horizontal=False).grid(row=0, column=1, sticky="ns")
+        views = self._views_parent = kit.frame(shell)
+        views.grid(row=0, column=2, sticky="nsew")
+        # Dialogs open as panels over this content area (see PanelHost).
+        self._panels = PanelHost(self, views)
+        EmbeddedDialog.host = self._panels
+        views.grid_columnconfigure(0, weight=1)
+        views.grid_rowconfigure(0, weight=1)
+        self._views = {"queue": self._build_queue_view(views)}
+        self._views["history"] = self._build_history_view(views)
+        self._views["log"] = self._build_log_view(views)
+        kit.rule(shell).grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._build_status_bar(shell).grid(row=2, column=0, columnspan=3, sticky="ew")
+        self._show_view("queue")
+        self.update_stages_display("", 0)
+        self._bind_shortcuts()
+        self._filter_root_configure()
+        self.update_queue_box()
+
+        # ── Drag & drop registration ─────────────────────────────────────────
+        if _HAS_DND:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _init_display_vars(self):
+        """Every StringVar the worker and poll code write, plus the job card's own."""
+        S = tk.StringVar
+        self.overall_title_var = S(value="QUEUE")
+        self.overall_pct_var = S(value="0%")
+        self.cur_game_var = S(value="CURRENT STEP")
+        self.stage_title_var = S(value="Ready")
+        self.stage_detail_var = S(value="Add a job and start the queue.")
+        self.stage_pct_var = S(value="")
+        self.game_name_var = S(value="Name: No game selected")
+        self.title_var = S(value="Title ID: —")
+        self.source_detail_var = S(value="Source: —")
+        self.orig_var = S(value="Original Size: —")
+        self.files_var = S(value="Files: —")
+        self.tune_note_var = S(value="")
+        self.big_status_var = S(value="Ready")
+        self.big_detail_var = S(value="Waiting for a game.")
+        self.speed_var = S(value="Speed: —")
+        self.elapsed_var = S(value="Elapsed: 00:00")
+        self.eta_var = S(value="ETA: —")
+        self.saved_var = S(value="Saved: —")
+        self.ratio_var = S(value="Compression: —")
+        self.rating_var = S(value="Rating: —")
+        self.temp_space_var = S(value="")
+        self.ram_var = S(value="")
+        self.footer_var = S(value="● Ready")
+        self.queue_total_var = S(value="No jobs yet")
+        self.batch_counter_var = S(value="")
+        self.card_title_var = S(value="")
+        self.card_meta_var = S(value="")
+        self.card_target_var = S(value="")
+        self.status_temp_var = S(value="")
+        self.status_out_var = S(value="")
+        self.last_result_var = S(value="")
+        self.progress_title_var = S(value="Progress")
+        self._footer_plain_var = S(value="Ready")
+        self._cur_job_pct = 0
+        self._space_result = None
+        self._space_busy = False
+        self._space_tick = 0
+        # The metric tiles show the values without the "Speed: " style prefix.
+        self.m_speed_var, self.m_elapsed_var, self.m_eta_var = S(value="—"), S(value="—"), S(value="—")
+
+        def _unprefix(src, dst):
+            def f(*_):
+                v = src.get()
+                v = v.split(":", 1)[1].strip() if ":" in v else v.strip()
+                dst.set(v if v and v not in ("—", "-") else "—")
+            src.trace_add("write", f)
+            f()
+        _unprefix(self.speed_var, self.m_speed_var)
+        _unprefix(self.elapsed_var, self.m_elapsed_var)
+        _unprefix(self.eta_var, self.m_eta_var)
+
+        def _last(*_):
+            parts = [v.get() for v in (self.saved_var, self.ratio_var, self.rating_var)]
+            if all(p.rstrip().endswith("—") for p in parts):
+                self.last_result_var.set("Totals and the last jobs, newest first.")
+            else:
+                self.last_result_var.set("Last result:  " + "   ·   ".join(parts))
+        for v in (self.saved_var, self.ratio_var, self.rating_var):
+            v.trace_add("write", _last)
+        _last()
+
+        def _prog(*_):
+            g = self.cur_game_var.get()
+            name = g.split("·", 1)[1].strip() if "·" in g else ""
+            self.progress_title_var.set(f"Now running  ·  {name}" if name else "Progress")
+        self.cur_game_var.trace_add("write", _prog)
+
+        def _foot(*_):
+            self._footer_plain_var.set(self.footer_var.get().lstrip("●").strip() or "Ready")
+        self.footer_var.trace_add("write", _foot)
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
+    def _build_sidebar(self, shell):
+        kit = self.kit
+        self._nav_all = []
+        side = kit.frame(shell, bg="sidebar", width=188)
+        side.grid(row=0, column=0, sticky="nsw")
+        side.pack_propagate(False)
+        brand = kit.frame(side, bg="sidebar")
+        brand.pack(fill="x", padx=18, pady=(18, 14))
+        kit.label(brand, bg="sidebar", text=APP_NAME, font=kit.fonts.app).pack(anchor="w")
+        kit.label(brand, bg="sidebar", fg="faint", font=kit.fonts.caption, text=APP_VERSION).pack(anchor="w", pady=(1, 0))
+
+        def nav(parent, text, icon, cmd, tooltip=None):
+            b = IconButton(parent, kit, text=text, icon=icon, command=cmd, variant="nav", height=28,
+                           bg="sidebar", icon_size=15, padx=10, tooltip=tooltip)
+            b.pack(fill="x", padx=8, pady=1)
+            self._nav_all.append(b)
+            return b
+        self._nav = {
+            "queue": nav(side, "Queue", "queue", lambda: self._show_view("queue"), "⌘1"),
+            "history": nav(side, "History", "history", lambda: self._show_view("history"), "⌘2"),
+            "log": nav(side, "Log", "terminal", lambda: self._show_view("log"), "⌘3"),
+        }
+        kit.rule(side, bg_token="border").pack(fill="x", padx=16, pady=(12, 10))
+        kit.label(side, bg="sidebar", fg="faint", font=kit.fonts.caption, text="Tools").pack(anchor="w", padx=18, pady=(0, 3))
+        nav(side, "Look inside", "search", self.open_pfs_browser,
+            "Browse a .ffpfsc, .ffpfs or .pkg and pull single files out")
+        nav(side, "Organize", "folders", self.organize_folder_dialog,
+            "Sort a folder of containers into Title [ID] [version] folders")
+        nav(side, "Clean temp", "broom", self.clear_temp_files, "Delete leftovers in the temp folder")
+        bottom = kit.frame(side, bg="sidebar")
+        bottom.pack(side="bottom", fill="x", pady=(0, 10))
+        self._nav["settings"] = nav(bottom, "Settings", "settings", self.open_settings, "⌘,")
+
+    def _show_view(self, name):
+        if name == "settings" and "settings" not in self._views:
+            self._settings_view = SettingsView(self._views_parent, self)
+            self._views["settings"] = self._settings_view.frame
+        for n, f in self._views.items():
+            if n == name:
+                f.grid(row=0, column=0, sticky="nsew")
+            else:
+                f.grid_remove()
+        for n, b in self._nav.items():
+            b.configure(selected=(n == name))
+        self._view = name
+        if name == "log":
+            try:
+                self.log_box.see("end")
+            except Exception:
+                pass
+
+    def _filter_root_configure(self):
+        """The toplevel's <Configure> bindings (CustomTkinter's and _on_window_configure)
+        sit on the toplevel's bind tag, so Tk runs them for EVERY child widget's
+        Configure: ~180 Python round trips per resize step, ~20 ms. Both only care about
+        the window itself, so skip the rest in Tcl before Python is entered."""
+        try:
+            w = self.root._w
+            script = self.root.bind("<Configure>")
+            guard = 'if {"%W" ne "' + w + '"} continue'
+            if script and not script.startswith(guard):
+                self.root.tk.call("bind", w, "<Configure>", guard + "\n" + script)
+        except Exception:
+            pass
+
+    def _set_nav_enabled(self, enabled: bool):
+        """The sidebar is off while a panel is open: finish or close the panel first."""
+        for b in getattr(self, "_nav_all", []):
+            try:
+                b.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+    def _bind_shortcuts(self):
+        keys = {"<Command-n>": self.open_job_dialog, "<Command-comma>": self.open_settings,
+                "<Command-Key-1>": lambda: self._show_view("queue"),
+                "<Command-Key-2>": lambda: self._show_view("history"),
+                "<Command-Key-3>": lambda: self._show_view("log")}
+        for seq, fn in keys.items():
+            try:
+                self.root.bind(seq, lambda e, f=fn: (None if self._panels.stack else f(), "break")[1])
+            except tk.TclError:
+                pass
+
+    # ── Shared pieces ────────────────────────────────────────────────────────
+    def _column_header(self, parent, title, subtitle=None, subtitle_var=None, bg="surface"):
+        """A column's title (+ a line under it) on the left, a button row on the right."""
+        kit = self.kit
+        head = kit.frame(parent, bg=bg)
+        head.grid_columnconfigure(0, weight=1)
+        tb = kit.frame(head, bg=bg)
+        tb.grid(row=0, column=0, sticky="w")
+        kit.label(tb, bg=bg, text=title, font=kit.fonts.view).pack(anchor="w")
+        if subtitle or subtitle_var:
+            kw = {"textvariable": subtitle_var} if subtitle_var else {"text": subtitle}
+            kit.label(tb, bg=bg, fg="muted", font=kit.fonts.small, **kw).pack(anchor="w", pady=(2, 0))
+        btns = kit.frame(head, bg=bg)
+        btns.grid(row=0, column=1, sticky="e")
+        return head, btns
+
+    def _small(self, parent, text, icon, cmd, variant="ghost", tooltip=None, bg="surface"):
+        return IconButton(parent, self.kit, text=text, icon=icon, command=cmd, variant=variant, height=26,
+                          padx=9, icon_size=13, font=self.kit.fonts.small, bg=bg, tooltip=tooltip)
+
+    def _text_view(self, parent, fg="text", mirror=None):
+        """A text area with a scrollbar filling *parent* (row 1 of its grid)."""
+        kit = self.kit
+        box = kit.frame(parent)
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_rowconfigure(0, weight=1)
+        if mirror is not None:
+            t = LogText(box, kit, mirror=mirror, mirror_lines=4, height=10)
+        else:
+            t = kit.text(box, fg=fg, height=8, state="disabled")
+        t.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        sb = tk.Scrollbar(box, orient="vertical", command=t.yview)
+        sb.grid(row=0, column=1, sticky="ns", pady=(0, 8))
+        t.configure(yscrollcommand=sb.set)
+        return box, t
+
+    # ── Queue view ───────────────────────────────────────────────────────────
+    def _build_queue_view(self, parent):
+        """Two flush columns, list | job card, split by a draggable hairline."""
+        kit = self.kit
+        pw = tk.PanedWindow(parent, orient="horizontal", sashwidth=6, sashrelief="flat", bd=0,
+                            opaqueresize=True, showhandle=False, sashpad=0)
+        kit.style(pw, bg="surface")
+        self._paned_q = pw
+        pw.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
+
+        left = kit.frame(pw)
+        pw.add(left, minsize=280, stretch="always")
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=1)
+        head, btns = self._column_header(left, "Queue", subtitle_var=self.queue_total_var)
+        head.grid(row=0, column=0, sticky="ew", padx=(18, 14), pady=(18, 12))
+        self._add_btn = self._small(btns, "Add job", "plus", self.open_job_dialog, variant="secondary",
+                                    tooltip="Pick a source, what to change in it and what comes out (⌘N)")
+        self._add_btn.pack(side="left", padx=(0, 6))
+        self.start_btn = self._small(btns, "Start", "play", self.start, variant="primary",
+                                     tooltip="Run the jobs from the top")
+        self.start_btn.pack(side="left")
+        self.queue_listbox = QueueList(
+            left, kit, on_select=lambda i: self._on_queue_select(), on_activate=self._on_queue_double_click,
+            on_context=self._queue_context_menu, on_key_up=self._lb_key_up, on_key_down=self._lb_key_down,
+            on_delete=self.queue_remove_selected, empty_title="Your queue is empty",
+            empty_body="Drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg into this window, "
+                       "or use Add job.")
+        self.queue_listbox.grid(row=1, column=0, sticky="nsew")
+        kit.rule(left).grid(row=2, column=0, sticky="ew")
+        tune = kit.frame(left)
+        tune.grid(row=3, column=0, sticky="ew", padx=(14, 8), pady=5)
+        tune.grid_columnconfigure(1, weight=1)
+        IconView(tune, kit, "settings", size=14, color="faint").grid(row=0, column=0, padx=(0, 7))
+        self._tune_text_var = tk.StringVar()
+        kit.label(tune, fg="faint", font=kit.fonts.caption, textvariable=self._tune_text_var).grid(row=0, column=1, sticky="w")
+        self._small(tune, "Change", None, self._open_tuning,
+                    tooltip="Compression level, CPU cores and block size").grid(row=0, column=2, sticky="e")
+        self._tune_note_lbl = kit.label(tune, fg="warning", font=kit.fonts.caption, textvariable=self.tune_note_var)
+        self._tune_note_lbl.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 3))
+        self._tune_note_lbl.grid_remove()
+        self._bind_dynamic_wrap(tune, [self._tune_note_lbl], padding=16, min_width=200)
+
+        def _tune_text(*_):
+            try:
+                cores = int(self.cpu_count_var.get())
+            except Exception:
+                cores = 0
+            blk = str(self.block_size_var.get() or "auto")
+            blk_txt = "64 KiB blocks" if blk in ("auto", "65536") else f"{blk} B blocks"
+            self._tune_text_var.set(f"Level {self.compression_level_var.get()}  ·  "
+                                    f"{'auto cores' if cores == 0 else f'{cores} cores'}  ·  {blk_txt}")
+        for var in (self.compression_level_var, self.cpu_count_var, self.block_size_var):
+            var.trace_add("write", _tune_text)
+        _tune_text()
+
+        # The job card keeps its width when the window is resized (only the list grows),
+        # like an inspector. Re-laying out the whole card on every step of a window drag
+        # cost ~60 ms per step; the divider still sets its width, and that is remembered.
+        right = self._card_pane = kit.frame(pw, bg="inspector")
+        pw.add(right, minsize=340, stretch="never")
+        right.grid_columnconfigure(1, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+        kit.rule(right, bg_token="border_strong", horizontal=False).grid(row=0, column=0, sticky="ns")
+        self._build_job_card(right)
+        return pw
+
+    def _queue_context_menu(self, event, idx):
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Edit job…", command=lambda: self._on_queue_double_click(None))
+        m.add_separator()
+        m.add_command(label="Move up", command=self.queue_move_up)
+        m.add_command(label="Move down", command=self.queue_move_down)
+        m.add_separator()
+        m.add_command(label="Remove", command=self.queue_remove_selected)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _build_job_card(self, card):
+        """The inspector next to the list: the selected job, and the running job's progress."""
+        kit, B = self.kit, "inspector"
+        body = kit.frame(card, bg=B)
+        body.grid(row=0, column=1, sticky="nsew", padx=20, pady=18)
+        body.grid_columnconfigure(0, weight=1)
+        self._card_body = body
+        self._card_empty = kit.label(card, bg=B, fg="faint", font=kit.fonts.body, anchor="center",
+                                     justify="center", text="Select a job to see its details.")
+
+        hdr = kit.frame(body, bg=B)
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.grid_columnconfigure(1, weight=1)
+        self.art_label = ArtView(hdr, kit, size=56, bg=B)
+        self.art_label.grid(row=0, column=0, rowspan=3, sticky="nw", padx=(0, 14))
+        t = kit.label(hdr, bg=B, font=kit.fonts.title, textvariable=self.card_title_var)
+        t.grid(row=0, column=1, sticky="ew")
+        m = kit.label(hdr, bg=B, fg="muted", font=kit.fonts.small, textvariable=self.card_meta_var)
+        m.grid(row=1, column=1, sticky="ew", pady=(3, 0))
+        tg = kit.label(hdr, bg=B, fg="faint", font=kit.fonts.small, textvariable=self.card_target_var)
+        tg.grid(row=2, column=1, sticky="ew", pady=(2, 0))
+        self._bind_dynamic_wrap(hdr, [t, m, tg], padding=84, min_width=160)
+
+        self._card_chips = Chips(body, kit, bg=B)
+        self._card_chips.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        # Only shown when the selected job does not fit on its drives.
+        self._space_warn = kit.label(body, bg=B, fg="warning", font=kit.fonts.small, textvariable=self.temp_space_var)
+        self._space_warn.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._space_warn.grid_remove()
+        self.temp_space_var.trace_add("write", lambda *_: (
+            self._space_warn.grid() if "LOW" in self.temp_space_var.get() else self._space_warn.grid_remove()))
+
+        # Progress of the running job; hidden while nothing runs.
+        prog = self._progress_box = kit.frame(body, bg=B)
+        prog.grid(row=3, column=0, sticky="ew", pady=(20, 0))
+        prog.grid_columnconfigure(0, weight=1)
+        kit.label(prog, bg=B, fg="faint", font=kit.fonts.caption, textvariable=self.progress_title_var).grid(
+            row=0, column=0, columnspan=2, sticky="ew")
+        self._steps = StepStrip(prog, kit, bg=B)
+        self._steps.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        kit.label(prog, bg=B, font=kit.fonts.heading, textvariable=self.stage_title_var).grid(
+            row=2, column=0, sticky="w", pady=(12, 0))
+        kit.label(prog, bg=B, fg="accent_text", font=kit.fonts.heading, textvariable=self.stage_pct_var).grid(
+            row=2, column=1, sticky="e", pady=(12, 0))
+        self.stage_bar = ProgressBar(prog, kit, height=4, bg=B)
+        self.stage_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        dt = kit.label(prog, bg=B, fg="muted", font=kit.fonts.small, textvariable=self.stage_detail_var)
+        dt.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._bind_dynamic_wrap(prog, [dt], padding=8, min_width=200)
+        tiles = kit.frame(prog, bg=B)
+        tiles.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        for i, (cap, var) in enumerate((("Speed", self.m_speed_var), ("Elapsed", self.m_elapsed_var),
+                                        ("Left", self.m_eta_var))):
+            tiles.grid_columnconfigure(i, weight=1, uniform="tile")
+            Tile(tiles, kit, cap, var, bg=B).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+        prog.grid_remove()
+
+        # A short preview of the log (the Log view has all of it): four lines, small mono.
+        tail_box = RoundBox(body, kit, bg=B, pad=10,
+                            height=4 * kit.fonts.mono_small.metrics("linespace") + 2 * 10 + 2)
+        tail_box.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        self._log_tail = kit.text(tail_box.inner, bg="surface2", fg="log", font=kit.fonts.mono_small, height=4,
+                                  state="disabled", padx=0, pady=0, wrap="none")
+        tail_box.set_child(self._log_tail)
+
+        acts = kit.frame(body, bg=B)
+        acts.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        acts.grid_columnconfigure(4, weight=1)
+        for col, (text, icon, cmd, tip) in enumerate((
+                ("Full log", "terminal", lambda: self._show_view("log"), "The whole log  ⌘3"),
+                ("Command", "code", self._toggle_command, "Show the backend command for this job"),
+                ("Edit", "edit", lambda: self._on_queue_double_click(None), "Change this job (or double-click it)"),
+                ("Remove", "trash", self.queue_remove_selected, None))):
+            self._small(acts, text, icon, cmd, tooltip=tip, bg=B).grid(row=0, column=col, padx=(0, 2))
+        self.cancel_btn = self._small(acts, "Cancel", "x", self.cancel, variant="danger",
+                                      tooltip="Stop the running job", bg=B)
+        self.cancel_btn.grid(row=0, column=5, sticky="e")
+        self.cancel_btn.autohide = True
         self.cancel_btn.configure(state="disabled")
 
-        # One calm toolbar row holds the format control + tools (populated once the
-        # output_compressed_var exists — see the Variables section below).
-        self._toolbar = ctk.CTkFrame(header, fg_color=BLACK)
-        self._toolbar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self._cmd_frame = RoundBox(body, kit, bg=B, height=90, pad=10)
+        self.command_label = kit.label(self._cmd_frame.inner, bg="surface2", fg="muted", font=kit.fonts.mono_small, text="")
+        self._cmd_frame.set_child(self.command_label)
+        self._bind_dynamic_wrap(self._cmd_frame, [self.command_label], padding=26, min_width=200)
 
-        # ── Variables ────────────────────────────────────────────────────────
+    def _sync_run_ui(self):
+        """Show the progress block only while a job runs (checked on every poll tick)."""
+        running = bool(getattr(self, "_batch_running", False))
+        if running == getattr(self, "_run_ui_shown", None):
+            return
+        self._run_ui_shown = running
+        try:
+            if running:
+                self._progress_box.grid()
+            else:
+                self._progress_box.grid_remove()
+        except Exception:
+            pass
+
+    def _sync_primary_action(self):
+        """One primary button: Add job while the queue is empty, Start once it has jobs.
+        While a batch runs, the run code owns the Start button's state."""
+        try:
+            empty = not self.queue
+            self._add_btn.configure(variant="primary" if empty else "secondary")
+            self.start_btn.configure(variant="secondary" if empty else "primary")
+            if not self._batch_running:
+                self.start_btn.configure(state="disabled" if empty else "normal")
+        except Exception:
+            pass
+
+    def _card_show(self, visible: bool):
+        if visible:
+            self._card_empty.grid_remove()
+            self._card_body.grid()
+        else:
+            self._card_body.grid_remove()
+            self._card_empty.configure(text="Select a job to see its details." if self.queue else "")
+            self._card_empty.grid(row=0, column=1, sticky="nsew")
+
+    def _toggle_command(self):
+        if self._cmd_frame.winfo_ismapped():
+            self._cmd_frame.grid_remove()
+        else:
+            self.update_command_preview()
+            self._cmd_frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+
+    def _job_recipe(self, item) -> list[str]:
+        """The job as chips: source kind → changes → output."""
+        op = getattr(item, "operation", "pack")
+        kind = chain_source_kind(item)
+        src = {"folder": "Folder", "archive": "Archive"}.get(kind, f".{kind}" if kind and kind != "file" else "File")
+        if op == "chain":
+            ch = []
+            for c in chain_changes(item):
+                ch.append("Patch" if c == "patch" else "Sign" if c == "sign"
+                          else ("Backport " + c.split(" ", 1)[1]) if c.startswith("backport") else c)
+            to = getattr(item, "chain_to", None) or "ffpfsc"
+            return [src, *ch, "Folder" if to == "folder" else CHAIN_TARGET_LABEL.get(to, to)]
+        if op == "pack":
+            parts = [src]
+            if getattr(item, "patch_source", None):
+                parts.append("Patch")
+            parts.append(".ffpfs" if getattr(item, "output_compressed", True) is False else ".ffpfsc")
+            return parts
+        return {"fpkg-build": [src, ".pkg"], "unpack": [src, "Folder"], "fpkg-extract": [".pkg", "Folder"],
+                "patch": [src, "Integrate patch"], "fake-sign": [src, "Sign in place"],
+                "copy": [src, "Move" if getattr(item, "copy_delete_source", True) else "Copy"]}.get(op, [src])
+
+    # ── History view ─────────────────────────────────────────────────────────
+    def _build_history_view(self, parent):
+        kit = self.kit
+        v = kit.frame(parent)
+        v.grid_columnconfigure(0, weight=3)
+        v.grid_columnconfigure(2, weight=2)
+        v.grid_rowconfigure(2, weight=1)
+        head, btns = self._column_header(v, "History", subtitle_var=self.last_result_var)
+        head.grid(row=0, column=0, columnspan=3, sticky="ew", padx=(18, 14), pady=(18, 12))
+        for text, icon, cmd in (("Refresh", "history", lambda: (self.refresh_history(), self.refresh_statistics())),
+                                ("Copy last result", "copy", self.copy_last_result),
+                                ("Open output folder", "folders", self.open_output_folder)):
+            self._small(btns, text, icon, cmd).pack(side="left", padx=(0, 2))
+        kit.rule(v).grid(row=1, column=0, columnspan=3, sticky="ew")
+        for col, caption, attr in ((0, "Recent jobs", "history_box"), (2, "Totals", "stats_box")):
+            box = kit.frame(v)
+            box.grid(row=2, column=col, sticky="nsew")
+            box.grid_columnconfigure(0, weight=1)
+            box.grid_rowconfigure(1, weight=1)
+            kit.label(box, fg="faint", font=kit.fonts.caption, text=caption).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 4))
+            tb, text = self._text_view(box)
+            tb.grid(row=1, column=0, sticky="nsew")
+            setattr(self, attr, text)
+        kit.rule(v, horizontal=False).grid(row=2, column=1, sticky="ns")
+        self.refresh_history()
+        self.refresh_statistics()
+        return v
+
+    # ── Log view ─────────────────────────────────────────────────────────────
+    def _build_log_view(self, parent):
+        kit = self.kit
+        v = kit.frame(parent)
+        v.grid_columnconfigure(0, weight=1)
+        v.grid_rowconfigure(2, weight=1)
+        head, btns = self._column_header(v, "Log", subtitle="Everything the backend printed, newest at the bottom.")
+        head.grid(row=0, column=0, sticky="ew", padx=(18, 14), pady=(18, 12))
+        for text, icon, cmd, tip in (("Clear", "trash", self.clear_logs, None),
+                                     ("Raw log", "export", self.open_raw_log, "Open the unfiltered backend output"),
+                                     ("Diagnostics", "export", self.export_diagnostics, "Save a report for a bug report"),
+                                     ("Copy last result", "copy", self.copy_last_result, None)):
+            self._small(btns, text, icon, cmd, tooltip=tip).pack(side="left", padx=(0, 2))
+        kit.rule(v).grid(row=1, column=0, sticky="ew")
+        box, self.log_box = self._text_view(v, mirror=self._log_tail)
+        box.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        return v
+
+    # ── Status bar ───────────────────────────────────────────────────────────
+    def _build_status_bar(self, shell):
+        kit = self.kit
+        bar = kit.frame(shell, bg="sidebar")
+        inner = kit.frame(bar, bg="sidebar")
+        inner.pack(fill="x", padx=14, pady=5)
+        f = kit.fonts.caption
+        self._status_dot = IconView(inner, kit, "dot", size=11, color="success", bg="sidebar")
+        self._status_dot.pack(side="left", padx=(0, 6))
+        kit.label(inner, bg="sidebar", fg="muted", font=f, textvariable=self._footer_plain_var).pack(side="left")
+        kit.label(inner, bg="sidebar", fg="faint", font=f, textvariable=self.batch_counter_var).pack(side="left", padx=(12, 0))
+        # The queue's overall progress is not shown (the job row carries the job's own
+        # percentage); the bar object stays because the poll loop feeds it.
+        self._overall_box = kit.frame(inner, bg="sidebar")
+        self.overall_bar = ProgressBar(self._overall_box, kit, height=4, bg="sidebar")
+        self._ram_label = kit.label(inner, bg="sidebar", fg="faint", font=f, textvariable=self.ram_var)
+        self._ram_label.pack(side="right")
+        kit.label(inner, bg="sidebar", fg="faint", font=f, textvariable=self.status_temp_var).pack(side="right", padx=(0, 14))
+        kit.label(inner, bg="sidebar", fg="faint", font=f, textvariable=self.status_out_var).pack(side="right", padx=(0, 14))
+
+        def _run_state(*_):
+            running = bool(getattr(self, "_batch_running", False))
+            txt = self._footer_plain_var.get().lower()
+            color = ("danger" if any(w in txt for w in ("fail", "error", "cancel")) else
+                     "success" if (not running and any(w in txt for w in ("ready", "done", "complete"))) else "accent")
+            self._status_dot.set(color=color)
+        self.batch_counter_var.trace_add("write", _run_state)
+        self._footer_plain_var.trace_add("write", _run_state)
+        return bar
+
+    def _tick_space_status(self):
+        """Free space on the temp and output drives for the status bar. The disk_usage
+        calls run on a worker thread (a sleeping HDD can take seconds to answer); only the
+        main thread touches Tk, so the paths are read here and the result is picked up on a
+        later poll tick."""
+        res = self._space_result
+        if res is not None:
+            self._space_result = None
+            self.status_temp_var.set(res[0])
+            self.status_out_var.set(res[1])
+        self._space_tick += 1
+        if self._space_tick % 50 != 1 or self._space_busy:
+            return
+        paths = ((self.temp_var.get() or "").strip(), (self.output_var.get() or "").strip())
+
+        def _label(kind, p):
+            if not p:
+                return ""
+            try:
+                free = get_free_space(Path(p))
+            except Exception:
+                return f"{kind}: not reachable"
+            parts = Path(p).parts
+            drive = parts[2] if len(parts) > 2 and parts[1] == "Volumes" else "Mac"
+            return f"{kind}: {drive}  ·  {format_size(free)} free"
+
+        def _work():
+            try:
+                self._space_result = (_label("Temp", paths[0]), _label("Output", paths[1]))
+            finally:
+                self._space_busy = False
+        self._space_busy = True
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _open_tuning(self):
+        """The compression controls, in a small window next to the queue."""
+        w = getattr(self, "_tuning_win", None)
+        if w is not None and w.winfo_exists():
+            w.lift()
+            w.focus_force()
+            return
+        w = self._tuning_win = EmbeddedDialog()
+        w.geometry("520x380")
+        w.title("Compression")
+        w.resizable(False, False)
+        w.configure(fg_color=ctk_pair("surface"))
+        try:
+            w.transient(self.root)
+        except Exception:
+            pass
+        acc, acc2 = ctk_pair("accent_fill"), ctk_pair("accent_hover")
+        txt, mut = ctk_pair("text"), ctk_pair("muted")
+        body = ctk.CTkFrame(w, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+        body.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(body, text="Compression", text_color=txt, font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ctk.CTkLabel(body, text="Used by .ffpfsc and .ffpfs builds. A .pkg job carries its own settings.",
+                     text_color=mut, font=ctk.CTkFont(size=12)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 14))
+
+        def slider_row(r, label, var, lo, hi, fmt):
+            ctk.CTkLabel(body, text=label, text_color=txt, font=ctk.CTkFont(size=13)).grid(row=r, column=0, sticky="w", pady=6)
+            ctk.CTkSlider(body, from_=lo, to=hi, number_of_steps=hi - lo, variable=var, width=220,
+                          fg_color=ctk_pair("track"), progress_color=acc, button_color=acc,
+                          button_hover_color=acc2).grid(row=r, column=1, sticky="ew", padx=12)
+            val = ctk.CTkLabel(body, text=fmt(var.get()), text_color=txt, width=44, anchor="e",
+                               font=ctk.CTkFont(size=13, weight="bold"))
+            val.grid(row=r, column=2, sticky="e")
+            var.trace_add("write", lambda *_: val.winfo_exists() and val.configure(text=fmt(var.get())))
+        slider_row(2, "Level", self.compression_level_var, 0, 9, str)
+        slider_row(3, "CPU cores", self.cpu_count_var, 0, 16, lambda v: "auto" if int(v) == 0 else str(int(v)))
+        ctk.CTkLabel(body, text="Block size", text_color=txt, font=ctk.CTkFont(size=13)).grid(row=4, column=0, sticky="w", pady=6)
+        ctk.CTkOptionMenu(body, values=["auto", "65536"], variable=self.block_size_var, width=120,
+                          command=lambda v: save_settings({"block_size": v})).grid(row=4, column=1, sticky="w", padx=12)
+        ctk.CTkLabel(body, text="The PS5 needs 64 KiB blocks, and auto picks them. With cores on auto the "
+                                "app decides by game size and uses fewer when the output drive is a slow HDD.",
+                     text_color=mut, font=ctk.CTkFont(size=12), wraplength=380, justify="left").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(12, 14))
+        ctk.CTkButton(body, text="Done", command=w.destroy, fg_color=acc, hover_color=acc2, text_color="#ffffff",
+                      width=90).grid(row=6, column=2, sticky="e")
+        w.update_idletasks()
+        w.geometry(f"520x{w.winfo_reqheight()}")
+
+    def _init_state_vars(self):
+        """The Tk variables behind the settings and the job defaults (paths, formats,
+        tuning, drive behaviour), each persisted on change."""
         # Remember the last input path across restarts (a browsed folder stays in the
         # field). Only restore it if it still exists, so a moved/deleted path doesn't
         # linger. Picking anything new overwrites it via the trace below.
@@ -5051,17 +6036,6 @@ class App:
             "v1112":            True,
         }
         self._pending_fpkg_identity = None   # (source path, identity dict) handed from the dialog to the scan result
-        # (legacy comment kept for context:) output_compressed_var persists the last choice
-        # as the default the submenu pre-fills.
-        ctk.CTkLabel(self._toolbar, text="Every job: a source, what to change in it, what comes out — folder, .ffpfs, .ffpfsc or .pkg",
-                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(2, 0))
-        # Tools, grouped on the right. (Job entry points — Pack/Convert/Patch/Sign —
-        # live in the 'Add job' bar below.)
-        self._button(self._toolbar, "⚙  Settings", self.open_settings, width=110).pack(side="right")
-        self._button(self._toolbar, "☀ / 🌙  Theme", self._toggle_theme, width=110).pack(side="right", padx=(0, 8))
-        # Utilities, not jobs: look inside an image/package, tidy a library.
-        self._button(self._toolbar, "🗂  Organize", self.organize_folder_dialog, width=110).pack(side="right", padx=(0, 8))
-        self._button(self._toolbar, "🔎  Browse", self.open_pfs_browser, width=110).pack(side="right", padx=(0, 8))
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
         # Auto-patch: when a release folder holds a base game plus a clearly-smaller
@@ -5073,7 +6047,7 @@ class App:
         self.drive_mode_var.trace_add("write", lambda *_: save_settings({"drive_mode": self.drive_mode_var.get()}))
         # Show the drive-space pre-flight dialog before each pack (default on). The
         # tunable safety factor and the low-space policy live in settings.json and are
-        # edited in the Settings window (see SettingsWindow).
+        # edited in Settings (see SettingsView).
         self.show_space_dialog_var = self._persisted_bool(settings, "show_space_dialog", True)
         # Opt-in: build an exFAT intermediate and compress that (PSBrew's most-stable
         # exfat->ffpfsc path) instead of the folder PFS builder. macOS only. Default off.
@@ -5108,467 +6082,23 @@ class App:
         self.cpu_count_var.trace_add("write", lambda *_: save_settings({"cpu_count": self.cpu_count_var.get()}))
         self.block_size_var.trace_add("write", lambda *_: save_settings({"block_size": self.block_size_var.get()}))
 
-        # ── Job builder ───────────────────────────────────────────────────────
-        # Every operation is a JOB. Pick a type → its submenu collects the inputs +
-        # output and ADDS the job to the queue. Nothing runs until ▶ START. Output and
-        # Temp below are the shared defaults each submenu pre-fills.
-        top = self.panel(main, row=1, column=0, sticky="ew", padx=18, pady=8)
-
-        jobbar = ctk.CTkFrame(top, fg_color="transparent")
-        jobbar.pack(fill="x", padx=14, pady=(12, 6))
-        ctk.CTkLabel(jobbar, text="Add job:", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 12))
-        # One door. Every job is a source, what to change in it and what comes out; the
-        # dialog derives the rest (see JobDialog). Look inside and Organize are not jobs —
-        # they sit top-right with Settings. The legacy dialogs remain reachable by
-        # double-clicking a job that was queued through them.
-        self._button(jobbar, "➕  Add job", self.open_job_dialog, green=True, width=140).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(jobbar, text="…or drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg anywhere in this window",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 0))
-
-        # Output + format are per job (each submenu); the shared Temp folder lives in
-        # Settings → Default Temp Folder. So the job bar needs no Output/Temp fields here.
-
-        # ── Vertical split: content area (top) ↕ log/tabs area (bottom). A horizontal
-        #    divider the user drags up/down to grow or shrink the log; its position
-        #    persists as sash_v (see _save_sashes/_restore_sashes).
-        vpaned = tk.PanedWindow(main, orient="vertical", bg="#2a2a2a", sashwidth=8,
-                                sashrelief="flat", bd=0, opaqueresize=True)
-        vpaned.grid(row=2, column=0, sticky="nsew", padx=18, pady=(6, 14))
-        self._paned_v = vpaned
-        vpaned.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
-
-        # ── Content area: 3 user-resizable sections (queue | progress | details).
-        #    A horizontal paned window lets the user drag the two dividers; the sash
-        #    positions are persisted across launches (see _save_sashes/_restore_sashes).
-        content = tk.PanedWindow(vpaned, orient="horizontal", bg="#2a2a2a", sashwidth=8,
-                                 sashrelief="flat", bd=0, opaqueresize=True)
-        vpaned.add(content, minsize=200, stretch="always")
-        self._paned_h = content
-        content.bind("<ButtonRelease-1>", lambda e: self._save_sashes(), add="+")
-
-        # ── Left: Queue + Options ────────────────────────────────────────────
-        left = ctk.CTkFrame(content, fg_color=PANEL, border_width=1, border_color=BORDER, corner_radius=10)
-        content.add(left, minsize=300, stretch="always")
-        left.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(left, text="QUEUE", font=ctk.CTkFont(size=16, weight="bold"),
-                      text_color=WHITE).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 4))
-
-        # Queue listbox — tk.Listbox for native single-row selection
-        lb_frame = ctk.CTkFrame(left, fg_color=CARD, corner_radius=6,
-                                 border_width=1, border_color=BORDER)
-        lb_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 0))
-        lb_frame.grid_columnconfigure(0, weight=1)
-
-        _lb_bg   = "#111111"
-        _lb_fg   = "#e8e8e8"
-        _lb_sel  = "#1a5c2e"
-        _lb_muted = "#888888"
-        self.queue_listbox = tk.Listbox(
-            lb_frame,
-            bg=_lb_bg, fg=_lb_fg,
-            selectbackground=_lb_sel, selectforeground="#ffffff",
-            font=("Consolas", 11),
-            borderwidth=0, highlightthickness=0,
-            activestyle="none", relief="flat",
-            height=7,
-            exportselection=False,
-        )
-        lb_scrollbar = tk.Scrollbar(lb_frame, orient="vertical",
-                                     command=self.queue_listbox.yview)
-        self.queue_listbox.configure(yscrollcommand=lb_scrollbar.set)
-        self.queue_listbox.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
-        lb_scrollbar.grid(row=0, column=1, sticky="ns", pady=4, padx=(0, 2))
-        # Clicking a row refreshes game details; arrow keys reorder; double-click edits.
-        self.queue_listbox.bind("<<ListboxSelect>>", self._on_queue_select)
-        self.queue_listbox.bind("<Double-Button-1>", self._on_queue_double_click)
-        self.queue_listbox.bind("<Up>",   self._lb_key_up)
-        self.queue_listbox.bind("<Down>", self._lb_key_down)
-
-        # Everything below the queue list goes into a SCROLLABLE body so it never gets
-        # clipped when the pane is short (the OPTIONS block used to fall off the bottom).
-        # The queue Listbox stays OUTSIDE this scroll area (row 1) on purpose: ctk only
-        # grabs the mouse-wheel inside its OWN canvas subtree, so a listbox that is not a
-        # descendant keeps its own wheel/scrollbar and the outer scroll can't fight it.
-        left.grid_rowconfigure(2, weight=1)
-        # Plain frame (no scrollbar): the left pane below the queue list now holds only the
-        # queue buttons + a couple of hint lines, so it always fits — the old scrollable
-        # body + its scrollbar just added visual noise.
-        body = ctk.CTkFrame(left, fg_color=PANEL, corner_radius=0)
-        body.grid(row=2, column=0, sticky="nsew", padx=0, pady=(2, 0))
-        body.grid_columnconfigure(0, weight=1)
-
-        # Queue action buttons — row 0: scan/add, row 1: reorder/remove/clear
-        qbtns = ctk.CTkFrame(body, fg_color=PANEL)
-        qbtns.grid(row=0, column=0, sticky="ew", padx=14, pady=(4, 10))
-        qbtns.grid_columnconfigure((0, 1, 2, 3), weight=1)
-
-        # (No SCAN / ADD here any more: "Add job" in the job bar — or a drop — is the one
-        # door; add_source_to_queue stays as the classifier behind it and multi-drops.)
-
-        self._button(qbtns, "↑",         self.queue_move_up,         width=40).grid(
-            row=1, column=0, sticky="ew", padx=(4, 2), pady=(2, 4))
-        self._button(qbtns, "↓",         self.queue_move_down,       width=40).grid(
-            row=1, column=1, sticky="ew", padx=2, pady=(2, 4))
-        self._button(qbtns, "✕ REMOVE",  self.queue_remove_selected).grid(
-            row=1, column=2, sticky="ew", padx=2, pady=(2, 4))
-        self._button(qbtns, "🗑 CLEAR",  self.clear_queue, red=True).grid(
-            row=1, column=3, sticky="ew", padx=(2, 4), pady=(2, 4))
-
-        # ── Total / batch counter / drag-drop hint ───────────────────────────
-        self.queue_total_var = tk.StringVar(value="Total: 0 game(s)")
-        ctk.CTkLabel(body, textvariable=self.queue_total_var,
-                      text_color=MUTED).grid(row=1, column=0, sticky="w", padx=14, pady=(8, 0))
-
-        self.batch_counter_var = tk.StringVar(value="")
-        self.batch_counter_label = ctk.CTkLabel(
-            body, textvariable=self.batch_counter_var,
-            text_color=YELLOW, font=ctk.CTkFont(size=12, weight="bold")
-        )
-        self.batch_counter_label.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 0))
-
-        if _HAS_DND:
-            ctk.CTkLabel(body, text="↓ Drag & drop supported", text_color=MUTED,
-                          font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="w", padx=14, pady=(2, 0))
-
-        # ── Mode ──────────────────────────────────────────────────────────────
-        # Everything persistent (passwords, sounds, verify, keep-PFS, auto-clear,
-        # auto-patch, drive usage, verbose, output/temp/compression…) lives in the
-        # ⚙ Settings window — including the auto-tried archive password list, so the old
-        # per-job password field here was redundant and just took up space (password_var
-        # stays as a fallback override, still editable in Settings). Unpacking/decompressing
-        # is via the 🔄 Converter (top); the old "Unpack PFS images" checkbox is gone.
-        ctk.CTkLabel(body, text="Double-click a job to change it.  Look inside an image or package with  🔎 Browse (top-right).\n"
-                                "Archive passwords & all other options live in  ⚙ Settings (top-right).",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), justify="left").grid(
-                          row=4, column=0, sticky="w", padx=14, pady=(4, 2))
-
-        # ── Center: Progress + Stages ────────────────────────────────────────
-        center = ctk.CTkFrame(content, fg_color=BLACK)
-        content.add(center, minsize=360, stretch="always")
-        center.grid_columnconfigure(0, weight=1)
-        center.grid_rowconfigure(0, weight=0)
-        center.grid_rowconfigure(1, weight=0)
-
-        progress = self.panel(center, row=0, column=0, sticky="ew", pady=(0, 8))
-        progress.grid_columnconfigure(0, weight=1)
-        self.overall_title_var = tk.StringVar(value="QUEUE")
-        ctk.CTkLabel(progress, textvariable=self.overall_title_var, text_color=WHITE,
-                      font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
-        self.overall_pct_var = tk.StringVar(value="0%")
-        ctk.CTkLabel(progress, textvariable=self.overall_pct_var, text_color=("#1a7a40", "#4ade80"),
-                      font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=1, sticky="e", padx=14)
-        self.overall_bar = ctk.CTkProgressBar(progress, progress_color=GREEN, fg_color=("#cccccc", "#242424"), height=14)
-        self.overall_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
-        self.overall_bar.set(0)
-
-        self.cur_game_var = tk.StringVar(value="CURRENT STEP")
-        ctk.CTkLabel(progress, textvariable=self.cur_game_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=12, weight="bold")).grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
-        self.stage_title_var = tk.StringVar(value="Ready")
-        self.stage_detail_var = tk.StringVar(value="Add a game and start queue.")
-        self.stage_pct_var = tk.StringVar(value="0%")
-        ctk.CTkLabel(progress, textvariable=self.stage_title_var, text_color=WHITE,
-                      font=ctk.CTkFont(size=20, weight="bold")).grid(row=3, column=0, sticky="w", padx=14, pady=(3, 0))
-        ctk.CTkLabel(progress, textvariable=self.stage_pct_var, text_color=("#1a7a40", "#4ade80"),
-                      font=ctk.CTkFont(size=18, weight="bold")).grid(row=3, column=1, sticky="e", padx=14)
-        self.stage_detail_label = ctk.CTkLabel(
-            progress, textvariable=self.stage_detail_var, text_color=MUTED,
-            wraplength=420, justify="left"
-        )
-        self.stage_detail_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 6))
-        self.stage_bar = ctk.CTkProgressBar(progress, progress_color=GREEN, fg_color=("#cccccc", "#242424"), height=12)
-        self.stage_bar.grid(row=5, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
-        self.stage_bar.set(0)
-
-        # Stages strip — one label per stage in a horizontal row
-        stages_outer = ctk.CTkFrame(progress, fg_color=PANEL, corner_radius=6)
-        stages_outer.grid(row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 8))
-        self._stage_labels = []
-        for i, (_, short) in enumerate(_STAGE_DEFS):
-            if i > 0:
-                ctk.CTkLabel(stages_outer, text="›", text_color=MUTED,
-                              font=ctk.CTkFont(size=13)).pack(side="left", padx=0)
-            lbl = ctk.CTkLabel(stages_outer, text=f"○ {short}", text_color=MUTED,
-                                font=ctk.CTkFont(size=10), width=62, anchor="center")
-            lbl.pack(side="left", padx=2, pady=6)
-            self._stage_labels.append(lbl)
-
-        self._bind_dynamic_wrap(progress, [self.stage_detail_label], padding=36, min_width=260)
-
-        # ── Compression tuning bar — sits directly under the stages strip ──
-        tune_bar = ctk.CTkFrame(progress, fg_color=CARD, corner_radius=6,
-                                 border_width=1, border_color=BORDER2)
-        tune_bar.grid(row=7, column=0, columnspan=2, sticky="ew", padx=14, pady=(2, 12))
-        tune_bar.grid_columnconfigure(1, weight=1)
-        tune_bar.grid_columnconfigure(4, weight=1)
-
-        ctk.CTkLabel(tune_bar, text="COMPRESSION TUNING",
-                      text_color=WHITE, font=ctk.CTkFont(size=11, weight="bold"),
-                      anchor="w").grid(row=0, column=0, columnspan=7, sticky="w",
-                                       padx=10, pady=(7, 3))
-        # Applicability note — set from update_game_details() for the selected job. Pack
-        # jobs use every control; an fPKG build honours only Level (per job); an fPKG
-        # extract none of them. Empty for pack jobs so the bar looks as before.
-        self.tune_note_var = tk.StringVar(value="")
-        self._tune_note_lbl = ctk.CTkLabel(tune_bar, textvariable=self.tune_note_var, text_color=MUTED,
-                                            font=ctk.CTkFont(size=11), anchor="w", justify="left")
-        self._tune_note_lbl.grid(row=2, column=0, columnspan=7, sticky="w", padx=10, pady=(0, 6))
-        self._tune_note_lbl.grid_remove()
-
-        # ── Compression level ──
-        ctk.CTkLabel(tune_bar, text="Level (0-9):", text_color=MUTED,
-                      font=ctk.CTkFont(size=11), anchor="e").grid(
-            row=1, column=0, sticky="e", padx=(10, 4), pady=(0, 8))
-        ctk.CTkSlider(tune_bar, from_=0, to=9, number_of_steps=9,
-                       variable=self.compression_level_var,
-                       fg_color=BORDER2, progress_color=GREEN,
-                       button_color=GREEN, button_hover_color=GREEN2,
-                       height=16).grid(row=1, column=1, sticky="ew", padx=(0, 4), pady=(0, 8))
-        self._comp_level_lbl = ctk.CTkLabel(tune_bar, text=str(self.compression_level_var.get()),
-                                             text_color=GREEN, font=ctk.CTkFont(size=12, weight="bold"),
-                                             width=22, anchor="w")
-        self._comp_level_lbl.grid(row=1, column=2, padx=(0, 18), pady=(0, 8))
-        def _update_comp_lbl(*_):
-            self._comp_level_lbl.configure(text=str(self.compression_level_var.get()))
-        self.compression_level_var.trace_add("write", _update_comp_lbl)
-
-        # ── CPU cores ──
-        ctk.CTkLabel(tune_bar, text="CPU cores (0=auto):", text_color=MUTED,
-                      font=ctk.CTkFont(size=11), anchor="e").grid(
-            row=1, column=3, sticky="e", padx=(0, 4), pady=(0, 8))
-        ctk.CTkSlider(tune_bar, from_=0, to=16, number_of_steps=16,
-                       variable=self.cpu_count_var,
-                       fg_color=BORDER2, progress_color=GREEN,
-                       button_color=GREEN, button_hover_color=GREEN2,
-                       height=16).grid(row=1, column=4, sticky="ew", padx=(0, 4), pady=(0, 8))
-        self._cpu_count_lbl = ctk.CTkLabel(tune_bar,
-                                            text=("auto" if self.cpu_count_var.get() == 0
-                                                  else str(self.cpu_count_var.get())),
-                                            text_color=GREEN, font=ctk.CTkFont(size=12, weight="bold"),
-                                            width=34, anchor="w")
-        self._cpu_count_lbl.grid(row=1, column=5, padx=(0, 10), pady=(0, 8))
-        def _update_cpu_lbl(*_):
-            v = self.cpu_count_var.get()
-            self._cpu_count_lbl.configure(text="auto" if v == 0 else str(v))
-        self.cpu_count_var.trace_add("write", _update_cpu_lbl)
-
-        # ── Block size ──  (MkPFS option — smaller = less waste for small files)
-        ctk.CTkLabel(tune_bar, text="Block size:", text_color=MUTED,
-                      font=ctk.CTkFont(size=11), anchor="e").grid(
-            row=1, column=6, sticky="e", padx=(14, 4), pady=(0, 8))
-        _block_opts = ["auto", "65536"]
-        _block_menu = ctk.CTkOptionMenu(
-            tune_bar, values=_block_opts, variable=self.block_size_var,
-            fg_color=CARD2, button_color=GREEN, button_hover_color=GREEN2,
-            text_color=WHITE, dropdown_fg_color=CARD2, dropdown_text_color=WHITE,
-            dropdown_hover_color=GREEN, width=96, height=24,
-            font=ctk.CTkFont(size=11),
-            command=lambda v: save_settings({"block_size": v}),
-        )
-        _block_menu.grid(row=1, column=7, sticky="w", padx=(0, 10), pady=(0, 8))
-
-        # ── Right: Game Details + Command Preview ────────────────────────────
-        right = ctk.CTkFrame(content, fg_color=BLACK)
-        content.add(right, minsize=300, stretch="always")
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-
-        details = self.panel(right, row=0, column=0, sticky="ew", pady=(0, 8))
-        details.grid_columnconfigure(1, weight=1)
-
-        self.art_frame = ctk.CTkFrame(details, width=100, height=110, fg_color=BLACK,
-                                       border_width=1, border_color=BORDER2)
-        self.art_frame.grid(row=0, column=0, rowspan=2, padx=10, pady=10)
-        self.art_frame.grid_propagate(False)
-        # Plain tk.Label — CTkLabel can't cleanly switch between image=CTkImage and image=None
-        self.art_label = tk.Label(self.art_frame, text="NO\nART",
-                                  fg="#888888", bg="#000000",
-                                  font=("Segoe UI", 9),
-                                  borderwidth=0, highlightthickness=0)
-        self.art_label.pack(expand=True)
-
-        ctk.CTkLabel(details, text="GAME DETAILS", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=1, sticky="w", padx=4, pady=(10, 4))
-        self.game_name_var = tk.StringVar(value="Name: No game selected")
-        self.title_var = tk.StringVar(value="Title ID: —")
-        self.source_detail_var = tk.StringVar(value="Source: —")
-        self.orig_var = tk.StringVar(value="Original Size: —")
-        self.files_var = tk.StringVar(value="Files: —")
-        info = ctk.CTkFrame(details, fg_color=PANEL)
-        info.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(0, 10))
-        self._detail_value_labels = []
-        for v in [self.game_name_var, self.title_var, self.orig_var, self.files_var, self.source_detail_var]:
-            lbl = ctk.CTkLabel(
-                info, textvariable=v, text_color=WHITE, anchor="w", justify="left",
-                wraplength=520, font=ctk.CTkFont(size=11)
-            )
-            lbl.pack(anchor="w", pady=2, padx=6)
-            self._detail_value_labels.append(lbl)
-        self._bind_dynamic_wrap(info, self._detail_value_labels, padding=18, min_width=220)
-
-        command = self.panel(right, row=1, column=0, sticky="nsew", pady=(0, 0))
-        command.grid_columnconfigure(0, weight=1)
-        command.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(command, text="COMMAND PREVIEW", text_color=WHITE,
-                      font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 4))
-        self.command_label = ctk.CTkLabel(command,
-                                           text="Select source, output, and temp folder to preview command.",
-                                           text_color=MUTED, wraplength=360, justify="left",
-                                           font=ctk.CTkFont(size=11))
-        self.command_label.grid(row=1, column=0, sticky="nw", padx=14, pady=(0, 10))
-        self._bind_dynamic_wrap(command, [self.command_label], padding=36, min_width=260)
-
-        # ── Bottom: Tabbed Logs / Status / History / Statistics ─────────────
-        #    Lives in the vertical paned window as the lower, drag-resizable pane.
-        bottom = ctk.CTkFrame(vpaned, fg_color=PANEL, border_width=1, border_color=BORDER, corner_radius=10)
-        vpaned.add(bottom, minsize=160, stretch="never")
-        bottom.grid_columnconfigure(0, weight=1)
-        bottom.grid_rowconfigure(0, weight=1)
-
-        self.bottom_tabs = ctk.CTkTabview(bottom, fg_color=BLACK, segmented_button_fg_color=PANEL,
-                                           segmented_button_selected_color=GREEN,
-                                           segmented_button_selected_hover_color=GREEN2,
-                                           segmented_button_unselected_color=PANEL,
-                                           text_color=WHITE)
-        self.bottom_tabs.grid(row=0, column=0, sticky="nsew", padx=12, pady=(10, 10))
-
-        self.bottom_tabs.add("Logs")
-        self.bottom_tabs.add("Status & Stats")
-        self.bottom_tabs.add("Recent Compressions")
-        self.bottom_tabs.add("Statistics")
-
-        # ── Status & Stats tab — 3 columns side by side ──────────────────────
-        ss_tab = self.bottom_tabs.tab("Status & Stats")
-        ss_tab.grid_columnconfigure(0, weight=2)   # STATUS
-        ss_tab.grid_columnconfigure(1, weight=2)   # STATS
-        ss_tab.grid_columnconfigure(2, weight=2)   # TOOLS
-        ss_tab.grid_rowconfigure(0, weight=1)
-
-        # ── STATUS (col 0) ────────────────────────────────────────────────────
-        status = self.panel(ss_tab, row=0, column=0, sticky="nsew", padx=(0, 4), pady=4)
-        ctk.CTkLabel(status, text="STATUS", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        self.big_status_var = tk.StringVar(value="Ready")
-        self.big_detail_var = tk.StringVar(value="Waiting for a game.")
-        ctk.CTkLabel(status, textvariable=self.big_status_var, text_color=WHITE,
-                      font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=12)
-        ctk.CTkLabel(status, textvariable=self.big_detail_var, text_color=MUTED,
-                      wraplength=320, justify="left",
-                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(3, 10))
-
-        # ── STATS (col 1) ─────────────────────────────────────────────────────
-        stats = self.panel(ss_tab, row=0, column=1, sticky="nsew", padx=4, pady=4)
-        ctk.CTkLabel(stats, text="STATS", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        self.speed_var       = tk.StringVar(value="Speed: —")
-        self.elapsed_var     = tk.StringVar(value="Elapsed: 00:00")
-        self.eta_var         = tk.StringVar(value="ETA: —")
-        self.saved_var       = tk.StringVar(value="Saved: —")
-        self.ratio_var       = tk.StringVar(value="Compression: —")
-        self.rating_var      = tk.StringVar(value="Rating: —")
-        self.temp_space_var  = tk.StringVar(value="Temp Needed: —")
-        for v in [self.speed_var, self.elapsed_var, self.eta_var,
-                  self.saved_var, self.ratio_var, self.rating_var, self.temp_space_var]:
-            ctk.CTkLabel(stats, textvariable=v, text_color=WHITE, anchor="w",
-                          font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=2)
-        # bottom padding
-        ctk.CTkLabel(stats, text="", height=6).pack()
-
-        # ── TOOLS (col 2) ─────────────────────────────────────────────────────
-        tools_frame = self.panel(ss_tab, row=0, column=2, sticky="nsew", padx=(4, 0), pady=4)
-        ctk.CTkLabel(tools_frame, text="TOOLS", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(10, 6))
-        self._button(tools_frame, "OPEN OUTPUT FOLDER",    self.open_output_folder,  height=34).pack(fill="x", padx=12, pady=3)
-        self._button(tools_frame, "EXPORT RAW LOG",        self.open_raw_log,        height=34).pack(fill="x", padx=12, pady=3)
-        self._button(tools_frame, "🗑  Clear Temp Files",  self.clear_temp_files,    height=34).pack(fill="x", padx=12, pady=3)
-        self._button(tools_frame, "📦  Export Diagnostic", self.export_diagnostics,  height=34).pack(fill="x", padx=12, pady=3)
-        self._button(tools_frame, "📋  Copy Last Result",  self.copy_last_result,    height=34).pack(fill="x", padx=12, pady=(3, 10))
-
-        # Logs tab
-        log_tab = self.bottom_tabs.tab("Logs")
-        log_tab.grid_columnconfigure(0, weight=1)
-        # Only the text box grows or shrinks; the header row keeps its natural height,
-        # otherwise a short log pane squeezes it and "LOGS" / CLEAR LOGS are cut off.
-        log_tab.grid_rowconfigure(0, weight=0)
-        log_head = ctk.CTkFrame(log_tab, fg_color=BLACK)
-        log_head.grid(row=0, column=0, sticky="ew")
-        log_head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(log_head, text="LOGS", text_color=WHITE,
-                      font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
-        # Live RAM meter — green/amber/red; refreshed ~every 2 s from the poll loop.
-        self.ram_var = tk.StringVar(value="")
-        self._ram_label = ctk.CTkLabel(log_head, textvariable=self.ram_var, text_color=MUTED,
-                                        font=ctk.CTkFont(size=12))
-        self._ram_label.grid(row=0, column=1, padx=(0, 10), sticky="e")
-        self._button(log_head, "CLEAR LOGS", self.clear_logs, width=110).grid(row=0, column=2, padx=4)
-        self.log_box = ctk.CTkTextbox(log_tab, fg_color=BLACK, border_width=1, border_color=BORDER, height=60,
-                                       text_color="#94a3b8", font=ctk.CTkFont(family="Consolas", size=12), wrap="none")
-        self.log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        log_tab.grid_rowconfigure(1, weight=1)
-        # Per-level colour tags on the underlying tk.Text widget
-        try:
-            t = self.log_box._textbox
-            t.tag_configure("SUCCESS",  foreground="#4ade80")
-            t.tag_configure("OK",       foreground="#4ade80")
-            t.tag_configure("ERROR",    foreground="#f87171")
-            t.tag_configure("WARN",     foreground="#facc15")
-            t.tag_configure("INFO",     foreground="#94a3b8")
-            t.tag_configure("PROGRESS", foreground="#60a5fa")
-            t.tag_configure("DEBUG",    foreground="#555555")
-        except Exception:
-            pass
-
-        # History tab
-        hist_tab = self.bottom_tabs.tab("Recent Compressions")
-        hist_tab.grid_columnconfigure(0, weight=1)
-        hist_tab.grid_rowconfigure(1, weight=1)
-        hist_head = ctk.CTkFrame(hist_tab, fg_color=BLACK)
-        hist_head.grid(row=0, column=0, sticky="ew")
-        hist_head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hist_head, text="RECENT COMPRESSIONS", text_color=WHITE,
-                      font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
-        self._button(hist_head, "REFRESH", self.refresh_history, width=110).grid(row=0, column=1, padx=4)
-        self.history_box = ctk.CTkTextbox(hist_tab, fg_color=BLACK, border_width=1, border_color=BORDER,
-                                           text_color=WHITE, font=ctk.CTkFont(family="Consolas", size=12), wrap="none")
-        self.history_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        self.refresh_history()
-
-        # Statistics tab
-        stats_tab = self.bottom_tabs.tab("Statistics")
-        stats_tab.grid_columnconfigure(0, weight=1)
-        stats_tab.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(stats_tab, text="COMPRESSION STATISTICS", text_color=WHITE,
-                      font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        self.stats_box = ctk.CTkTextbox(stats_tab, fg_color=BLACK, border_width=1, border_color=BORDER,
-                                         text_color=WHITE, font=ctk.CTkFont(family="Consolas", size=13), wrap="none")
-        self.stats_box.grid(row=1, column=0, sticky="nsew")
-        self._button(stats_tab, "REFRESH STATS", self.refresh_statistics, width=140).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.refresh_statistics()
-
-
-        # Footer
-        footer = ctk.CTkFrame(main, fg_color=BLACK)
-        footer.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 8))
-        self.footer_var = tk.StringVar(value="● Ready")
-        ctk.CTkLabel(footer, textvariable=self.footer_var, text_color=("#1a7a40", "#4ade80")).pack(side="left")
-        ctk.CTkLabel(footer, text=f"{APP_VERSION}  |  Bizkut Backend  |  {MKPFS_NAME} v{MKPFS_VERSION}", text_color=MUTED).pack(side="right")
-
-        self.update_queue_box()
-
-        # ── Drag & drop registration ─────────────────────────────────────────
-        if _HAS_DND:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>", self._on_drop)
-
     # ── Theme toggle ─────────────────────────────────────────────────────────
+    def _set_theme(self, mode):
+        if mode in ("dark", "light") and mode != self._theme:
+            self._toggle_theme()
+
     def _toggle_theme(self):
         self._theme = "light" if self._theme == "dark" else "dark"
         ctk.set_appearance_mode(self._theme)
         save_settings({"appearance_mode": self._theme})
-        # No manual recoloring needed — all color constants are (light, dark) tuples
-        # so CTk picks the correct value automatically on appearance mode change.
+        for w in [self.root] + [c for c in self.root.winfo_children() if isinstance(c, tk.Toplevel)]:
+            set_window_appearance(w, self._theme)
+        # CTk widgets (the dialogs) follow their (light, dark) tuples on their own; the
+        # main window's Tk widgets are recoloured through the kit.
+        try:
+            self.kit.set_mode(self._theme)
+        except Exception:
+            pass
 
     def _open_patch_dialog(self):
         # No busy-guard: adding a job to the queue while another runs is fine (it just
@@ -5657,10 +6187,7 @@ class App:
 
 
     def open_settings(self):
-        if self._settings_win and self._settings_win.winfo_exists():
-            self._settings_win.focus()
-            return
-        self._settings_win = SettingsWindow(self.root, self)
+        self._show_view("settings")
 
     def open_converter(self):
         ConverterDialog(self)
@@ -5931,20 +6458,24 @@ class App:
         if art_key == getattr(self, "_loaded_art_key", object()):
             return
         self._loaded_art_key = art_key
-
-        if Image and ImageTk and art and art.exists():
+        photo = None
+        if Image and ImageTk and art and Path(str(art)).exists():
             try:
                 img = Image.open(art).convert("RGBA")
-                img.thumbnail((130, 130))
-                tk_img = ImageTk.PhotoImage(img)
-                self.art_img = tk_img          # hold reference — GC would delete the Tcl image
-                self.art_label.configure(image=tk_img, text="", bg="#000000")
-                return
-            except Exception as _art_err:
-                pass   # fall through to placeholder
-        # No art or load failed
-        self.art_img = None
-        self.art_label.configure(image="", text="NO\nART", fg="#888888", bg="#000000")
+                img.thumbnail((56, 56))
+                try:
+                    from PIL import ImageChops, ImageDraw
+                    mask = Image.new("L", img.size, 0)
+                    ImageDraw.Draw(mask).rounded_rectangle(
+                        [0, 0, img.size[0] - 1, img.size[1] - 1], radius=10, fill=255)
+                    img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
+                except Exception:
+                    pass
+                photo = ImageTk.PhotoImage(img)
+            except Exception:
+                photo = None
+        self.art_img = photo   # hold a reference; Tk drops unreferenced images
+        self.art_label.set_photo(photo)
 
     # ── Queue management ──────────────────────────────────────────────────────
     @staticmethod
@@ -7069,10 +7600,6 @@ class App:
         self.log("INFO", f"Extracting archive: {archive.name}")
         self.status_update("Extracting", f"Unpacking {archive.name}…  0%",
                             "Extracting", 0, 0, "00:00", "—", "—")
-        try:
-            self.bottom_tabs.set("Logs")
-        except Exception:
-            pass
 
         _last_pct = [-1]
         def _progress(pct, filename):
@@ -7181,10 +7708,6 @@ class App:
         self.update_queue_box()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
-        try:
-            self.bottom_tabs.set("Logs")
-        except Exception:
-            pass
         temp_base = self.temp_var.get().strip() or str(Path(item.path).parent / "_ffpfsc_temp")
         self.temp_var.set(temp_base)
         pw = self._candidate_passwords(item)
@@ -7962,15 +8485,20 @@ class App:
                            if prev_idx is not None and prev_idx < len(self.queue)
                            else None)
 
-        self.queue_listbox.delete(0, "end")
+        self._sync_primary_action()
         if not self.queue:
-            self.queue_listbox.insert("end", "  Queue is empty")
-            self.queue_listbox.itemconfig(0, fg="#555555")
-            self.queue_total_var.set("Total: 0 game(s)")
+            self.queue_listbox.set_rows([])
+            self.queue_total_var.set("No jobs yet")
             self._details_item = None
+            try:
+                self._nav["queue"].configure(badge=None)
+                self._card_show(False)
+            except Exception:
+                pass
             return
 
-        total = sum(x.size for x in self.queue)
+        total = sum(getattr(x, "size", 0) or 0 for x in self.queue)
+        rows = []
         for i, item in enumerate(self.queue):
             # Capture a STABLE display name the first time we render this item — at add
             # time item.name is the friendly name (a bundle's folder, the archive's name).
@@ -8016,22 +8544,41 @@ class App:
                           if shows_extracted_size(item) else format_size(item.size))
             disp = getattr(item, "display_name", None) or item.name
             line = f"{prefix}{badge}  {item.title_id}  {disp}  [{detail}]  {item.status}"
-            self.queue_listbox.insert("end", line)
-            if self._batch_running and i == 0:
-                self.queue_listbox.itemconfig(i, fg="#4ade80")
-            elif item.status == "Failed":
-                self.queue_listbox.itemconfig(i, fg="#f87171")
-            elif item.status == "Done":
-                self.queue_listbox.itemconfig(i, fg="#888888")
+            running = self._batch_running and i == 0
+            st = str(getattr(item, "status", "") or "")
+            state = ("running" if running else "done" if st == "Done" else "failed" if st == "Failed"
+                     else "skipped" if st in ("Skipped", "Cancelled")
+                     else "waiting" if st in ("Pending Extract", "Extracting") else "queued")
+            if shows_extracted_size(item):
+                size_txt = f"~{format_size(display_size(item))}"
+            elif getattr(item, "size", 0):
+                size_txt = format_size(item.size)
+            else:
+                size_txt = ""
+            sub = "  →  ".join(self._job_recipe(item))
+            if size_txt:
+                sub += f"   ·   {size_txt}"
+            tid = getattr(item, "title_id", "") or ""
+            if tid and tid not in str(disp):
+                sub = f"{tid}   ·   {sub}"
+            chip = (f"{int(self._cur_job_pct)}%" if running else
+                    {"Pending": "Queued", "Pending Extract": "Waiting"}.get(st, st or "Queued"))
+            rows.append({"text": line, "title": str(disp), "subtitle": sub, "state": state, "chip": chip,
+                         "progress": (max(0.0, min(1.0, self._cur_job_pct / 100.0)) if running else None)})
 
-        self.queue_total_var.set(f"Total: {len(self.queue)} item(s)  |  {format_size(total)}")
+        n = len(self.queue)
+        self.queue_total_var.set(f"{n} job{'' if n == 1 else 's'}  ·  {format_size(total)}")
+        try:
+            self._nav["queue"].configure(badge=n)
+        except Exception:
+            pass
 
         # Find the target item's new index; fall back to row 0
         try:
             sel = self.queue.index(select_item) if select_item in self.queue else 0
         except (ValueError, TypeError):
             sel = 0
-        self.queue_listbox.selection_set(sel)
+        self.queue_listbox.set_rows(rows, selected=sel)
         self.queue_listbox.see(sel)
 
         # Only refresh the details panel when the selected item actually changed.
@@ -8079,6 +8626,32 @@ class App:
         self.load_art(item.artwork)
         self._refresh_space_for_item(item)
         self.update_command_preview()
+        self._fill_job_card(item)
+
+    def _fill_job_card(self, item):
+        """The job card's header lines and recipe chips for *item*."""
+        try:
+            self._card_show(True)
+            disp = getattr(item, "display_name", None) or item.name
+            self.card_title_var.set(str(disp))
+            ver = ""
+            try:
+                src = getattr(item, "path", None)
+                if src and Path(str(src)).exists():
+                    ver = guess_game_version(Path(str(src)))
+            except Exception:
+                ver = ""
+            size_txt = (f"~{format_size(item.extracted_size)} unpacked" if shows_extracted_size(item)
+                        else format_size(getattr(item, "size", 0) or 0))
+            files = getattr(item, "files", 0) or 0
+            meta = [x for x in (getattr(item, "title_id", ""), f"v{ver}" if ver else "", size_txt,
+                                f"{files:,} file{'' if files == 1 else 's'}" if files else "") if x]
+            self.card_meta_var.set("   ·   ".join(meta))
+            out = self._job_output_dir(item)
+            self.card_target_var.set(f"→  {out}" if out else "→  no output folder set")
+            self._card_chips.set_parts(self._job_recipe(item))
+        except Exception:
+            pass
 
     def _refresh_space_for_item(self, item=None):
         """Recalculate free-space vs what this game needs and update the stats label."""
@@ -8116,7 +8689,7 @@ class App:
             # It completes if the SSD can hold the image (split — the spool auto-routes to
             # the big output drive) OR the output drive can hold the whole build.
             ok = (size > 0 and free >= image_need) or (out_dir is not None and out_free >= out_full)
-            flag = "✓ OK" if ok else "⚠ LOW"
+            flag = "fits" if ok else "LOW, may not fit"
             self.temp_space_var.set(
                 f"Temp image: ~{format_size(image_need)}  |  Temp Free: {format_size(free)}  "
                 f"|  Out Free: {format_size(out_free)}  |  {flag}"
@@ -8127,8 +8700,8 @@ class App:
     def _update_format_label(self):
         comp = self.output_compressed_var.get()
         try:
-            self.format_hint_var.set("📦 Compressed (.ffpfsc, smaller)" if comp
-                                     else "⚡ Uncompressed (.ffpfs, faster)")
+            self.format_hint_var.set("Compressed (.ffpfsc, smaller)" if comp
+                                     else "Uncompressed (.ffpfs, faster)")
         except Exception:
             pass
 
@@ -8150,7 +8723,7 @@ class App:
         # Archive placeholders have no path yet — show a friendly message instead
         if item and getattr(item, "archive_path", None):
             self.command_label.configure(
-                text=f"📦 {item.name} — archive will be extracted before compression starts.")
+                text=f"{item.name} — archive will be extracted before compression starts.")
             return
         src = self.source_var.get().strip()
         if not item and src and Path(src).exists():
@@ -8674,14 +9247,12 @@ class App:
         if self._ampr_folder():
             return True
         result = [False]
-        win = ctk.CTkToplevel(self.root)
+        win = MessageWindow(self.root)
+        win.geometry("560x400")
         win.title("AMPR Emu Files Needed")
         win.resizable(False, False)
-        win.attributes("-topmost", True)
-        win.lift()
-        win.after(200, lambda: win.attributes("-topmost", False))
         ctk.CTkLabel(win, text="AMPR emu folder not set",
-                     font=ctk.CTkFont(size=14, weight="bold"),
+                     font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=WHITE).pack(padx=28, pady=(22, 4))
         ctk.CTkLabel(win,
                      text="This APR (PlayGo) game needs two emu files to boot after compression:\n"
@@ -8713,6 +9284,8 @@ class App:
             win.destroy()
         self._button(btns, "Confirm & Continue", _confirm, green=True, width=190, height=36).pack(side="left", padx=(0, 10))
         self._button(btns, "Skip (no AMPR)", win.destroy, width=140, height=36).pack(side="left")
+        for seq in ("<Return>", "<KP_Enter>"):
+            win.bind(seq, lambda e: _confirm())
         win.grab_set()
         self.root.wait_window(win)
         return result[0]
@@ -9233,7 +9806,7 @@ class App:
                 freed += sz
             except Exception:
                 errors += 1
-        msg = f"🗑  Auto-cleared temp: freed {format_size(freed)}"
+        msg = f"Auto-cleared temp: freed {format_size(freed)}"
         if errors:
             msg += f" ({errors} item(s) could not be removed)"
         self.log("OK", msg)
@@ -9244,9 +9817,8 @@ class App:
             self.batch_counter_var.set("")
             return
         current = self._batch_done + self._batch_failed + 1
-        self.batch_counter_var.set(
-            f"Game {current}/{self._batch_total}  |  ✓ {self._batch_done}  ✗ {self._batch_failed}"
-        )
+        extra = "".join(f"  ·  {n} {w}" for n, w in ((self._batch_done, "done"), (self._batch_failed, "failed")) if n)
+        self.batch_counter_var.set(f"Job {current} of {self._batch_total}{extra}")
 
     def _job_output_dir(self, item) -> Path | None:
         """The folder this job writes to: its own output_path when set (the per-job
@@ -9465,7 +10037,7 @@ class App:
         done  = self._batch_done
         fail  = self._batch_failed
         self.batch_counter_var.set(
-            f"Batch complete  |  ✓ {done}/{total}  ✗ {fail}/{total}"
+            f"Queue finished  ·  {done} of {total} done" + (f"  ·  {fail} failed" if fail else "")
         )
         msg = (
             f"Batch finished.\n\n"
@@ -9474,9 +10046,9 @@ class App:
             f"Failed:       {fail}\n"
         )
         if fail == 0:
-            self.log("SUCCESS", f"🏁 Batch complete — all {total} item(s) processed successfully.")
+            self.log("SUCCESS", f"Batch complete — all {total} item(s) processed successfully.")
         else:
-            self.log("WARN", f"🏁 Batch complete — {done}/{total} succeeded, {fail} failed.")
+            self.log("WARN", f"Batch complete — {done}/{total} succeeded, {fail} failed.")
         messagebox.showinfo("Batch Complete", msg)
 
     def _ensure_batch_started(self):
@@ -9887,18 +10459,30 @@ class App:
     def update_stages_display(self, current_stage, pct):
         full_names   = [s[0] for s in _STAGE_DEFS]
         current_idx  = full_names.index(current_stage) if current_stage in full_names else -1
-        # Only tick a prior stage ✓ if it was ACTUALLY entered — pack and unpack use
+        # Only tick a prior stage done if it was ACTUALLY entered: pack and unpack use
         # disjoint subsets of _STAGE_DEFS, so a raw index check would mark e.g.
-        # "✓ Compress" during an unpack or "✓ Extract" during a pack.
+        # "Compress" done during an unpack or "Extract" done during a pack.
         sp = getattr(self.worker, "stage_progress", {}) if getattr(self, "worker", None) else {}
-        for i, (lbl, (full, short)) in enumerate(zip(self._stage_labels, _STAGE_DEFS)):
-            if i == current_idx:
-                dp = min(int(pct), 99) if full == "Creating Temp PFS" else int(pct)
-                lbl.configure(text=f"▶ {short} {dp}%", text_color=YELLOW)
-            elif current_idx >= 0 and i < current_idx and sp.get(full, 0) >= 100:
-                lbl.configure(text=f"✓ {short}", text_color=("#1a7a40", "#4ade80"))
-            else:
-                lbl.configure(text=f"○ {short}", text_color=MUTED)
+        # Only the stations this job goes through: the ones it has entered, the current one,
+        # and what is still ahead (Extract only happens first; Verify only when switched on).
+        steps = []
+        verify_on = bool(getattr(self, "verify_output_var", None) and self.verify_output_var.get())
+        if current_idx >= 0:
+            for i, (full, short) in enumerate(_STAGE_DEFS):
+                if i == current_idx:
+                    dp = min(int(pct), 99) if full == "Creating Temp PFS" else int(pct)
+                    steps.append((short, "current", dp))
+                elif i < current_idx:
+                    if sp.get(full, 0) > 0:
+                        steps.append((short, "done", 0))
+                elif full == "Extracting" or (full == "Verifying Output" and not verify_on):
+                    continue
+                else:
+                    steps.append((short, "pending", 0))
+        try:
+            self._steps.set_steps(steps)
+        except Exception:
+            pass
 
     # ── Poll loop ─────────────────────────────────────────────────────────────
     def _tick_elapsed(self):
@@ -9909,19 +10493,17 @@ class App:
             self.elapsed_var.set(f"Elapsed: {format_duration(time.time() - w.start_time)}")
 
     def _update_ram_meter(self):
-        """Refresh the RAM readout in the log header (green <70%, amber <85%, red above)."""
+        """Refresh the RAM readout in the status bar (plain <70 %, amber <85 %, red above)."""
         try:
             import psutil
             mem = psutil.virtual_memory()
             avail_gb = mem.available / 1024**3
             total_gb = mem.total / 1024**3
             pct = mem.percent
-            color = (("#1a7a40", "#4ade80") if pct < 70
-                     else ("#b45309", "#facc15") if pct < 85
-                     else ("#b91c1c", "#f87171"))
-            self.ram_var.set(f"RAM: {avail_gb:.1f} / {total_gb:.0f} GB free  ({pct:.0f}% used)")
+            tok = "faint" if pct < 70 else "warning" if pct < 85 else "danger"
+            self.ram_var.set(f"RAM: {avail_gb:.1f} of {total_gb:.0f} GB free")
             try:
-                self._ram_label.configure(text_color=color)
+                self._ram_label.configure(fg=self.kit.c(tok))
             except Exception:
                 pass
         except Exception:
@@ -9949,6 +10531,11 @@ class App:
         if self._ram_tick >= 10:
             self._ram_tick = 0
             self._update_ram_meter()
+        try:
+            self._tick_space_status()
+            self._sync_run_ui()
+        except Exception:
+            pass
         try:
             while True:
                 status, payload = self.scan_q.get_nowait()
@@ -10227,6 +10814,13 @@ class App:
                 self.header_status_var.set(f"v{APP_VERSION}  |  Stage: {stage}")
                 self.footer_var.set(f"● {title}")
                 self.update_stages_display(stage, stage_pct)
+                self._cur_job_pct = overall_pct
+                if self._batch_running and self.queue:
+                    try:
+                        self.queue_listbox.update_row(0, progress=max(0.0, min(1.0, overall_pct / 100.0)),
+                                                      chip=f"{int(overall_pct)}%")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
 
@@ -10432,86 +11026,35 @@ else:
 
 
 def _wire_open_document(root, app):
-    """macOS: open a .ffpfsc / .ffpfs that was double-clicked (or 'Open With') straight
-    into the PFS browser. On a COLD launch (the app was not already running) show ONLY the
-    browser — the main window stays hidden and the app quits when the browser closes. If
-    the app is already running, the browser opens on top of the normal window. No-op off
-    macOS (the OpenDocument AppleEvent is macOS-only); argv_emulation stays off in the spec
-    so the event reaches Tk instead of being swallowed into argv."""
+    """macOS: a .ffpfsc / .ffpfs that was double-clicked (or 'Open With') opens in Look
+    inside, as a panel of the main window. No-op off macOS (the OpenDocument AppleEvent is
+    macOS-only); argv_emulation stays off in the spec so the event reaches Tk instead of
+    being swallowed into argv."""
     if sys.platform != "darwin":
         return
-    # shown        : the main window has been presented (normal launch). Once true, later
-    #                file-opens land on it instead of starting a browser-only session.
-    # browser_only : a cold double-click session (main window stays hidden).
-    # open         : how many browser-only windows are still open (quit on the LAST close).
-    state = {"shown": False, "browser_only": False, "open": 0}
-
-    def _show_main():
-        state["shown"] = True
-        state["browser_only"] = False
-        app._browser_only = False
-        try: root.deiconify()
-        except Exception: pass
-
-    def _open_browser(path, browser_only):
-        try:
-            dlg = PfsBrowserDialog(app, path, standalone=browser_only)
-        except Exception as e:
-            try: app.log("ERROR", f"Could not open the PFS browser for {path}: {e}")
-            except Exception: pass
-            if browser_only and state["open"] <= 0:
-                _show_main()   # never leave a hidden, un-quittable orphan if construction fails
-            return
-        if browser_only:
-            state["open"] += 1
-            # Quit the whole app when the LAST browser-only window closes — by ANY route:
-            # the red title-bar button (default destroys the toplevel) OR the dialog's own
-            # "Close" button (self.destroy()). Act only on the toplevel's own <Destroy>.
-            def _on_destroy(e, d=dlg):
-                if e.widget is not d:
-                    return
-                state["open"] -= 1
-                if state["open"] <= 0:
-                    try: root.destroy()
-                    except Exception: pass
-            try: dlg.bind("<Destroy>", _on_destroy)
-            except Exception: pass
 
     def _on_open(*paths):
-        files = [p for p in paths if str(p).lower().endswith((".ffpfsc", ".ffpfs"))]
+        files = [p for p in paths if str(p).lower().endswith((".ffpfsc", ".ffpfs", ".pkg"))]
         if not files:
             return
-        # Cold launch = the main window has NOT been shown yet (timing-independent, so a slow
-        # AppleEvent still yields a browser-only session as long as we haven't presented the
-        # main window). Once shown, the browser opens on top of the normal window.
-        if not state["shown"]:
-            state["browser_only"] = True
-            app._browser_only = True
-        bo = state["browser_only"]
-        if not bo:
-            try: root.deiconify()
-            except Exception: pass
+        try:
+            root.deiconify()
+            root.lift()
+        except Exception:
+            pass
         for f in files:
-            _open_browser(f, browser_only=bo)
+            try:
+                PfsBrowserDialog(app, f)
+            except Exception as e:
+                try:
+                    app.log("ERROR", f"Could not open {f} in Look inside: {e}")
+                except Exception:
+                    pass
 
     try:
         root.createcommand("::tk::mac::OpenDocument", _on_open)
     except Exception:
         return
-
-    # Start hidden; if no file-open AppleEvent arrives shortly it is a normal launch -> show
-    # the main window. If one DID arrive we are in browser-only mode and stay hidden.
-    try:
-        root.withdraw()
-    except Exception:
-        return
-
-    def _finalize():
-        if state["browser_only"] or state["shown"]:
-            return
-        _show_main()
-
-    root.after(250, _finalize)
 
 
 def main():

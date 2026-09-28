@@ -6,6 +6,106 @@
   v1.2.0  (current)
 ────────────────────────────────────────────────────────────────────────
 
+A NEW MAIN WINDOW
+
+  The window has three columns now: a sidebar, the job list, and a
+  card for the selected job.
+
+  - The sidebar switches between Queue, History (past jobs and
+    totals), Log (everything the backend printed) and Settings, and
+    holds the tools Look inside, Organize and Clean temp.
+  - The job card shows the recipe (source, changes, output), the
+    target folder and, while the job runs, only the stages this job
+    goes through, its speed, elapsed and remaining time, and the last
+    four log lines. Cancel sits on the card and appears only while a
+    job runs.
+  - The status bar shows RAM and the free space on the temp and
+    output drives. A worker thread reads the drives, so a sleeping
+    HDD cannot stall the window.
+  - Compression level, cores and block size fit in one line under
+    the list; Change opens a small panel with the controls.
+  - Text follows the macOS sizes, in logical pixels everywhere: 13
+    for text and navigation, 12 for second lines, 11 for captions,
+    15 and 17 for titles, Menlo 11 for the log and 10 for its preview.
+  - A PlayStation-like blue marks the one main action (Add job while
+    the queue is empty, Start once it has jobs) and the selection.
+    Green means done, amber a warning, red an error. One set of
+    stroke icons replaces the emoji.
+  - The window opens at 1280 x 820 and works down to 900 x 600. The
+    job card keeps its width when you resize the window; drag the
+    divider to change it, and the app remembers it.
+  - Cmd+N adds a job, Cmd+, opens Settings, Cmd+1 to Cmd+3 switch
+    views. Right-click a job for Edit, Move up, Move down and Remove.
+
+WORK IN THE MAIN WINDOW, MESSAGES IN WINDOWS OF THEIR OWN
+
+  Settings is a view of the main window now, with a page list:
+  General, Compression, Archives, Drives & space, Backport &
+  libraries, About. General gains an Appearance switch and a "Clean
+  temp now" button.
+
+  The work surfaces open as panels over the content area: Add job,
+  Edit job, Look inside, the compression controls and the first-run
+  setup. The sidebar pauses while a panel is open, Escape or the
+  close button dismisses it, and Return still adds a job.
+  Double-clicking a .ffpfsc or .ffpfs in Finder opens it in Look
+  inside, in the main window.
+
+  Messages keep a small window of their own, centred over the main
+  window: the job result, the error report, the space check before a
+  start, and the prompts for an archive password or the AMPR folder.
+  Return presses the main button, Escape closes. The result window
+  takes the height of its report, so a short result gets a short
+  window.
+
+CLEANER CONTROLS
+
+  - Buttons, chips, the selected row, progress bars and tiles have
+    smooth rounded corners. Tk on macOS fills a shape without
+    antialiasing, so the corners came out as pixel steps. The shapes
+    are now drawn as a thick stroke with round joins, which macOS
+    smooths.
+  - Buttons use 13 px regular text, like a macOS push button. A normal
+    button is a quiet fill with a hairline in light mode, and the
+    dialogs use the same look. Their normal buttons used to have no
+    edge in light mode and all but vanished on white.
+  - Start shows a filled play symbol, pop-up menus are one field with
+    a chevron, and checkboxes are 18 px.
+  - The title bar follows the app's Light or Dark setting, not only
+    the system's.
+  - Look inside has a dark scrollbar and one primary button. Add job
+    lines its option notes up in one column, shows a scrollbar only
+    when the options do not fit, and puts the summary next to its
+    buttons. The compression panel is as tall as its content, and the
+    job card's log preview shows exactly the last four lines.
+  - Labels and buttons use sentence case throughout.
+
+FASTER
+
+  ui_kit.py draws the main window on plain Tk canvases and labels;
+  it no longer contains a single CustomTkinter widget. Measured on an
+  M2 Max with the window on screen:
+
+    one step of dragging the window edge, three jobs   360 ms -> ~90 ms
+    building the window                                 91 ms -> 19 ms
+    opening Settings                                   0.9 s -> 0.2 s, 0.1 s after that
+
+  The job card keeps its width while the window resizes, and the
+  toplevel's resize handlers no longer run once for every child
+  widget. Settings pages are built the first time you open them.
+
+TESTS
+
+  The GUI driver checks that messages open in windows of their own,
+  that they wait while the main window is hidden, and that the work
+  surfaces stay panels.
+
+  test_archive_extractor and test_chain_items point the profile at a
+  scratch folder before they load the app code, so the settings
+  migration below can never touch your real profile during a test
+  run. --prepare-backport-libs keeps its patch cache in
+  PS5_FFPFSC_APP_DIR when that is set.
+
 NEW NAME: PS5 UltraPack
 
   PS5 FFPFSC ULTRA is now PS5 UltraPack. The app reads and writes

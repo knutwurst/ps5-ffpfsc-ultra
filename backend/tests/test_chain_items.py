@@ -6,6 +6,7 @@ job dialog shows and the queue row carries.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
+# Never touch the real profile: the app dir is computed (and an old one migrated) at
+# import time, so point it at a scratch folder first.
+os.environ.setdefault("PS5_FFPFSC_APP_DIR", tempfile.mkdtemp(prefix="ultrapack-test-profile-"))
 import ultra_core as uc  # noqa: E402
 
 

@@ -76,6 +76,11 @@ def pump(cond, timeout=20.0):
         time.sleep(0.05)
     return cond()
 def close_toplevels():
+    # Work dialogs are panels of the main window since 1.2.0 (app._panels.stack); messages
+    # (job result, error report, prompts) are windows of their own.
+    for w in list(app._panels.stack):
+        try: w.destroy()
+        except Exception: pass
     for w in root.winfo_children():
         try:
             if isinstance(w, m.ctk.CTkToplevel): w.destroy()
@@ -500,11 +505,25 @@ try:
     ok("job.defaults-saved", _jd.get("folder", {}).get("to") == "ffpfsc" and _jd.get("ffpfsc", {}).get("to") == "pkg", str(_jd))
     # J9) the double-click dispatch opens the job dialog for a chain item
     app.queue_listbox.selection_clear(0, "end"); app.queue_listbox.selection_set(idx)
-    before = {w for w in root.winfo_children()}
+    before = set(app._panels.stack)
     app._on_queue_double_click(None); root.update()
-    opened = [w for w in root.winfo_children() if w not in before and isinstance(w, m.JobDialog)]
-    ok("job.double-click.opens-job-dialog", len(opened) == 1, f"{[type(w).__name__ for w in root.winfo_children() if w not in before]}")
+    opened = [w for w in app._panels.stack if w not in before and isinstance(w, m.JobDialog)]
+    ok("job.double-click.opens-job-dialog", len(opened) == 1, f"{[type(w).__name__ for w in app._panels.stack if w not in before]}")
     close_toplevels()
+    # J10) messages get a window of their own; the work surfaces stay panels of the main window
+    n_panels = len(app._panels.stack)
+    sd = m.SummaryDialog(root, "report"); ed = m.ErrorDialog(root, "boom", "", "", operation="pack")
+    root.update(); time.sleep(0.3); root.update()
+    ok("message.summary-own-window", isinstance(sd, m.ctk.CTkToplevel) and sd not in app._panels.stack
+       and len(app._panels.stack) == n_panels, f"panels {n_panels} -> {len(app._panels.stack)}")
+    ok("message.error-own-window", isinstance(ed, m.ctk.CTkToplevel) and ed not in app._panels.stack, "")
+    ok("message.waits-for-main-window", not sd.winfo_viewable() and not ed.winfo_viewable(),
+       "the driver's main window is withdrawn, so no message may appear on screen")
+    ok("message.prompts-own-window", all(issubclass(c, m.MessageWindow) for c in
+       (m.SpaceDiagnosticsDialog, m.ArchivePasswordPrompt)), "")
+    ok("work-surface.panels", all(issubclass(c, m.EmbeddedDialog) for c in
+       (m.JobDialog, m.PfsBrowserDialog, m.JobEditMiniDialog, m.FirstRunWizard)), "")
+    sd.destroy(); ed.destroy(); root.update()
 except Exception:
     traceback.print_exc()   # the summary keeps one line; the full trace goes to stderr
     res.append(("driver", False, traceback.format_exc()))

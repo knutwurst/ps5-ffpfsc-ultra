@@ -1879,7 +1879,10 @@ def main() -> None:
                   "and --backport-libs (where the patched files land)", flush=True)
             sys.exit(2)
         import backport_libs as _bpl
-        cache = Path.home() / "Library" / "Application Support" / "PS5_UltraPack" / "backport-patches"
+        # Same profile folder as the GUI (tests point PS5_FFPFSC_APP_DIR at a scratch one).
+        _profile = os.environ.get("PS5_FFPFSC_APP_DIR", "").strip()
+        cache = (Path(_profile) if _profile else
+                 Path.home() / "Library" / "Application Support" / "PS5_UltraPack") / "backport-patches"
         try:
             r = _bpl.prepare_target(target, fw, out, cache_dir=cache,
                                     log=lambda m: print(m, flush=True))

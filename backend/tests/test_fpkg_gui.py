@@ -416,6 +416,91 @@ try:
     moved = list(cout.glob("*.ffpfsc"))
     ok("copy.landed-and-source-gone", len(moved) == 1 and not copy_src.exists(),
        f"moved={[p.name for p in moved]} src_exists={copy_src.exists()}")
+
+    # ── JobDialog: source → change the content → output (one door for every job) ──
+    # J1) folder source, .ffpfsc out, backport on → one chain item; build_command emits --to
+    jd = m.JobDialog(app, init_src=str(HBT)); root.update()
+    ok("job.detect.folder", jd._kind == "folder" and "Game folder" in jd.detect_var.get()
+       and "PPSA99099" in jd.detect_var.get(), jd.detect_var.get())
+    jd.to_var.set(".ffpfsc"); jd.backport_on_var.set(True); jd.backport_target_var.set("7.61")
+    jd.out_var.set(str(OUT / "job")); root.update()
+    ok("job.summary.sentence", jd.summary_var.get() == "Backport to 7.61, then build .ffpfsc", jd.summary_var.get())
+    n0 = len(app.queue); jd._add(); root.update()
+    ji = app.queue[-1]
+    ok("job.add.chain-item", len(app.queue) == n0 + 1 and ji.operation == "chain" and ji.chain_to == "ffpfsc"
+       and ji.backport_target == "7.61" and not ji.chain_sign, f"errors={errors}")
+    jcmd, jcwd, jout, jtmp = app.build_command(ji)
+    ok("job.build_command.chain", "--to" in jcmd and jcmd[jcmd.index("--to") + 1] == "ffpfsc"
+       and "--backport-target" in jcmd and "--overwrite" in jcmd and str(HBT) in jcmd, " ".join(jcmd[-10:]))
+    # auto-organize is on: the image lands in "<out>/<Title> [TID] [vX]/" below the chosen folder
+    ok("job.build_command.named-output", any(a.endswith(".ffpfsc") for a in jcmd) and jout.parent == OUT / "job",
+       " ".join(a for a in jcmd if a.endswith(".ffpfsc")) + f" out={jout}")
+    # J2) .ffpfsc source → .pkg: pkg flags present, sign forced, Look inside offered
+    jd2 = m.JobDialog(app, init_src=str(FF)); root.update()
+    ok("job.detect.ffpfsc", jd2._kind == "ffpfsc" and jd2._look_btn.winfo_manager() == "pack", jd2.detect_var.get())
+    jd2.to_var.set(".pkg"); jd2.out_var.set(str(OUT / "job")); jd2.speed_var.set("fast"); root.update()
+    ok("job.pkg.sign-forced", jd2._sign_cb.cget("state") == "disabled", str(jd2._sign_cb.cget("state")))
+    ok("job.summary.pkg", jd2.summary_var.get() == "Build .pkg", jd2.summary_var.get())
+    n0 = len(app.queue); jd2._add(); root.update(); j2 = app.queue[-1]
+    ok("job.add.pkg-item", len(app.queue) == n0 + 1 and j2.operation == "chain" and j2.chain_to == "pkg"
+       and getattr(j2, "fpkg_level", None) == -4, f"errors={errors}")
+    jcmd2, *_ = app.build_command(j2)
+    ok("job.build_command.pkg-flags", jcmd2[jcmd2.index("--to") + 1] == "pkg" and "--fpkg-inner" in jcmd2
+       and jcmd2[jcmd2.index("--compression-level") + 1] == "-4" and "--backport-target" not in jcmd2,
+       " ".join(jcmd2[-12:]))
+    # J3) .pkg source → folder: output named "<stem> [extracted]" under the chosen folder
+    if pkg:
+        jd3 = m.JobDialog(app, init_src=str(pkg)); root.update()
+        jd3.to_var.set("Folder"); jd3.out_var.set(str(OUT / "job")); root.update()
+        ok("job.summary.unpack", jd3.summary_var.get() == "Unpack to folder", jd3.summary_var.get())
+        n0 = len(app.queue); jd3._add(); root.update(); j3 = app.queue[-1]
+        jcmd3, _, jout3, _ = app.build_command(j3)
+        ok("job.build_command.folder-out", jcmd3[jcmd3.index("--to") + 1] == "folder"
+           and str(jout3).endswith(" [extracted]") and jout3.parent == OUT / "job", str(jout3))
+    # J4) folder → folder with nothing to change disables Add; with Sign it is "in place"
+    jd4 = m.JobDialog(app, init_src=str(HBT)); root.update()
+    # the remembered choices for "folder" (J1 turned backport on) are applied; clear them here
+    jd4.backport_on_var.set(False); jd4.patch_on_var.set(False); jd4.sign_var.set(False)
+    jd4.to_var.set("Folder"); root.update()
+    ok("job.nothing-to-do.disabled", jd4.summary_var.get() == "Nothing to do"
+       and str(jd4._add_btn.cget("state")) == "disabled", jd4.summary_var.get())
+    jd4.sign_var.set(True); root.update()
+    ok("job.sign-in-place", jd4.summary_var.get() == "Sign in place" and str(jd4._add_btn.cget("state")) == "normal"
+       and str(jd4._out_entry.cget("state")) == "disabled", jd4.summary_var.get())
+    jd4.destroy()
+    # J5) edit: the dialog refills from the item and swaps it in place at the same index
+    e = m.JobDialog(app, item=ji); root.update()
+    ok("job.edit.prefill", e.src_var.get() == str(HBT) and e.backport_on_var.get() and e.to_var.get() == ".ffpfsc",
+       f"{e.src_var.get()} {e.to_var.get()}")
+    idx = app.queue.index(ji); e.backport_on_var.set(False); e.sign_var.set(True); e._add(); root.update()
+    ok("job.edit.swapped-in-place", app.queue[idx].operation == "chain" and app.queue[idx].chain_sign
+       and app.queue[idx].backport_target is None and app.queue[idx] is not ji, "")
+    # J6) the queue row and the details panel carry the derived sentence
+    app.update_queue_box(select_item=app.queue[idx]); root.update()
+    row = app.queue_listbox.get(idx)
+    ok("job.queue-row", "→ .ffpfsc" in row and "sign" in row, row)
+    app._on_queue_select(); root.update()
+    ok("job.details.mode-sentence", "Sign, then build .ffpfsc" in app.title_var.get(), app.title_var.get())
+    # J7) a parent folder makes one job per game
+    parent = S / "parent"; parent.mkdir(exist_ok=True)
+    for nme in ("A", "B"):
+        if not (parent / nme).exists():
+            shutil.copytree(HBT, parent / nme)
+    jd7 = m.JobDialog(app, init_src=str(parent)); root.update()
+    ok("job.detect.parent", jd7._kind == "parent" and len(jd7._games) == 2, jd7.detect_var.get())
+    jd7.to_var.set(".ffpfsc"); jd7.out_var.set(str(OUT / "job")); n0 = len(app.queue); jd7._add(); root.update()
+    ok("job.add.parent-two-items", len(app.queue) == n0 + 2 and all(x.operation == "chain" for x in app.queue[-2:]),
+       f"+{len(app.queue) - n0}")
+    # J8) the choices are remembered per kind of source
+    _jd = m.load_settings().get("job_dialog_defaults") or {}
+    ok("job.defaults-saved", _jd.get("folder", {}).get("to") == "ffpfsc" and _jd.get("ffpfsc", {}).get("to") == "pkg", str(_jd))
+    # J9) the double-click dispatch opens the job dialog for a chain item
+    app.queue_listbox.selection_clear(0, "end"); app.queue_listbox.selection_set(idx)
+    before = {w for w in root.winfo_children()}
+    app._on_queue_double_click(None); root.update()
+    opened = [w for w in root.winfo_children() if w not in before and isinstance(w, m.JobDialog)]
+    ok("job.double-click.opens-job-dialog", len(opened) == 1, f"{[type(w).__name__ for w in root.winfo_children() if w not in before]}")
+    close_toplevels()
 except Exception:
     traceback.print_exc()   # the summary keeps one line; the full trace goes to stderr
     res.append(("driver", False, traceback.format_exc()))

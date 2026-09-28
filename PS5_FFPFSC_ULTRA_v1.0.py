@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import signal
 import shutil
+import struct
+import types
 import multiprocessing
 from pathlib import Path
 
@@ -1924,15 +1926,23 @@ class CLIWorker(threading.Thread):
                 self.last_log = t
             self.app.log(tag, line)
 
+    def _chain_to(self):
+        """The output kind of a chain job ('folder' | 'ffpfs' | 'ffpfsc' | 'pkg'), None for
+        every other job — so the result detection can treat a chain like the legacy job
+        that produces the same thing."""
+        if self.operation != "chain":
+            return None
+        return getattr(self.item, "chain_to", None) or "ffpfsc"
+
     def _find_output(self):
         if self.output_path:
             p = Path(self.output_path.strip('"'))
             try:
-                if self.operation in ("unpack", "fpkg-extract") and p.exists() and p.is_dir():
+                if (self.operation in ("unpack", "fpkg-extract") or self._chain_to() == "folder") and p.exists() and p.is_dir():
                     self.final_size = get_folder_size(p)
                     return True
                 if p.exists() and p.is_file() and p.stat().st_size > 0 and p.stat().st_mtime >= self.start_time - 2:
-                    if self.operation == "fpkg-build":
+                    if self.operation == "fpkg-build" or self._chain_to() == "pkg":
                         # The backend's "[OK] fPKG complete: <path>" marker lands here — the
                         # usual path for a build, so the auto-organize rename must happen
                         # here (the glob fallback below is only reached without the marker).
@@ -1943,7 +1953,7 @@ class CLIWorker(threading.Thread):
             except OSError:
                 pass
 
-        if self.operation == "fpkg-extract":
+        if self.operation == "fpkg-extract" or self._chain_to() == "folder":
             # The backend writes straight into the job's output folder.
             if self.output_dir.exists() and self.output_dir.is_dir() and any(self.output_dir.iterdir()):
                 self.output_path = str(self.output_dir)
@@ -1951,7 +1961,7 @@ class CLIWorker(threading.Thread):
                 return True
             return False
 
-        if self.operation == "fpkg-build":
+        if self.operation == "fpkg-build" or self._chain_to() == "pkg":
             try:
                 cands = [q for q in self.output_dir.glob("*.pkg")
                          if q.is_file() and q.stat().st_size > 0 and q.stat().st_mtime >= self.start_time - 2]
@@ -2192,16 +2202,6 @@ def _hdr_mode(v) -> str:
 
 
 class PackDialog(ctk.CTkToplevel):
-    # Hint text shown for each backport target. Kept as a class constant so it
-    # is easy to update when a firmware's status changes (see backport-landscape
-    # research 2026-09-28).
-    _BACKPORT_HINTS = {
-        "off":   "No SDK change. Pack the game as it is.",
-        "7.61":  "Sweet spot — public fakelib patches exist; verified paths in the wider community.",
-        "6.02":  "Experimental — smaller public library set; only some titles run.",
-        "10.xx": "SDK only — no fakelib bundle. For a game whose SDK is newer than the console you target.",
-    }
-
     """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
 
     Three formats: '.ffpfsc' (compressed), '.ffpfs' (uncompressed) and '.pkg' — an
@@ -2321,13 +2321,6 @@ class PackDialog(ctk.CTkToplevel):
         self.hdr_var    = tk.StringVar(value=_hdr_mode(fp.get("hdr_flag", "auto")))   # auto | on | off
         self.regen_var  = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
         self.sign_var   = tk.BooleanVar(value=bool(fp.get("fake_sign", True)))
-        # Backport (opt-in): lower SDK words to a public target so the build runs on
-        # older firmwares. The library folder is the user's own patched sprx set.
-        # Never bundled with this app; empty by default.
-        _bt = fp.get("backport_target")
-        self.backport_target_var = tk.StringVar(value=_bt if _bt in ("7.61", "6.02", "10.xx") else "off")
-        self.backport_libs_var = tk.StringVar(value=str(fp.get("backport_libs", "") or ""))
-        self.backport_hint_var = tk.StringVar(value=self._BACKPORT_HINTS["off"])
         self.back_hint = tk.StringVar()
         self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
         self.ident_head = tk.StringVar(value=self._IDENT_HEAD_FALLBACK)
@@ -2508,36 +2501,6 @@ class PackDialog(ctk.CTkToplevel):
                       ).pack(anchor="w", padx=10, pady=(0, 8))
         for _v in (self.cid_var, self.tid_var):
             _v.trace_add("write", lambda *_: self._update_summary())
-
-        # ── Backport (always visible; applies to pack AND pkg) ──
-        # Two knobs: a target firmware and a folder with the user's patched Sony
-        # libraries. The libraries are NEVER shipped with this app — the user
-        # extracts them from their own firmware and applies the public patches
-        # themselves. See backport-landscape-2026-09-28.md for what each target
-        # covers, and the readme entry linked from the hint below.
-        self.brow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
-        self.brow.pack(fill="x", padx=20, pady=4)
-        _bhead = ctk.CTkFrame(self.brow, fg_color=PANEL); _bhead.pack(fill="x", padx=10, pady=(6, 2))
-        ctk.CTkLabel(_bhead, text="Backport to firmware:", text_color=WHITE, width=180, anchor="w",
-                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        ctk.CTkSegmentedButton(_bhead, values=["off", "7.61", "6.02", "10.xx"],
-                                variable=self.backport_target_var,
-                                selected_color=GREEN, selected_hover_color=GREEN2,
-                                command=lambda *_: self._on_backport_target_changed()).pack(side="left")
-        _blibs = ctk.CTkFrame(self.brow, fg_color=PANEL); _blibs.pack(fill="x", padx=10, pady=(2, 2))
-        ctk.CTkLabel(_blibs, text="Patched libraries folder:", text_color=MUTED, width=180, anchor="w",
-                      font=ctk.CTkFont(size=11)).pack(side="left")
-        self._backport_entry = ctk.CTkEntry(_blibs, textvariable=self.backport_libs_var,
-                                             fg_color=CARD2, text_color=WHITE)
-        self._backport_entry.pack(side="left", fill="x", expand=True)
-        self._backport_btn = ctk.CTkButton(_blibs, text="Folder…", width=76, fg_color=CARD2,
-                                            hover_color=GREEN2, text_color=WHITE,
-                                            command=self._pick_backport_libs)
-        self._backport_btn.pack(side="left", padx=(6, 0))
-        ctk.CTkLabel(self.brow, textvariable=self.backport_hint_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=11), wraplength=620, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(0, 6))
-        self._on_backport_target_changed()   # apply initial disabled/enabled state
 
         # ── Buttons ──
         self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
@@ -2747,25 +2710,6 @@ class PackDialog(ctk.CTkToplevel):
         if p:
             self.out_var.set(p)
 
-    def _pick_backport_libs(self):
-        p = filedialog.askdirectory(parent=self, title="Select the folder with your PATCHED PS5 libraries")
-        if p:
-            self.backport_libs_var.set(p)
-
-    def _on_backport_target_changed(self):
-        """Sync the hint line to the selected target and enable/disable the libs
-        picker. Called on segment change and once at build time so the initial
-        state matches whatever the item carried."""
-        v = self.backport_target_var.get()
-        self.backport_hint_var.set(self._BACKPORT_HINTS.get(v, self._BACKPORT_HINTS["off"]))
-        enabled = v != "off"
-        try:
-            state = "normal" if enabled else "disabled"
-            self._backport_entry.configure(state=state)
-            self._backport_btn.configure(state=state)
-        except Exception:
-            pass
-
     # ── hints + identity pre-fill ────────────────────────────────────────────
     def _on_source_changed(self):
         raw = (self.src_var.get() or "").strip()
@@ -2935,13 +2879,10 @@ class PackDialog(ctk.CTkToplevel):
         back  = self.back_var.get() if self.back_var.get() in self._BACKEND else "builtin"
         level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)
         dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
-        bt = self.backport_target_var.get()
         return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
                 "inner": inner, "backend": back, "level": level, "dll": dll,
                 "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
-                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get()),
-                "backport_target": bt if bt in ("7.61", "6.02", "10.xx") else None,
-                "backport_libs": (self.backport_libs_var.get() or "").strip()}
+                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get())}
 
     # ── commit ───────────────────────────────────────────────────────────────
     def _add(self):
@@ -2987,31 +2928,14 @@ class PackDialog(ctk.CTkToplevel):
             save_settings({"fpkg_defaults": self.app.fpkg_defaults})
 
         organize = bool(self.organize_var.get())
-        # Backport applies to every pack / pkg job the dialog produces; capture it once
-        # even when the fPKG params dict was not built (mkpfs pack path). Empty string
-        # rather than a missing key so the loop below is uniform.
-        _bt = self.backport_target_var.get()
-        _backport_pair = {
-            "backport_target": _bt if _bt in ("7.61", "6.02", "10.xx") else None,
-            "backport_libs_root": (self.backport_libs_var.get() or "").strip() or None,
-        }
         if self.edit_item is not None:
             self._save_edit(src, outf, fmt, params, organize)
-            for k, v in _backport_pair.items():
-                setattr(self.edit_item, k, v)
             return
 
         # ── Add mode ─────────────────────────────────────────────────────────
         self.app.output_var.set(outf)
         self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
         self.app.auto_organize_var.set(organize)   # likewise remembered + snapshotted onto the item(s)
-        # Helper: apply the backport pair to any newly added items. Used by every
-        # add-mode exit below so the pack (mkpfs) path picks it up too, not just fpkg.
-        def _tag(items):
-            for it in items:
-                for k, v in _backport_pair.items():
-                    setattr(it, k, v)
-
         # Same-format copy job: skip the whole build path — enqueue a copy item and remember
         # the "delete source after copy" default the user just picked.
         if same_fmt_copy:
@@ -3021,7 +2945,6 @@ class PackDialog(ctk.CTkToplevel):
                                            auto_organize=organize, parent=self)
             if item is None:
                 return
-            _tag([item])
             self.app.queue.append(item)
             self.app.update_queue_box(select_item=item)
             action = "Move (same-drive rename) or copy+delete (cross-drive)" if delete_src else "Copy (source kept)"
@@ -3037,7 +2960,6 @@ class PackDialog(ctk.CTkToplevel):
             if item is None:
                 return
             item.auto_organize = organize
-            _tag([item])
             self.app.queue.append(item)
             self.app.update_queue_box(select_item=item)
             kind = "image"
@@ -3070,12 +2992,8 @@ class PackDialog(ctk.CTkToplevel):
             self.app.unpack_mode_var.set(False)
         except Exception:
             pass
-        # Track how many items existed so any freshly enqueued ones (folder scans, archive
-        # placeholders) can be tagged with the backport pair after add_source_to_queue returns.
-        _before = len(self.app.queue)
         self.destroy()
         self.app.add_source_to_queue()
-        _tag(self.app.queue[_before:])
 
     def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None, organize: bool = True) -> None:
         """Edit mode: mutate in place when the source and the job kind are unchanged;
@@ -3140,6 +3058,571 @@ class PackDialog(ctk.CTkToplevel):
         self.app.log("OK", f"Job replaced: {it.name} → {new_item.name}"
                            + ("  (now an fPKG build)" if fmt == "pkg" and not was_fpkg else "")
                            + (f"  (now a pack → .{fmt})" if fmt != "pkg" and was_fpkg else ""))
+        self.destroy()
+
+
+class JobDialog(ctk.CTkToplevel):
+    """One job, three groups: 1. source → 2. change the content → 3. output.
+
+    Every job the app can run is a source (folder, parent folder, archive, disk image,
+    .ffpfs, .ffpfsc, .pkg), an optional set of content changes (patch → backport → sign)
+    and an output format (folder / .ffpfs / .ffpfsc / .pkg). The sentence above the Add
+    button says what the queue will do, and the queue row carries the same sentence. The
+    backend's --to chain does the work (see cli.py CHAIN MODE); GameItem.from_chain is the
+    item. Look inside (the PFS browser) is a peek, not a job — a link under the source.
+    Edit mode (item given) refills the dialog and swaps the item in place."""
+
+    _TARGET_LABEL = {"folder": "Folder", "ffpfs": ".ffpfs", "ffpfsc": ".ffpfsc", "pkg": ".pkg"}
+    _TARGET_KEY = {v: k for k, v in _TARGET_LABEL.items()}
+    _SOURCE_HINT = ("Game folder, parent folder of games, archive (.zip/.rar/.7z), disk image "
+                    "(.exfat/.ffpkg), .ffpfs, .ffpfsc or .pkg")
+    _BACKPORT_HINTS = {
+        "7.61":  "7.61 — public library patches exist for this target",
+        "6.02":  "6.02 — experimental: a smaller public library set, only some titles run",
+        "10.xx": "10.xx — SDK only, no library bundle; for a game newer than the console",
+    }
+    _KIND_LABEL = {"folder": "Game folder", "parent": "Parent folder", "archive": "Archive",
+                   "exfat": "exFAT disk image", "ffpkg": "ffpkg disk image", "ffpfs": ".ffpfs image",
+                   "ffpfsc": ".ffpfsc image", "pkg": "PS5 package (.pkg)"}
+
+    def __init__(self, app, item=None, init_src: str | None = None):
+        super().__init__(app.root)
+        self.app = app
+        self.edit_item = item
+        self.title("Edit job" if item else "Add job")
+        self.geometry("780x760")
+        self.minsize(640, 520)
+        self.configure(fg_color=BLACK)
+        self.transient(app.root)
+        self.lift()
+        self.after(50, self.grab_set)
+
+        settings = load_settings()
+        self._defaults = dict(settings.get("job_dialog_defaults", {}) or {})
+        self._defaults_kind = None          # the source kind whose remembered choices are applied
+        self._kind = "none"
+        self._games: list[Path] = []
+        self._check_thread = None
+
+        src0 = init_src or ""
+        if item is not None:
+            src0 = str(getattr(item, "archive_path", None) or getattr(item, "path", "") or "")
+        self.src_var = tk.StringVar(value=src0)
+        self.detect_var = tk.StringVar(value=self._SOURCE_HINT)
+        self.sign_var = tk.BooleanVar(value=bool(getattr(item, "chain_sign", False)) if item else False)
+        self.patch_on_var = tk.BooleanVar(value=bool(getattr(item, "patch_source", None)) if item else False)
+        self.patch_var = tk.StringVar(value=str(getattr(item, "patch_source", "") or "") if item else "")
+        self.backport_on_var = tk.BooleanVar(value=bool(getattr(item, "backport_target", None)) if item else False)
+        _bt0 = (getattr(item, "backport_target", None) if item else None) or settings.get("backport_target_default") or "7.61"
+        self.backport_target_var = tk.StringVar(value=_bt0 if _bt0 in self._BACKPORT_HINTS else "7.61")
+        _libs0 = (getattr(item, "backport_libs_root", None) if item else None) or settings.get("backport_libs_root") or ""
+        self.backport_libs_var = tk.StringVar(value=str(_libs0))
+        self.backport_hint_var = tk.StringVar(value="")
+        self.check_var = tk.StringVar(value="")
+        self.to_var = tk.StringVar(value=self._TARGET_LABEL.get(getattr(item, "chain_to", None) or "ffpfsc", ".ffpfsc"))
+        out0 = str(getattr(item, "output_path", "") or "") if item else (app.output_var.get() or "").strip()
+        self.out_var = tk.StringVar(value=out0)
+        _org = getattr(item, "auto_organize", None) if item else None
+        self.organize_var = tk.BooleanVar(value=bool(app.auto_organize_var.get()) if _org is None else bool(_org))
+        self.keep_source_var = tk.BooleanVar(value=not bool(getattr(item, "copy_delete_source", True)) if item else False)
+        fp = app._fpkg_params_of(item) if item else dict(app.fpkg_defaults)
+        self.retail_var = tk.BooleanVar(value=bool(fp.get("retail_normalize", True)))
+        self.hdr_var = tk.StringVar(value=_hdr_mode(fp.get("hdr_flag", "auto")))
+        self.regen_var = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
+        try:
+            _lvl = int(fp.get("level", 7))
+        except Exception:
+            _lvl = 7
+        self.speed_var = tk.StringVar(value="fast" if _lvl < 0 else "normal")
+        self.summary_var = tk.StringVar(value="")
+        self.summary_dest_var = tk.StringVar(value="")
+
+        self._build()
+        self.src_var.trace_add("write", lambda *_: self._on_source_changed())
+        for v in (self.sign_var, self.patch_on_var, self.patch_var, self.backport_on_var,
+                  self.backport_target_var, self.backport_libs_var, self.to_var, self.out_var,
+                  self.organize_var, self.keep_source_var):
+            v.trace_add("write", lambda *_: self._refresh())
+        self.bind("<Return>", lambda e: self._add())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._on_source_changed()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+    def _group(self, number: str, title: str, hint: str = ""):
+        row = ctk.CTkFrame(self.body, fg_color=PANEL, corner_radius=8)
+        row.pack(fill="x", padx=20, pady=5)
+        head = ctk.CTkFrame(row, fg_color=PANEL); head.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(head, text=number, width=22, height=22, corner_radius=11, fg_color=GREEN,
+                      text_color="#061006", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+        ctk.CTkLabel(head, text=title, text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold")
+                      ).pack(side="left", padx=(8, 10))
+        if hint:
+            ctk.CTkLabel(head, text=hint, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        return row
+
+    def _build(self):
+        head = "✎  Edit job" if self.edit_item else "➕  Add job"
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=18, weight="bold"), text_color=GREEN
+                      ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text="Pick a source, choose what to change in it, choose what comes out. "
+                                "The line above the button says what the queue will do.",
+                      text_color=MUTED, wraplength=720, justify="left").pack(anchor="w", padx=20, pady=(0, 6))
+        self.body = ctk.CTkScrollableFrame(self, fg_color=BLACK)
+        self.body.pack(fill="both", expand=True)
+
+        # 1 · Source
+        srow = self._group("1", "Source", "folder, parent folder, archive, disk image, .ffpfs, .ffpfsc or .pkg")
+        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(sinner, text="📄  File…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_file).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(sinner, text="📁  Folder…", width=88, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_folder).pack(side="left", padx=(6, 0))
+        dline = ctk.CTkFrame(srow, fg_color=PANEL); dline.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(dline, textvariable=self.detect_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=560, justify="left").pack(side="left")
+        self._look_btn = ctk.CTkButton(dline, text="🔎  Look inside…", width=120, height=24, fg_color="transparent",
+                                       hover_color=CARD2, text_color=GREEN, font=ctk.CTkFont(size=11),
+                                       command=self._look_inside)
+
+        # 2 · Change the content
+        crow = self._group("2", "Change the content", "optional · applied in this order")
+        cin = ctk.CTkFrame(crow, fg_color=PANEL); cin.pack(fill="x", padx=10, pady=(2, 6))
+        # Patch
+        prow = ctk.CTkFrame(cin, fg_color=PANEL); prow.pack(fill="x", pady=1)
+        ctk.CTkCheckBox(prow, text="Integrate a patch", variable=self.patch_on_var, checkbox_width=18, checkbox_height=18,
+                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkLabel(prow, text="merge an update (folder, .zip or .rar) into the game", text_color=MUTED,
+                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
+        self._patch_opts = ctk.CTkFrame(cin, fg_color=PANEL)
+        pin = ctk.CTkFrame(self._patch_opts, fg_color=PANEL); pin.pack(fill="x", padx=(26, 0), pady=(0, 4))
+        ctk.CTkLabel(pin, text="Patch:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkEntry(pin, textvariable=self.patch_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(pin, text="File…", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_patch_file).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(pin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_patch_folder).pack(side="left", padx=(6, 0))
+        # Backport
+        brow = ctk.CTkFrame(cin, fg_color=PANEL); brow.pack(fill="x", pady=1)
+        ctk.CTkCheckBox(brow, text="Backport", variable=self.backport_on_var, checkbox_width=18, checkbox_height=18,
+                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkLabel(brow, text="lower the SDK so the game runs on an older firmware", text_color=MUTED,
+                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
+        self._backport_opts = ctk.CTkFrame(cin, fg_color=PANEL)
+        b1 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b1.pack(fill="x", padx=(26, 0), pady=(0, 2))
+        ctk.CTkLabel(b1, text="Target firmware:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkSegmentedButton(b1, values=["7.61", "6.02", "10.xx"], variable=self.backport_target_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
+        ctk.CTkLabel(b1, textvariable=self.backport_hint_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=380, justify="left").pack(side="left", padx=(10, 0))
+        b2 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b2.pack(fill="x", padx=(26, 0), pady=2)
+        ctk.CTkLabel(b2, text="Patched libraries:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkEntry(b2, textvariable=self.backport_libs_var, fg_color=CARD2, text_color=WHITE,
+                     placeholder_text="optional — your own patched system libraries for this target").pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(b2, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                       command=self._pick_backport_libs).pack(side="left", padx=(6, 0))
+        b3 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b3.pack(fill="x", padx=(26, 0), pady=(2, 4))
+        ctk.CTkLabel(b3, text="Compatibility:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        self._check_btn = ctk.CTkButton(b3, text="Check", width=72, height=26, fg_color=CARD2, hover_color=GREEN2,
+                                        text_color=WHITE, command=self._check_compat)
+        self._check_btn.pack(side="left")
+        ctk.CTkLabel(b3, textvariable=self.check_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=440, justify="left").pack(side="left", padx=(10, 0))
+        # Sign
+        sgrow = ctk.CTkFrame(cin, fg_color=PANEL); sgrow.pack(fill="x", pady=1)
+        self._sign_cb = ctk.CTkCheckBox(sgrow, text="Sign executables", variable=self.sign_var, checkbox_width=18,
+                                        checkbox_height=18, fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
+                                        font=ctk.CTkFont(size=12))
+        self._sign_cb.pack(side="left")
+        self._sign_note = tk.StringVar(value="fake-sign eboot.bin and every prx/sprx")
+        ctk.CTkLabel(sgrow, textvariable=self._sign_note, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
+
+        # 3 · Output
+        orow = self._group("3", "Output")
+        oin = ctk.CTkFrame(orow, fg_color=PANEL); oin.pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkSegmentedButton(oin, values=[self._TARGET_LABEL[k] for k in ("folder", "ffpfs", "ffpfsc", "pkg")],
+                                variable=self.to_var, selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
+        self._to_hint = tk.StringVar(value="")
+        ctk.CTkLabel(oin, textvariable=self._to_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=420, justify="left").pack(side="left", padx=(10, 0))
+        fin = ctk.CTkFrame(orow, fg_color=PANEL); fin.pack(fill="x", padx=10, pady=(4, 2))
+        ctk.CTkLabel(fin, text="Folder:", text_color=MUTED, width=60, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        self._out_entry = ctk.CTkEntry(fin, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE)
+        self._out_entry.pack(side="left", fill="x", expand=True)
+        self._out_btn = ctk.CTkButton(fin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
+                                      command=self._pick_out)
+        self._out_btn.pack(side="left", padx=(6, 0))
+        oline = ctk.CTkFrame(orow, fg_color=PANEL); oline.pack(fill="x", padx=10, pady=(2, 6))
+        self._organize_cb = ctk.CTkCheckBox(oline, text="Auto-organize — folder and file named from the game's own metadata",
+                                            variable=self.organize_var, checkbox_width=18, checkbox_height=18,
+                                            fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+        self._organize_cb.pack(side="left")
+        self._keep_cb = ctk.CTkCheckBox(oline, text="Keep the source (cross-drive copy)", variable=self.keep_source_var,
+                                        checkbox_width=18, checkbox_height=18, fg_color=GREEN, hover_color=GREEN2,
+                                        text_color=WHITE, font=ctk.CTkFont(size=11))
+        # .pkg options — shown only when .pkg is the output
+        self._pkg_opts = ctk.CTkFrame(orow, fg_color=PANEL)
+        p1 = ctk.CTkFrame(self._pkg_opts, fg_color=PANEL); p1.pack(fill="x", padx=10, pady=(0, 2))
+        ctk.CTkLabel(p1, text=".pkg options:", text_color=MUTED, width=100, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        for _var, _text in ((self.retail_var, "Retail fixes"), (self.regen_var, "Rebuild PlayGo")):
+            ctk.CTkCheckBox(p1, text=_text, variable=_var, checkbox_width=18, checkbox_height=18, fg_color=GREEN,
+                            hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(p1, text="HDR:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(6, 6))
+        ctk.CTkSegmentedButton(p1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=GREEN,
+                                selected_hover_color=GREEN2, height=24).pack(side="left")
+        ctk.CTkLabel(p1, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 6))
+        ctk.CTkSegmentedButton(p1, values=["normal", "fast"], variable=self.speed_var, selected_color=GREEN,
+                                selected_hover_color=GREEN2, height=24).pack(side="left")
+        ctk.CTkLabel(self._pkg_opts, text="Defaults are the configuration verified on a console. HDR auto keeps what the "
+                                          "game declares. Executables are always signed for a .pkg.",
+                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=700, justify="left"
+                      ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        # Summary + buttons (outside the scroll area, always visible)
+        foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(6, 12))
+        ctk.CTkLabel(foot, textvariable=self.summary_var, text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold"),
+                      wraplength=720, justify="left").pack(anchor="w")
+        ctk.CTkLabel(foot, textvariable=self.summary_dest_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=720, justify="left").pack(anchor="w", pady=(0, 6))
+        btns = ctk.CTkFrame(foot, fg_color=BLACK); btns.pack(fill="x")
+        self._add_btn = ctk.CTkButton(btns, text="💾  Save changes" if self.edit_item else "➕  Add to queue",
+                                      fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
+                                      font=ctk.CTkFont(size=14, weight="bold"), command=self._add)
+        self._add_btn.pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
+                       command=self.destroy).pack(side="right")
+
+    # ── pickers ──────────────────────────────────────────────────────────────
+    def _pick_file(self):
+        p = filedialog.askopenfilename(parent=self, title="Choose a source file",
+                                       filetypes=[("PS5 sources", "*.ffpfsc *.ffpfs *.pkg *.exfat *.ffpkg *.zip *.rar *.7z"),
+                                                  ("All files", "*.*")])
+        if p:
+            self.src_var.set(p)
+
+    def _pick_folder(self):
+        p = filedialog.askdirectory(parent=self, title="Choose a game folder or a parent folder of games")
+        if p:
+            self.src_var.set(p)
+
+    def _pick_patch_file(self):
+        p = filedialog.askopenfilename(parent=self, title="Choose the patch archive",
+                                       filetypes=[("Patch archives", "*.zip *.rar"), ("All files", "*.*")])
+        if p:
+            self.patch_var.set(p)
+
+    def _pick_patch_folder(self):
+        p = filedialog.askdirectory(parent=self, title="Choose the patch folder")
+        if p:
+            self.patch_var.set(p)
+
+    def _pick_backport_libs(self):
+        p = filedialog.askdirectory(parent=self, title="Choose the folder with your patched PS5 libraries")
+        if p:
+            self.backport_libs_var.set(p)
+
+    def _pick_out(self):
+        p = filedialog.askdirectory(parent=self, title="Choose the output folder for this job")
+        if p:
+            self.out_var.set(p)
+
+    def _look_inside(self):
+        p = Path((self.src_var.get() or "").strip())
+        if p.is_file():
+            PfsBrowserDialog(self.app, image_path=str(p))
+
+    # ── detection ────────────────────────────────────────────────────────────
+    def _to_key(self) -> str:
+        return self._TARGET_KEY.get(self.to_var.get(), "ffpfsc")
+
+    @staticmethod
+    def _sdk_text(folder: Path) -> str:
+        """'SDK 8.00' read from eboot.bin's SCE param segment, '' when unreadable."""
+        try:
+            eboot = folder / "eboot.bin"
+            if not eboot.is_file():
+                return ""
+            with open(eboot, "rb") as f:
+                head = f.read(4 << 20)
+            _bd = str(backend_base_dir())
+            if _bd not in sys.path:
+                sys.path.insert(0, _bd)
+            import backport as _bp
+            hit = _bp._find_param_segment(head)
+            if hit is None:
+                return ""
+            word = struct.unpack_from("<I", head, hit[1] + 0x14)[0]
+            return f"SDK {word >> 24:X}.{(word >> 16) & 0xFF:02X}"
+        except Exception:
+            return ""
+
+    def _on_source_changed(self):
+        raw = (self.src_var.get() or "").strip()
+        p = Path(raw) if raw else None
+        self._games = []
+        self.check_var.set("")
+        try:
+            self._look_btn.pack_forget()
+        except Exception:
+            pass
+        if not p or not p.exists():
+            self._kind = "none"
+            self.detect_var.set(self._SOURCE_HINT if not raw else "Not found")
+            self._refresh(); return
+        if p.is_dir():
+            if is_game_folder(p):
+                self._kind = "folder"; self._games = [p]
+                bits = [self._KIND_LABEL["folder"], parse_title_id(p) or "no title id"]
+                ver = ""
+                try:
+                    pj = json.loads((p / "sce_sys" / "param.json").read_text(encoding="utf-8-sig", errors="replace"))
+                    ver = str(pj.get("contentVersion") or pj.get("masterVersion") or "")
+                except Exception:
+                    pass
+                if ver:
+                    bits.append(f"v{ver}")
+                sdk = self._sdk_text(p)
+                if sdk:
+                    bits.append(sdk)
+                if (p / "fakelib").is_dir():
+                    bits.append("fakelib present")
+                self.detect_var.set(" · ".join(bits))
+            else:
+                games = find_game_folders(p)
+                if games:
+                    self._kind = "parent"; self._games = games
+                    self.detect_var.set(f"{self._KIND_LABEL['parent']} · {len(games)} game folder(s) — one job each")
+                else:
+                    self._kind = "folder-unknown"
+                    self.detect_var.set("Folder without eboot.bin + sce_sys — not a PS5 game folder")
+        else:
+            suf = p.suffix.lower()
+            kind = {".exfat": "exfat", ".ffpkg": "ffpkg", ".ffpfs": "ffpfs", ".ffpfsc": "ffpfsc", ".pkg": "pkg"}.get(suf)
+            if kind is None and (suf in (".zip", ".rar", ".7z", ".r00") or re.match(r"^\.r\d{2,}$", suf)
+                                 or re.search(r"\.part\d+\.rar$", p.name, re.I)):
+                kind = "archive"
+            if kind is None:
+                self._kind = "file-unknown"
+                self.detect_var.set(f"Unsupported file type {suf or '(none)'}")
+                self._refresh(); return
+            self._kind = kind
+            tid = ""
+            _m = re.search(r"[A-Z]{4}[0-9]{5}", p.stem.upper())
+            if _m:
+                tid = _m.group(0)
+            try:
+                size = format_size(p.stat().st_size)
+            except Exception:
+                size = ""
+            self.detect_var.set(" · ".join(x for x in (self._KIND_LABEL[kind], tid, size) if x))
+            if kind in ("ffpfs", "ffpfsc", "pkg"):
+                self._look_btn.pack(side="left", padx=(10, 0))
+        # Remembered choices for this kind of source (add mode only, once per kind).
+        if self.edit_item is None and self._defaults_kind != self._kind:
+            self._defaults_kind = self._kind
+            d = self._defaults.get(self._kind)
+            if d:
+                self.to_var.set(self._TARGET_LABEL.get(d.get("to", "ffpfsc"), ".ffpfsc"))
+                self.sign_var.set(bool(d.get("sign", False)))
+                self.backport_on_var.set(bool(d.get("backport", False)))
+                if d.get("backport_target") in self._BACKPORT_HINTS:
+                    self.backport_target_var.set(d["backport_target"])
+        self._refresh()
+
+    # ── live state ───────────────────────────────────────────────────────────
+    def _stand_in(self, p: Path | None):
+        """A lightweight object with the attributes chain_summary reads — no folder walk."""
+        kind = self._kind
+        return types.SimpleNamespace(
+            path=p, archive_path=(p if kind == "archive" else None),
+            chain_to=self._to_key(), chain_sign=bool(self.sign_var.get()) and self._to_key() != "pkg",
+            patch_source=(self.patch_var.get().strip() if self.patch_on_var.get() else None),
+            backport_target=(self.backport_target_var.get() if self.backport_on_var.get() else None))
+
+    def _refresh(self):
+        to = self._to_key()
+        # progressive disclosure
+        (self._patch_opts.pack(fill="x") if self.patch_on_var.get() else self._patch_opts.pack_forget())
+        (self._backport_opts.pack(fill="x") if self.backport_on_var.get() else self._backport_opts.pack_forget())
+        (self._pkg_opts.pack(fill="x", pady=(2, 0)) if to == "pkg" else self._pkg_opts.pack_forget())
+        self.backport_hint_var.set(self._BACKPORT_HINTS.get(self.backport_target_var.get(), ""))
+        if to == "pkg":
+            self._sign_cb.configure(state="disabled"); self._sign_note.set("always for a .pkg (the package builder signs)")
+        else:
+            self._sign_cb.configure(state="normal"); self._sign_note.set("fake-sign eboot.bin and every prx/sprx")
+        self._to_hint.set({"folder": "plain /app0 folder — for a folder source: changes in place",
+                           "ffpfs": "uncompressed image — fastest to build and mount, full size",
+                           "ffpfsc": "compressed image — mounts with ShadowMount",
+                           "pkg": "installable package"}.get(to, ""))
+        in_place = (to == "folder" and self._kind in ("folder", "parent"))
+        for w in (self._out_entry, self._out_btn):
+            try:
+                w.configure(state="disabled" if in_place else "normal")
+            except Exception:
+                pass
+        try:
+            same_fmt = (self._kind == to) and not chain_changes(self._stand_in(None if self._kind == "none" else Path(self.src_var.get().strip())))
+            (self._keep_cb.pack(side="left", padx=(16, 0)) if same_fmt else self._keep_cb.pack_forget())
+        except Exception:
+            pass
+        # summary
+        raw = (self.src_var.get() or "").strip()
+        p = Path(raw) if raw else None
+        if self._kind in ("none", "folder-unknown", "file-unknown") or p is None:
+            text = "Choose a source"
+            ok = False
+        else:
+            text = chain_summary(self._stand_in(p))
+            if self._kind == "parent":
+                text += f"  × {len(self._games)} game(s)"
+            ok = not text.startswith("Nothing to do")
+        out = (self.out_var.get() or "").strip()
+        if ok and not in_place and not out:
+            ok = False
+            dest = "Choose an output folder"
+        elif in_place:
+            dest = f"in {p}" if p else ""
+        else:
+            dest = f"→ {out}"
+        self.summary_var.set(text)
+        self.summary_dest_var.set(dest)
+        try:
+            self._add_btn.configure(state="normal" if ok else "disabled")
+        except Exception:
+            pass
+
+    # ── compatibility check (backport analyser, read-only) ───────────────────
+    def _check_compat(self):
+        if self._kind not in ("folder", "parent") or not self._games:
+            self.check_var.set("The check reads a game folder. A container is checked after it is unpacked at build time.")
+            return
+        folder = self._games[0]
+        target = self.backport_target_var.get()
+        libs = (self.backport_libs_var.get() or "").strip()
+        fw = (load_settings().get("fw_libs_root") or "").strip()
+        pycmd = get_backend_python_command()
+        if not pycmd:
+            self.check_var.set("Backend not found."); return
+        cli_py = backend_base_dir() / "cli.py"
+        head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
+        argv = head + ["--backport-analyze", str(folder), "--backport-target", target]
+        if fw:
+            argv += ["--fw-libs-root", fw]
+        if libs:
+            argv += ["--backport-libs", libs]
+        self.check_var.set("Checking…")
+        self._check_btn.configure(state="disabled")
+
+        def work():
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=600)
+                lines = [l for l in (r.stdout or "").splitlines() if l.startswith("[analyse]")]
+                msg = " · ".join(l.replace("[analyse] ", "") for l in lines) or (r.stderr or "").strip()[-300:] or "no result"
+                if not fw:
+                    msg += "  (no firmware library folder set in Settings — only your patched libraries were counted)"
+            except Exception as e:
+                msg = f"check failed: {e}"
+            self.after(0, lambda: (self.check_var.set(msg), self._check_btn.configure(state="normal")))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── commit ───────────────────────────────────────────────────────────────
+    def _add(self):
+        raw = (self.src_var.get() or "").strip()
+        p = Path(raw) if raw else None
+        if not p or not p.exists() or self._kind in ("none", "folder-unknown", "file-unknown"):
+            messagebox.showerror("Source", "Choose a game folder, a parent folder, an archive, a disk image, "
+                                           "a .ffpfs/.ffpfsc or a .pkg.", parent=self); return
+        to = self._to_key()
+        in_place = (to == "folder" and self._kind in ("folder", "parent"))
+        out = (self.out_var.get() or "").strip()
+        if not in_place and not out:
+            messagebox.showerror("Output", "Choose an output folder for this job.", parent=self); return
+        patch = self.patch_var.get().strip() if self.patch_on_var.get() else ""
+        if self.patch_on_var.get() and not (patch and Path(patch).exists()):
+            messagebox.showerror("Patch", "Choose the patch folder or archive to integrate.", parent=self); return
+        target = self.backport_target_var.get() if self.backport_on_var.get() else None
+        libs = (self.backport_libs_var.get() or "").strip() if self.backport_on_var.get() else ""
+        if libs and not Path(libs).is_dir():
+            messagebox.showerror("Backport", "The patched-libraries folder does not exist.", parent=self); return
+        stand = self._stand_in(p)
+        if chain_summary(stand).startswith("Nothing to do"):
+            messagebox.showerror("Nothing to do", "A folder to a folder with no changes is nothing to do.", parent=self); return
+
+        level = -4 if self.speed_var.get() == "fast" else 7
+        pkg_params = {"content_id": "", "title_id": "", "title": "", "version": "01.000.000",
+                      "inner": "kraken", "backend": "builtin", "level": level, "dll": "",
+                      "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
+                      "regen_playgo": bool(self.regen_var.get()), "fake_sign": True,
+                      "backport_target": target, "backport_libs": libs}
+        organize = bool(self.organize_var.get())
+        keep = bool(self.keep_source_var.get())
+
+        # Remember the choices for this kind of source, and the backport folder globally.
+        self._defaults[self._kind] = {"to": to, "sign": bool(self.sign_var.get()),
+                                      "backport": bool(self.backport_on_var.get()),
+                                      "backport_target": self.backport_target_var.get()}
+        upd = {"job_dialog_defaults": self._defaults}
+        if libs:
+            upd["backport_libs_root"] = libs
+        if target:
+            upd["backport_target_default"] = target
+        try:
+            save_settings(upd)
+        except Exception:
+            pass
+        if to == "pkg":
+            self.app.fpkg_defaults = {k: pkg_params[k] for k in ("inner", "backend", "level", "retail_normalize",
+                                                                "hdr_flag", "regen_playgo", "fake_sign")}
+            self.app.fpkg_defaults["v1112"] = True
+        if out:
+            self.app.output_var.set(out)
+        self.app.auto_organize_var.set(organize)
+
+        sources = self._games if self._kind in ("folder", "parent") else [p]
+        made = []
+        for s in sources:
+            try:
+                it = GameItem.from_chain(s, to=to, output_path=out or None,
+                                         sign=bool(self.sign_var.get()) and to != "pkg",   # a .pkg is always signed by its builder
+                                         patch_source=patch or None, backport_target=target,
+                                         backport_libs_root=libs or None, delete_source=not keep)
+            except Exception as e:
+                messagebox.showerror("Source", f"Could not read {s}:\n{e}", parent=self); return
+            if to == "pkg":
+                self.app._apply_fpkg_params(it, pkg_params)
+            it.auto_organize = organize
+            made.append(it)
+        if not made:
+            return
+
+        if self.edit_item is not None:
+            old = self.edit_item
+            new = made[0]
+            for attr in ("display_name", "bundle_subfolder", "password"):
+                if getattr(old, attr, None) is not None and getattr(new, attr, None) is None:
+                    setattr(new, attr, getattr(old, attr))
+            if getattr(old, "status", "") not in ("Done",):
+                new.status = "Pending Extract" if getattr(new, "archive_path", None) else "Queued"
+            try:
+                idx = self.app.queue.index(old)
+                self.app.queue[idx] = new
+            except ValueError:
+                self.app.queue.append(new)
+            self.app.update_queue_box(select_item=new)
+            self.app.log("OK", f"Job updated: {chain_summary(new)} — {new.display_name or new.name}")
+            self.destroy(); return
+
+        for it in made:
+            self.app.queue.append(it)
+            try:
+                if getattr(it, "archive_path", None):
+                    self.app._resolve_archive_password(it)
+            except Exception:
+                pass
+        self.app.update_queue_box(select_item=made[-1])
+        what = chain_summary(made[0]) + (f" × {len(made)}" if len(made) > 1 else "")
+        self.app.log("OK", f"Queued: {what} — {made[0].display_name or made[0].name}"
+                           + (f" (+{len(made) - 1} more)" if len(made) > 1 else "") + ".  Press ▶ START to run.")
         self.destroy()
 
 
@@ -4406,7 +4889,8 @@ class App:
         jobbar.pack(fill="x", padx=14, pady=(12, 6))
         ctk.CTkLabel(jobbar, text="Add job:", text_color=WHITE,
                       font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 12))
-        self._button(jobbar, "📦  Pack",    self.open_pack_dialog,   green=True, width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "➕  Add job", self.open_job_dialog,    green=True, width=118).pack(side="left", padx=(0, 8))
+        self._button(jobbar, "📦  Pack",    self.open_pack_dialog,               width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🔄  Convert", self.open_converter,                 width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🩹  Patch",   self._open_patch_dialog,             width=118).pack(side="left", padx=(0, 8))
         self._button(jobbar, "🖊  Sign",    self.fake_sign_folder,               width=118).pack(side="left", padx=(0, 8))
@@ -4968,6 +5452,10 @@ class App:
     def open_pfs_browser(self):
         PfsBrowserDialog(self)
 
+    def open_job_dialog(self, init_src: str | None = None):
+        """The one door for every job: source → change the content → output (JobDialog)."""
+        JobDialog(self, init_src=init_src)
+
     def fake_sign_folder(self):
         """Fake Sign job: pick a decrypted PS5 dump folder and ADD it to the queue as a
         fake-sign job (eboot.bin / .elf / .prx / .sprx are signed in place when it runs).
@@ -5049,6 +5537,14 @@ class App:
             paths = self.root.tk.splitlist(event.data)
         except Exception:
             paths = [event.data]
+        # One dropped path opens the job dialog with it as the source — the user then says
+        # what to change and what comes out. Several paths at once keep the batch path
+        # below (remembered format), so a whole library can still be dropped in one go.
+        if len(paths) == 1:
+            p = Path(str(paths[0]).strip("{}").strip())
+            if not p.exists():
+                self.log("WARN", f"Dropped path not found: {p}"); return
+            self.open_job_dialog(init_src=str(p)); return
         for raw in paths:
             p = Path(raw.strip("{}").strip())
             if not p.exists():
@@ -6568,7 +7064,9 @@ class App:
 
         op = getattr(item, "operation", "pack")
         try:
-            if op in ("pack", "fpkg-build"):
+            if op == "chain":
+                JobDialog(self, item=item)
+            elif op in ("pack", "fpkg-build"):
                 PackDialog(self, item=item)     # fPKG is the Pack dialog's third format
             elif op == "patch":
                 PatchDialog(self, item=item)
@@ -7174,7 +7672,7 @@ class App:
             _fmt = "ffpfsc"
         for _it in self.queue:
             _op = getattr(_it, "operation", "pack")
-            if _gout and getattr(_it, "output_path", None) is None and _op in ("pack", "unpack"):
+            if _gout and getattr(_it, "output_path", None) is None and _op in ("pack", "unpack", "chain"):
                 _it.output_path = Path(_gout)
             # Format is per-job: snapshot the remembered default onto a fresh pack item once.
             # With '.pkg' remembered the fresh pack item becomes an fPKG build job — this is
@@ -7188,7 +7686,7 @@ class App:
                                       identity=self._take_pending_fpkg_identity(_it))
                 _it.output_compressed = (_fmt != "ffpfs")
             # Auto-organize is per job too: snapshot the remembered default once.
-            if _op in ("pack", "fpkg-build") and getattr(_it, "auto_organize", None) is None:
+            if _op in ("pack", "fpkg-build", "chain") and getattr(_it, "auto_organize", None) is None:
                 _it.auto_organize = bool(self.auto_organize_var.get())
         self._save_queue()   # persist the (just-mutated) queue across restarts
         # Decide which item to keep selected
@@ -7222,10 +7720,17 @@ class App:
                      "fake-sign": "SIGN   ",
                      "fpkg-extract": "fPKG-EX",
                      "fpkg-build":   "fPKG-BD",
-                     "copy":         "COPY   "}.get(opn, "PACK   ")
+                     "copy":         "COPY   ",
+                     "chain":        ("→ " + CHAIN_TARGET_LABEL.get(getattr(item, "chain_to", ""), "?")).ljust(7)
+                     }.get(opn, "PACK   ")
             # Per-job detail: jobs that don't have a meaningful source size show their
             # target/mode instead of "0 B".
-            if opn == "fake-sign":
+            if opn == "chain":
+                _ch = ", ".join(chain_changes(item)) or "no changes"
+                _sz = (f"~{format_size(display_size(item))}" if shows_extracted_size(item)
+                       else format_size(getattr(item, "size", 0) or 0))
+                detail = f"{_ch}  ·  {_sz}"
+            elif opn == "fake-sign":
                 detail = "in place"
             elif opn == "patch":
                 detail = "overwrite" if getattr(item, "patch_overwrite", False) else "→ [patched]"
@@ -7277,6 +7782,8 @@ class App:
                 "fake-sign": "Fake sign",
                 "fpkg-extract": "Extract fPKG",
                 "fpkg-build":   "Build fPKG"}.get(getattr(item, "operation", "pack"), "Pack")
+        if getattr(item, "operation", "pack") == "chain":
+            mode = chain_summary(item)
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")
         # Tell the user which tuning controls the selected job actually honours.
         try:
@@ -7463,6 +7970,121 @@ class App:
         pycmd = get_backend_python_command()
         if not pycmd:
             raise RuntimeError("Python was not found. Install Python, or run the app from source.")
+
+        # ── CHAIN job: source → [patch → backport → sign] → folder/.ffpfs/.ffpfsc/.pkg ──
+        # The one shape the job dialog produces. The backend's --to does the work; this
+        # only names the output the way the matching legacy job would (so a library
+        # built by chains and by old jobs looks the same) and passes the tuning that
+        # applies to the chosen output.
+        if op == "chain":
+            to = getattr(item, "chain_to", None) or "ffpfsc"
+            src = Path(item.path)
+            item._organized_pkg_name = None
+            if to == "folder":
+                if src.is_dir():
+                    out = src                                   # changes in place; nothing is written elsewhere
+                elif not out.name.endswith(" [extracted]"):
+                    out = out / f"{sanitize_filename(src.stem)} [extracted]"
+                run_dir = out
+            elif to == "pkg":
+                if not explicit_file and (self._auto_organize_on(item) or sub):
+                    if self._auto_organize_on(item):
+                        _b, _pkg_name = self._organized_layout(item, out, ".pkg")
+                        if _b is not None:
+                            out = _b
+                            item._organized_pkg_name = _pkg_name
+                        elif sub:
+                            out = self._mirror_base(item, out, sub)
+                    elif sub:
+                        out = self._mirror_base(item, out, sub)
+                run_dir = out
+            else:
+                ext = ".ffpfs" if to == "ffpfs" else ".ffpfsc"
+                if not explicit_file:
+                    base = out
+                    organized_name = None
+                    if self._auto_organize_on(item):
+                        _b, organized_name = self._organized_layout(item, out, ext)
+                        if _b is not None:
+                            base = _b
+                        elif sub:
+                            base = self._mirror_base(item, out, sub)
+                    elif sub:
+                        base = self._mirror_base(item, out, sub)
+                    try:
+                        out = base / (organized_name or descriptive_ffpfsc_name(item, ext=ext))
+                    except Exception:
+                        out = base
+                run_dir = out.parent if out.suffix.lower() in (".ffpfsc", ".ffpfs") else out
+            self._cmd_uncompressed = (to == "ffpfs")
+            try:
+                (out if to in ("folder", "pkg") or not out.suffix else out.parent).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            head = (pycmd + [str(src), str(out)] if getattr(sys, "frozen", False)
+                    else pycmd + ["-u", str(cli_py), str(src), str(out)])
+            cmd = head + ["--to", to]
+            _ps = getattr(item, "patch_source", None)
+            if _ps:
+                cmd += ["--patch", str(_ps)]
+            _bt = getattr(item, "backport_target", None)
+            if _bt in ("7.61", "6.02", "10.xx"):
+                cmd += ["--backport-target", _bt]
+                _blr = getattr(item, "backport_libs_root", None)
+                if _blr:
+                    cmd += ["--backport-libs", str(_blr)]
+            if getattr(item, "chain_sign", False):
+                cmd.append("--sign")
+            if getattr(item, "_build_temp", None) is None:
+                try:
+                    self._resolve_extract_root(item)
+                except Exception:
+                    pass
+            bt = getattr(item, "_build_temp", None)
+            tstr = str(Path(bt)) if bt else str(temp)
+            if tstr:
+                cmd += ["--temp-dir", tstr]
+            if to in ("ffpfs", "ffpfsc"):
+                _cl = self.compression_level_var.get()
+                if _cl != 7:
+                    cmd += ["--compression-level", str(_cl)]
+                _cpu = getattr(item, "_cpu_retry_override", None)
+                if _cpu is None:
+                    _cpu = self.cpu_count_var.get()
+                if _cpu:
+                    cmd += ["--cpu-count", str(_cpu)]
+                _bs = self.block_size_var.get()
+                if _bs and _bs != "auto":
+                    cmd += ["--block-size", _bs]
+                if self.verify_output_var.get():
+                    cmd.append("--verify")
+                out_root = str(_job_out) if _job_out else self.output_var.get().strip()
+                if out_root:
+                    cmd += ["--spool-fallback-dir", out_root]
+                if not bool(getattr(item, "copy_delete_source", True)):
+                    cmd.append("--keep-source")
+            if to == "pkg":
+                cmd += ["--fpkg-inner", str(getattr(item, "fpkg_inner_mode", "kraken") or "kraken"),
+                        "--fpkg-kraken-backend", str(getattr(item, "fpkg_kraken_backend", "builtin") or "builtin")]
+                if not getattr(item, "fpkg_retail_normalize", True):
+                    cmd += ["--fpkg-no-retail-normalize"]
+                _hdr = _hdr_mode(getattr(item, "fpkg_hdr_flag", "auto"))
+                if _hdr != "auto":
+                    cmd += ["--fpkg-hdr-flag", _hdr]
+                if getattr(item, "fpkg_regen_playgo", False):
+                    cmd += ["--fpkg-regen-playgo"]
+                for flag, attr in (("--content-id", "fpkg_content_id"), ("--title-id", "fpkg_title_id"),
+                                   ("--fpkg-title", "fpkg_title"), ("--fpkg-version", "fpkg_version")):
+                    _v = str(getattr(item, attr, "") or "").strip()
+                    if _v and not (attr == "fpkg_version" and _v == "01.000.000"):
+                        cmd += [flag, _v]
+                _lvl = getattr(item, "fpkg_level", None)
+                cmd += ["--compression-level", str(int(7 if _lvl is None else _lvl))]
+            if self.verbose_var.get():
+                cmd.append("--verbose")
+            cmd.append("--overwrite")
+            return cmd, backend, run_dir, temp
 
         # ── FAKE-SIGN job ────────────────────────────────────────────────────
         if op == "fake-sign":
@@ -8385,6 +9007,10 @@ class App:
         # Unpack and fPKG extract write to the output drive only; fake-sign rewrites in
         # place (no temp, no new output). None of them needs the pack space gate.
         if op in ("unpack", "fake-sign", "fpkg-extract"):
+            return "proceed"
+        # A chain that only changes a folder in place, or unpacks to a folder, writes no
+        # inner image — same as the three above.
+        if op == "chain" and getattr(item, "chain_to", None) == "folder":
             return "proceed"
         out_dir = Path(out_dir)
         try:

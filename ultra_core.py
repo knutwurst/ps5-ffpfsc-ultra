@@ -263,6 +263,13 @@ def _item_is_single_pass(item) -> bool:
         ri = getattr(item, "_resume_inner", None)
         if ri and Path(str(ri)).is_file():
             return True
+        # A chain that passes a disk image / .ffpfs straight to the pack path (nothing to
+        # change, a format the pack path takes natively) is the same single pass.
+        if getattr(item, "operation", "pack") == "chain":
+            return (getattr(item, "chain_to", None) in ("ffpfs", "ffpfsc")
+                    and not chain_needs_unpack(item)
+                    and not getattr(item, "archive_path", None)
+                    and Path(getattr(item, "path", "") or "").is_file())
         return (getattr(item, "operation", "pack") == "pack"
                 and getattr(item, "source_kind", "") == "inplace"
                 and not getattr(item, "archive_path", None)
@@ -319,7 +326,84 @@ def _peak_factor_for(item) -> float:
             return PATCH_PEAK_FACTOR
     except Exception:
         pass
+    # A chain that must unpack its container into scratch before repacking holds the
+    # unpacked game AND the inner image at once — the same shape as a patch job.
+    if getattr(item, "operation", "pack") == "chain" and chain_needs_unpack(item):
+        return PATCH_PEAK_FACTOR
     return INPLACE_PEAK_FACTOR if getattr(item, "source_kind", "archive") == "inplace" else ARCHIVE_PEAK_FACTOR
+
+
+# ── chain job helpers (Tk-free; the job dialog and the queue row both use them) ──
+CHAIN_TARGETS = ("folder", "ffpfs", "ffpfsc", "pkg")
+CHAIN_TARGET_LABEL = {"folder": "folder", "ffpfs": ".ffpfs", "ffpfsc": ".ffpfsc", "pkg": ".pkg"}
+ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z", ".r00")
+
+
+def chain_source_kind(item) -> str:
+    """folder | archive | exfat | ffpkg | ffpfs | ffpfsc | pkg | file — what the backend's
+    --to chain will see. An archive placeholder (not yet extracted) is 'archive'."""
+    if getattr(item, "archive_path", None):
+        return "archive"
+    p = Path(str(getattr(item, "path", "") or ""))
+    if not str(p):
+        return "file"
+    if p.is_dir():
+        return "folder"
+    suf = p.suffix.lower()
+    return {".exfat": "exfat", ".ffpkg": "ffpkg", ".ffpfs": "ffpfs",
+            ".ffpfsc": "ffpfsc", ".pkg": "pkg"}.get(suf, suf.lstrip(".") or "file")
+
+
+def chain_changes(item) -> list[str]:
+    """The content changes a chain job applies, in backend order: patch → backport → sign."""
+    out: list[str] = []
+    if getattr(item, "patch_source", None):
+        out.append("patch")
+    if getattr(item, "backport_target", None):
+        out.append(f"backport {item.backport_target}")
+    if getattr(item, "chain_sign", False):
+        out.append("sign")
+    return out
+
+
+def chain_needs_unpack(item) -> bool:
+    """True when the backend must unpack the source into scratch: a container that the
+    target path does not take natively, or any container when something is to change."""
+    kind = chain_source_kind(item)
+    to = getattr(item, "chain_to", None) or "ffpfsc"
+    if kind in ("folder", "archive"):
+        return False
+    if chain_changes(item):
+        return True
+    native = {"ffpfs": {"exfat", "ffpkg", "ffpfs"}, "ffpfsc": {"exfat", "ffpkg", "ffpfs"},
+              "pkg": {"ffpfs", "ffpfsc", "exfat", "ffpkg"}}
+    return kind not in native.get(to, set())
+
+
+def chain_summary(item) -> str:
+    """The sentence the dialog shows above 'Add to queue' and the queue row carries:
+    'Sign, backport to 7.61, then build .ffpfsc' · 'Unpack to folder' · 'Build .pkg' ·
+    'Copy or move (same format)' · 'Sign in place' · 'Nothing to do'."""
+    to = getattr(item, "chain_to", None) or "ffpfsc"
+    kind = chain_source_kind(item)
+    label = CHAIN_TARGET_LABEL.get(to, to)
+    parts: list[str] = []
+    for c in chain_changes(item):
+        if c.startswith("backport "):
+            parts.append("backport to " + c.split(" ", 1)[1])
+        else:
+            parts.append({"patch": "integrate patch", "sign": "sign"}.get(c, c))
+    if not parts:
+        if kind == to == "folder":
+            return "Nothing to do"
+        if kind == to:
+            return "Copy or move (same format)"
+        return "Unpack to folder" if to == "folder" else f"Build {label}"
+    head = ", ".join(parts)
+    head = head[0].upper() + head[1:]
+    if to == "folder":
+        return f"{head} in place" if kind == "folder" else f"{head}, then unpack to folder"
+    return f"{head}, then build {label}"
 
 
 def estimate_peak_space_needed(extracted_size: int, factor: float = ARCHIVE_PEAK_FACTOR,
@@ -2397,6 +2481,8 @@ class GameItem:
     copy_delete_source = True  # copy: delete the source after a successful cross-drive copy
     backport_target = None  # None|"7.61"|"6.02"|"10.xx": lower SDK before pack/fpkg (opt-in)
     backport_libs_root = None  # str: folder of user-supplied patched sprx dropped into fakelib/
+    chain_to = None         # chain job: "folder" | "ffpfs" | "ffpfsc" | "pkg"
+    chain_sign = False      # chain job: fake-sign executables (after patch and backport)
 
     def __init__(self, path: Path):
         self.path       = path
@@ -2576,6 +2662,48 @@ class GameItem:
         return obj
 
     @classmethod
+    def from_chain(cls, source: Path, *, to: str, output_path=None,
+                   sign: bool = False, patch_source=None,
+                   backport_target=None, backport_libs_root=None,
+                   delete_source: bool = True) -> "GameItem":
+        """The one job the job dialog produces: source → [patch → backport → sign] → *to*.
+        The source may be a game folder, a parent folder, an archive (extracted when its
+        turn comes, like a pack), a disk image, a .ffpfs/.ffpfsc or a .pkg. The backend's
+        --to chain resolves it, applies the changes and produces *to*; the GUI only names
+        the output and picks the drives."""
+        src = Path(source)
+        suf = src.suffix.lower() if src.is_file() else ""
+        if src.is_dir():
+            obj = cls(src)                                   # FolderStats, title id, artwork
+        elif suf in ARCHIVE_SUFFIXES or re.match(r"^\.r\d{2,}$", suf):
+            obj = cls.from_archive(src)                      # placeholder until extracted
+        else:
+            obj              = cls.__new__(cls)
+            obj.path         = src
+            obj.archive_path = None
+            obj.name         = src.stem
+            _m = re.search(r"[A-Z]{4}[0-9]{5}", src.stem.upper()) if suf == ".pkg" else None
+            obj.title_id     = _m.group(0) if _m else (parse_title_id(src) or "📦")
+            obj.size         = src.stat().st_size if src.exists() else 0
+            obj.files        = 1
+            obj.artwork      = None
+            obj.status       = "Queued"
+            obj.source_kind  = "inplace"
+            obj.extracted_size = obj.size                    # the container is a floor for the unpacked size
+            obj._is_disk_image = suf in DISK_IMAGE_SUFFIXES
+        obj.operation          = "chain"
+        obj.status             = "Pending Extract" if getattr(obj, "archive_path", None) else "Queued"
+        obj.chain_to           = to if to in CHAIN_TARGETS else "ffpfsc"
+        obj.chain_sign         = bool(sign)
+        obj.patch_source       = Path(patch_source) if patch_source else None
+        obj.backport_target    = backport_target if backport_target in ("7.61", "6.02", "10.xx") else None
+        obj.backport_libs_root = str(backport_libs_root) if backport_libs_root else None
+        obj.copy_delete_source = bool(delete_source)
+        obj.output_path        = Path(output_path) if output_path else None
+        obj.output_compressed  = (obj.chain_to != "ffpfs")
+        return obj
+
+    @classmethod
     def from_fpkg_build(cls, source: Path, *, output_path=None,
                         content_id: str = "",
                         title_id: str = "",
@@ -2708,6 +2836,13 @@ __all__ = [
     "_SETTINGS_CORRUPT_COPY",
     "load_settings",
     "save_settings",
+    "CHAIN_TARGETS",
+    "CHAIN_TARGET_LABEL",
+    "ARCHIVE_SUFFIXES",
+    "chain_source_kind",
+    "chain_changes",
+    "chain_needs_unpack",
+    "chain_summary",
     "is_first_run",
     "get_last_log_lines",
     "ArchiveExtractionCancelled",

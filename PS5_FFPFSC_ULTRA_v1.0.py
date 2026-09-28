@@ -2192,6 +2192,16 @@ def _hdr_mode(v) -> str:
 
 
 class PackDialog(ctk.CTkToplevel):
+    # Hint text shown for each backport target. Kept as a class constant so it
+    # is easy to update when a firmware's status changes (see backport-landscape
+    # research 2026-09-28).
+    _BACKPORT_HINTS = {
+        "off":   "No SDK change. Pack the game as it is.",
+        "7.61":  "Sweet spot — public fakelib patches exist; verified paths in the wider community.",
+        "6.02":  "Experimental — smaller public library set; only some titles run.",
+        "10.xx": "SDK only — no fakelib bundle. For a game whose SDK is newer than the console you target.",
+    }
+
     """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
 
     Three formats: '.ffpfsc' (compressed), '.ffpfs' (uncompressed) and '.pkg' — an
@@ -2311,6 +2321,13 @@ class PackDialog(ctk.CTkToplevel):
         self.hdr_var    = tk.StringVar(value=_hdr_mode(fp.get("hdr_flag", "auto")))   # auto | on | off
         self.regen_var  = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
         self.sign_var   = tk.BooleanVar(value=bool(fp.get("fake_sign", True)))
+        # Backport (opt-in): lower SDK words to a public target so the build runs on
+        # older firmwares. The library folder is the user's own patched sprx set.
+        # Never bundled with this app; empty by default.
+        _bt = fp.get("backport_target")
+        self.backport_target_var = tk.StringVar(value=_bt if _bt in ("7.61", "6.02", "10.xx") else "off")
+        self.backport_libs_var = tk.StringVar(value=str(fp.get("backport_libs", "") or ""))
+        self.backport_hint_var = tk.StringVar(value=self._BACKPORT_HINTS["off"])
         self.back_hint = tk.StringVar()
         self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
         self.ident_head = tk.StringVar(value=self._IDENT_HEAD_FALLBACK)
@@ -2491,6 +2508,36 @@ class PackDialog(ctk.CTkToplevel):
                       ).pack(anchor="w", padx=10, pady=(0, 8))
         for _v in (self.cid_var, self.tid_var):
             _v.trace_add("write", lambda *_: self._update_summary())
+
+        # ── Backport (always visible; applies to pack AND pkg) ──
+        # Two knobs: a target firmware and a folder with the user's patched Sony
+        # libraries. The libraries are NEVER shipped with this app — the user
+        # extracts them from their own firmware and applies the public patches
+        # themselves. See backport-landscape-2026-09-28.md for what each target
+        # covers, and the readme entry linked from the hint below.
+        self.brow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
+        self.brow.pack(fill="x", padx=20, pady=4)
+        _bhead = ctk.CTkFrame(self.brow, fg_color=PANEL); _bhead.pack(fill="x", padx=10, pady=(6, 2))
+        ctk.CTkLabel(_bhead, text="Backport to firmware:", text_color=WHITE, width=180, anchor="w",
+                      font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+        ctk.CTkSegmentedButton(_bhead, values=["off", "7.61", "6.02", "10.xx"],
+                                variable=self.backport_target_var,
+                                selected_color=GREEN, selected_hover_color=GREEN2,
+                                command=lambda *_: self._on_backport_target_changed()).pack(side="left")
+        _blibs = ctk.CTkFrame(self.brow, fg_color=PANEL); _blibs.pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkLabel(_blibs, text="Patched libraries folder:", text_color=MUTED, width=180, anchor="w",
+                      font=ctk.CTkFont(size=11)).pack(side="left")
+        self._backport_entry = ctk.CTkEntry(_blibs, textvariable=self.backport_libs_var,
+                                             fg_color=CARD2, text_color=WHITE)
+        self._backport_entry.pack(side="left", fill="x", expand=True)
+        self._backport_btn = ctk.CTkButton(_blibs, text="Folder…", width=76, fg_color=CARD2,
+                                            hover_color=GREEN2, text_color=WHITE,
+                                            command=self._pick_backport_libs)
+        self._backport_btn.pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(self.brow, textvariable=self.backport_hint_var, text_color=MUTED,
+                      font=ctk.CTkFont(size=11), wraplength=620, justify="left"
+                      ).pack(anchor="w", padx=10, pady=(0, 6))
+        self._on_backport_target_changed()   # apply initial disabled/enabled state
 
         # ── Buttons ──
         self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
@@ -2700,6 +2747,25 @@ class PackDialog(ctk.CTkToplevel):
         if p:
             self.out_var.set(p)
 
+    def _pick_backport_libs(self):
+        p = filedialog.askdirectory(parent=self, title="Select the folder with your PATCHED PS5 libraries")
+        if p:
+            self.backport_libs_var.set(p)
+
+    def _on_backport_target_changed(self):
+        """Sync the hint line to the selected target and enable/disable the libs
+        picker. Called on segment change and once at build time so the initial
+        state matches whatever the item carried."""
+        v = self.backport_target_var.get()
+        self.backport_hint_var.set(self._BACKPORT_HINTS.get(v, self._BACKPORT_HINTS["off"]))
+        enabled = v != "off"
+        try:
+            state = "normal" if enabled else "disabled"
+            self._backport_entry.configure(state=state)
+            self._backport_btn.configure(state=state)
+        except Exception:
+            pass
+
     # ── hints + identity pre-fill ────────────────────────────────────────────
     def _on_source_changed(self):
         raw = (self.src_var.get() or "").strip()
@@ -2869,10 +2935,13 @@ class PackDialog(ctk.CTkToplevel):
         back  = self.back_var.get() if self.back_var.get() in self._BACKEND else "builtin"
         level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)
         dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
+        bt = self.backport_target_var.get()
         return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
                 "inner": inner, "backend": back, "level": level, "dll": dll,
                 "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
-                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get())}
+                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get()),
+                "backport_target": bt if bt in ("7.61", "6.02", "10.xx") else None,
+                "backport_libs": (self.backport_libs_var.get() or "").strip()}
 
     # ── commit ───────────────────────────────────────────────────────────────
     def _add(self):
@@ -2918,14 +2987,31 @@ class PackDialog(ctk.CTkToplevel):
             save_settings({"fpkg_defaults": self.app.fpkg_defaults})
 
         organize = bool(self.organize_var.get())
+        # Backport applies to every pack / pkg job the dialog produces; capture it once
+        # even when the fPKG params dict was not built (mkpfs pack path). Empty string
+        # rather than a missing key so the loop below is uniform.
+        _bt = self.backport_target_var.get()
+        _backport_pair = {
+            "backport_target": _bt if _bt in ("7.61", "6.02", "10.xx") else None,
+            "backport_libs_root": (self.backport_libs_var.get() or "").strip() or None,
+        }
         if self.edit_item is not None:
             self._save_edit(src, outf, fmt, params, organize)
+            for k, v in _backport_pair.items():
+                setattr(self.edit_item, k, v)
             return
 
         # ── Add mode ─────────────────────────────────────────────────────────
         self.app.output_var.set(outf)
         self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
         self.app.auto_organize_var.set(organize)   # likewise remembered + snapshotted onto the item(s)
+        # Helper: apply the backport pair to any newly added items. Used by every
+        # add-mode exit below so the pack (mkpfs) path picks it up too, not just fpkg.
+        def _tag(items):
+            for it in items:
+                for k, v in _backport_pair.items():
+                    setattr(it, k, v)
+
         # Same-format copy job: skip the whole build path — enqueue a copy item and remember
         # the "delete source after copy" default the user just picked.
         if same_fmt_copy:
@@ -2935,6 +3021,7 @@ class PackDialog(ctk.CTkToplevel):
                                            auto_organize=organize, parent=self)
             if item is None:
                 return
+            _tag([item])
             self.app.queue.append(item)
             self.app.update_queue_box(select_item=item)
             action = "Move (same-drive rename) or copy+delete (cross-drive)" if delete_src else "Copy (source kept)"
@@ -2950,6 +3037,7 @@ class PackDialog(ctk.CTkToplevel):
             if item is None:
                 return
             item.auto_organize = organize
+            _tag([item])
             self.app.queue.append(item)
             self.app.update_queue_box(select_item=item)
             kind = "image"
@@ -2982,8 +3070,12 @@ class PackDialog(ctk.CTkToplevel):
             self.app.unpack_mode_var.set(False)
         except Exception:
             pass
+        # Track how many items existed so any freshly enqueued ones (folder scans, archive
+        # placeholders) can be tagged with the backport pair after add_source_to_queue returns.
+        _before = len(self.app.queue)
         self.destroy()
         self.app.add_source_to_queue()
+        _tag(self.app.queue[_before:])
 
     def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None, organize: bool = True) -> None:
         """Edit mode: mutate in place when the source and the job kind are unchanged;
@@ -3022,7 +3114,8 @@ class PackDialog(ctk.CTkToplevel):
                     it.operation = "pack"
                     for _a in ("fpkg_content_id", "fpkg_title_id", "fpkg_title", "fpkg_version",
                                "fpkg_inner_mode", "fpkg_kraken_backend", "fpkg_pubtools_dll", "fpkg_level",
-                               "fpkg_retail_normalize", "fpkg_hdr_flag", "fpkg_regen_playgo", "fpkg_fake_sign"):
+                               "fpkg_retail_normalize", "fpkg_hdr_flag", "fpkg_regen_playgo", "fpkg_fake_sign",
+                               "backport_target", "backport_libs_root"):
                         if _a in vars(it):
                             delattr(it, _a)
                 it.output_path = Path(outf)
@@ -6541,6 +6634,8 @@ class App:
             "hdr_flag":         _hdr_mode(getattr(item, "fpkg_hdr_flag", "auto")),
             "regen_playgo":     bool(getattr(item, "fpkg_regen_playgo", False)),
             "fake_sign":        bool(getattr(item, "fpkg_fake_sign", True)),
+            "backport_target":  getattr(item, "backport_target", None),
+            "backport_libs":    getattr(item, "backport_libs_root", None) or "",
         }
 
     def _fpkg_compression_of(self, item) -> dict:
@@ -6568,6 +6663,10 @@ class App:
         item.fpkg_hdr_flag         = _hdr_mode(params.get("hdr_flag", "auto"))
         item.fpkg_regen_playgo     = bool(params.get("regen_playgo", False))
         item.fpkg_fake_sign        = bool(params.get("fake_sign", True))
+        bt = params.get("backport_target")
+        item.backport_target = bt if bt in ("7.61", "6.02", "10.xx") else None
+        blr = str(params.get("backport_libs", "") or "").strip()
+        item.backport_libs_root = blr or None
         dll = str(params.get("dll", "") or "").strip()
         if item.fpkg_kraken_backend == "publishingtools" and sys.platform != "win32":
             # Cannot work here (LibProsperoPkg: "requires 64-bit Windows", hard failure) —
@@ -7462,6 +7561,15 @@ class App:
                 cmd += ["--fpkg-regen-playgo"]
             if not getattr(item, "fpkg_fake_sign", True):
                 cmd += ["--fpkg-no-fake-sign"]
+            # Backport: --backport-target lowers eboot/prx/sprx SDK words to the
+            # target's public values BEFORE the C# tool spiegels+signs+packs. Runs
+            # in-place on a folder source, same as --fake-sign-first.
+            _bt = getattr(item, "backport_target", None)
+            if _bt in ("7.61", "6.02", "10.xx"):
+                cmd += ["--backport-target", _bt]
+                _blr = getattr(item, "backport_libs_root", None)
+                if _blr:
+                    cmd += ["--backport-libs", str(_blr)]
             # Identity fields are FALLBACKS: the backend reads sce_sys/param.json of the
             # resolved source first (folder, unwrapped image, extracted archive alike) and
             # only uses these for what it lacks. Empty fields are simply not passed.
@@ -7636,6 +7744,17 @@ class App:
                 and getattr(item, "operation", "pack") == "pack"
                 and not getattr(item, "ampr_emu", False)):
             cmd.append("--fake-sign-first")
+        # Backport for a pack (mkpfs) job: same semantics as for fpkg — lowers
+        # SDK words in place on the folder source before the pack, and pipes
+        # the user's fakelib folder into sce_sys/../fakelib/.
+        _bt_pack = getattr(item, "backport_target", None)
+        if (_bt_pack in ("7.61", "6.02", "10.xx") and not is_patch_job and not _resume_ok
+                and getattr(item, "operation", "pack") == "pack"
+                and getattr(item, "path", None) and Path(item.path).is_dir()):
+            cmd += ["--backport-target", _bt_pack]
+            _blr = getattr(item, "backport_libs_root", None)
+            if _blr:
+                cmd += ["--backport-libs", str(_blr)]
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() not in (".ffpfsc", ".ffpfs") else out.parent, temp
 

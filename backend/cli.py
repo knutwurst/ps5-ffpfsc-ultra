@@ -1986,6 +1986,23 @@ def main() -> None:
                 print(f"[ERROR] fPKG source must be a game folder or a .ffpfsc/.ffpfs/.exfat/.ffpkg image: {src}",
                       flush=True); sys.exit(1)
 
+            # BACKPORT: lower the SDK words in eboot/prx/sprx and (optionally) copy the
+            # user's patched Sony libs into fakelib/. Runs on build_src — that is either
+            # the folder passed on the command line (in-place, same semantics as
+            # --fake-sign-first) or the scratch we unwrapped an image into (self-contained,
+            # never touches the original archive). Everything else in the fPKG build path
+            # is the same as before; the C# tool's own staging then signs+packs whatever
+            # is here.
+            if getattr(args, "backport_target", None):
+                try:
+                    _apply_backport(build_src, args.backport_target,
+                                    Path(args.backport_libs).resolve() if args.backport_libs else None)
+                except Exception as e:
+                    if staged is not None:
+                        shutil.rmtree(staged, ignore_errors=True)
+                    print(f"[ERROR] Backport before fPKG build failed: {e}", flush=True)
+                    sys.exit(1)
+
             # Identity: the game's own sce_sys/param.json decides; the passed values only
             # fill what it lacks. This is what lets ANY source (folder, archive, image)
             # become a .pkg without the GUI knowing the content id up front.

@@ -2395,6 +2395,8 @@ class GameItem:
     patch_inplace = False   # patch: overlay onto a throwaway temp extract (archive game source)
     unwrap = True           # convert/unpack: True = unwrap to a folder, False = stop at inner .ffpfs
     copy_delete_source = True  # copy: delete the source after a successful cross-drive copy
+    backport_target = None  # None|"7.61"|"6.02"|"10.xx": lower SDK before pack/fpkg (opt-in)
+    backport_libs_root = None  # str: folder of user-supplied patched sprx dropped into fakelib/
 
     def __init__(self, path: Path):
         self.path       = path

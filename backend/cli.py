@@ -1524,6 +1524,131 @@ def _apply_backport(folder, target: str, libs_root=None) -> None:
           f"kept {kept} existing file(s) as-is.", flush=True)
 
 
+def _extract_archive_into(archive: Path, dest: Path, password: str | None = None) -> None:
+    """Extract a .zip or a .rar (any volume of a multi-part set) into *dest*.
+    Zip members are checked against Zip-Slip; the bundled rarfile guards that itself.
+    Raises on failure with a readable message; the caller decides how to report it."""
+    dest.mkdir(parents=True, exist_ok=True)
+    suf = archive.suffix.lower()
+    if suf == ".zip":
+        with zipfile.ZipFile(archive) as zf:
+            root = dest.resolve()
+            for member in zf.infolist():
+                try:
+                    (dest / member.filename).resolve().relative_to(root)
+                except ValueError:
+                    raise RuntimeError(f"ZIP path traversal blocked: {member.filename}")
+            zf.extractall(dest, pwd=password.encode() if password else None)
+        return
+    first = archive
+    m = re.match(r"^(?P<b>.*\.part)(?P<n>\d+)(?P<e>\.rar)$", archive.name, re.I)
+    if m:
+        cand = archive.with_name(f"{m.group('b')}{'1'.zfill(len(m.group('n')))}{m.group('e')}")
+        if cand.exists():
+            first = cand
+    elif re.match(r"^.+\.r\d{2,}$", archive.name, re.I):
+        cand = archive.with_suffix(".rar")
+        if cand.exists():
+            first = cand
+    from unrar import rarfile  # bundled extractall already guards traversal
+    with rarfile.RarFile(first, pwd=password or None) as rf:
+        rf.extractall(str(dest))
+
+
+def _resolve_patch_dir(patch_arg: Path, td: Path, password: str | None = None) -> Path:
+    """The folder holding a patch's files: *patch_arg* itself when it is a folder, else
+    the archive extracted under *td*. A 7z patch is left to the GUI to pre-extract."""
+    if patch_arg.is_file() and patch_arg.suffix.lower() in (".zip", ".rar"):
+        patch_dir = td / "_patch"
+        print(f"[INFO] Extracting patch archive '{patch_arg.name}'...", flush=True)
+        _extract_archive_into(patch_arg, patch_dir, password)
+        return patch_dir
+    return patch_arg
+
+
+# ── CHAIN MODE helpers: any source → [patch → backport → sign] → any output ──────
+_CHAIN_KINDS = {".ffpfs": "ffpfs", ".ffpfsc": "ffpfsc", ".pkg": "pkg", ".exfat": "exfat",
+                ".ffpkg": "ffpkg", ".zip": "zip", ".rar": "rar", ".r00": "rar"}
+
+
+def _chain_source_kind(src: Path) -> str:
+    if src.is_dir():
+        return "folder"
+    suf = src.suffix.lower()
+    if re.match(r"^\.r\d{2,}$", suf):
+        return "rar"
+    return _CHAIN_KINDS.get(suf, suf.lstrip(".") or "file")
+
+
+def _chain_materialize(src: Path, scratch_root: Path, args) -> tuple[Path, Path | None]:
+    """Resolve *src* to a game folder. A folder is returned as is (owned = None). Every
+    container is unpacked into a fresh scratch folder under *scratch_root* and the game
+    root inside it is returned together with that scratch folder, which the caller
+    removes when the job is done (or moves, for a folder output)."""
+    if src.is_dir():
+        return src, None
+    scratch = Path(tempfile.mkdtemp(prefix="chain-", dir=str(scratch_root)))
+    kind = _chain_source_kind(src)
+    _phase("Extracting")
+    print(f"[INFO] Unpacking {src.name} ({kind}) into scratch before applying changes...", flush=True)
+    try:
+        if kind in ("exfat", "ffpkg"):
+            if not _extract_exfat_to(src, scratch):
+                raise RuntimeError("could not read the exFAT/UFS image on this platform")
+        elif kind in ("ffpfs", "ffpfsc"):
+            cmd, cwd = _locate_mkpfs()
+            unpack_pfs_image(src, scratch, cmd, cwd, overwrite=True)
+            _fully_unwrap(scratch, cmd, cwd)
+        elif kind == "pkg":
+            import fpkg as _fpkg
+            rc = _fpkg.extract(src, scratch, passcode=args.fpkg_passcode,
+                               on_line=lambda l: print(l, flush=True))
+            if rc != 0:
+                raise RuntimeError(f"fPKG extract failed (rc={rc})")
+        elif kind in ("zip", "rar"):
+            _extract_archive_into(src, scratch, args.password)
+        else:
+            raise RuntimeError(f"unsupported source type '{src.suffix}' — expected a folder, "
+                               ".zip/.rar, .exfat/.ffpkg, .ffpfs, .ffpfsc or .pkg")
+    except BaseException:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise
+    _strip_junk_files(scratch)
+    return _patch_find_game_root(scratch), scratch
+
+
+def _chain_transforms(root: Path, args, scratch_root: Path) -> list[str]:
+    """Apply the requested content changes to *root*, in place, in the order patch →
+    backport → sign. The order matters: a patch may add executables that must be
+    lowered too, and fake-signing turns raw ELFs into SELFs the backport pass skips.
+    Returns the list of changes applied (for the log)."""
+    done: list[str] = []
+    if args.patch:
+        patch_arg = Path(args.patch).resolve()
+        if not patch_arg.exists():
+            raise FileNotFoundError(f"patch source not found: {patch_arg}")
+        td = Path(tempfile.mkdtemp(prefix="chain-patch-", dir=str(scratch_root)))
+        try:
+            patch_dir = _resolve_patch_dir(patch_arg, td, args.password)
+            applied = overlay_patch(root, patch_dir)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+        if applied == 0:
+            raise RuntimeError("the patch contained no files to overlay")
+        print(f"[OK] Applied {applied} patch file(s).", flush=True)
+        done.append("patch")
+    if args.backport_target:
+        _apply_backport(root, args.backport_target,
+                        Path(args.backport_libs).resolve() if args.backport_libs else None)
+        done.append(f"backport {args.backport_target}")
+    if getattr(args, "chain_sign", False):
+        counts = _fake_sign_tree(root)
+        if counts.get("failed"):
+            raise RuntimeError(f"fake-sign reported {counts['failed']} failure(s)")
+        done.append("sign")
+    return done
+
+
 @contextlib.contextmanager
 def _extracted_zip_source(path: Path, *, temp_root=None, password: str | None = None):
     """Extract a ZIP source into a temporary folder and yield that folder.
@@ -1695,6 +1820,13 @@ def main() -> None:
                              "(7.61=BackPork sweet spot; 6.02=experimental; 10.xx=SDK only, "
                              "no fakelib bundle). Applied to a folder source; ignored for "
                              ".ffpfs/.ffpfsc/.pkg/.exfat sources.")
+    parser.add_argument("--to", dest="chain_to", choices=("folder", "ffpfs", "ffpfsc", "pkg"), default=None,
+                        help="CHAIN: turn the SOURCE positional (folder, .zip/.rar, .exfat/.ffpkg, .ffpfs, "
+                             ".ffpfsc or .pkg) into this output, applying --patch, --backport-target and "
+                             "--sign on the way (in that order). One job for e.g. "
+                             "'.ffpfsc → backport 7.61 → .ffpfsc'. Same format without changes = copy.")
+    parser.add_argument("--sign", dest="chain_sign", action="store_true",
+                        help="CHAIN: fake-sign eboot/prx/sprx after --patch and --backport-target.")
     parser.add_argument("--backport-libs", type=str, default=None, metavar="DIR",
                         help="BACKPORT: folder holding user-supplied, PATCHED Sony system "
                              "libraries for the selected --backport-target (never bundled "
@@ -1851,6 +1983,87 @@ def main() -> None:
                                 delete_source=not args.keep_source,
                                 on_line=lambda l: print(l, flush=True))
         sys.exit(rc)
+
+    # ── CHAIN MODE: any source → [patch → backport → sign] → any output ─────────
+    # The one job shape the GUI's job dialog produces. Resolves the source to a game
+    # folder (a container is unpacked into scratch), applies the requested changes,
+    # then hands over to the path that already knows how to produce the output:
+    # the mkpfs pack path (.ffpfs/.ffpfsc), the fPKG build (.pkg), a move (folder),
+    # or the copy job (same format, nothing to change). Sources the target path takes
+    # natively are passed straight through when there is nothing to change.
+    if args.chain_to:
+        if not args.game_folder or not args.output:
+            print("[ERROR] --to needs SOURCE and OUTPUT positionals.", flush=True); sys.exit(2)
+        src = Path(args.game_folder).resolve()
+        out = Path(args.output).resolve()
+        if not src.exists():
+            print(f"[ERROR] Source path does not exist: {src}", flush=True); sys.exit(1)
+        to = args.chain_to
+        kind = _chain_source_kind(src)
+        wanted = [n for flag, n in ((args.patch, "patch"),
+                                    (args.backport_target, f"backport {args.backport_target}"),
+                                    (args.chain_sign, "sign")) if flag]
+        temp_root = Path(args.temp_dir).resolve() if args.temp_dir else Path(tempfile.gettempdir())
+        scratch_root = temp_root / "_ffpfsc_temp"
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] CHAIN: {src.name} ({kind}) → {', '.join(wanted) or 'no changes'} → {to}", flush=True)
+
+        if not wanted and kind == to == "folder":
+            print("[ERROR] Nothing to do: a folder to a folder with no changes.", flush=True); sys.exit(1)
+        if not wanted and kind == to:
+            # Same container format, nothing to change: the copy job (rename on the same
+            # drive, chunked copy across drives). Same switches as --copy.
+            import copy_job as _copy_job
+            out.mkdir(parents=True, exist_ok=True)
+            sys.exit(_copy_job.run_copy(src, out, dst_name=args.copy_name or None,
+                                        delete_source=not args.keep_source,
+                                        on_line=lambda l: print(l, flush=True)))
+
+        native = {"ffpfs": {"folder", "exfat", "ffpkg", "ffpfs", "zip", "rar"},
+                  "ffpfsc": {"folder", "exfat", "ffpkg", "ffpfs", "zip", "rar"},
+                  "pkg": {"folder", "ffpfs", "ffpfsc", "exfat", "ffpkg"}}
+        root, owned = src, None
+        if wanted or kind not in native.get(to, set()):
+            try:
+                root, owned = _chain_materialize(src, scratch_root, args)
+                if owned is None and wanted:
+                    print("[INFO] Applying the changes to the source folder in place.", flush=True)
+                if wanted:
+                    _chain_transforms(root, args, scratch_root)
+            except SystemExit:
+                if owned: shutil.rmtree(owned, ignore_errors=True)
+                raise
+            except Exception as e:
+                if owned: shutil.rmtree(owned, ignore_errors=True)
+                print(f"[ERROR] {e}", flush=True); sys.exit(1)
+
+        if to == "folder":
+            if owned is None:
+                print(f"\n[SUCCESS] Changed in place: {root}", flush=True); return
+            dest = out / f"{src.stem}_extracted" if out.is_dir() else out
+            if dest.exists():
+                if not args.overwrite:
+                    shutil.rmtree(owned, ignore_errors=True)
+                    print(f"[ERROR] Output folder already exists: {dest}  (use --overwrite)", flush=True); sys.exit(1)
+                shutil.rmtree(dest, ignore_errors=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(root), str(dest))
+            shutil.rmtree(owned, ignore_errors=True)
+            print(f"[OK] Folder ready: {dest}", flush=True)
+            print("\n[SUCCESS] All operations completed successfully!", flush=True); return
+
+        # Hand over. The changes are done, so the flags that would redo them are cleared;
+        # an owned scratch is removed when the process ends (the startup sweep reclaims
+        # a leftover under _ffpfsc_temp after a crash).
+        if owned is not None:
+            import atexit
+            atexit.register(shutil.rmtree, str(owned), ignore_errors=True)
+        args.patch = None; args.backport_target = None; args.backport_libs = None
+        args.chain_sign = False; args.fake_sign_first = False; args.chain_to = None
+        if to == "pkg":
+            args.fpkg_build = str(root)
+        else:
+            args.game_folder = str(root); args.operation = "pack"; args.no_compress = (to == "ffpfs")
 
     # ── fPKG MODE (extract / build / validate via bundled ffpfsc-pkg-tool) ──────
     if args.fpkg_extract or args.fpkg_build or args.fpkg_validate:
@@ -2207,40 +2420,12 @@ def main() -> None:
             # The patch may arrive as an archive (auto-patch hands a sibling RAR/ZIP
             # straight through). Extract zip/rar here; a folder is used as-is. A 7z
             # patch is left to the GUI to pre-extract.
-            patch_dir = patch_arg
-            if patch_arg.is_file() and patch_arg.suffix.lower() in (".zip", ".rar"):
-                patch_dir = td / "_patch"
-                patch_dir.mkdir(parents=True, exist_ok=True)
-                print(f"[INFO] Extracting patch archive '{patch_arg.name}'...", flush=True)
-                try:
-                    if patch_arg.suffix.lower() == ".zip":
-                        with zipfile.ZipFile(patch_arg) as zf:
-                            # Guard against Zip-Slip: every member must resolve inside patch_dir.
-                            root = patch_dir.resolve()
-                            for member in zf.infolist():
-                                dest = (patch_dir / member.filename).resolve()
-                                try:
-                                    dest.relative_to(root)
-                                except ValueError:
-                                    print(f"[ERROR] Patch ZIP path traversal blocked: {member.filename}")
-                                    sys.exit(1)
-                            zf.extractall(patch_dir, pwd=args.password.encode() if args.password else None)
-                    else:
-                        first = patch_arg
-                        m = re.match(r"^(?P<b>.*\.part)(?P<n>\d+)(?P<e>\.rar)$", patch_arg.name, re.I)
-                        if m:
-                            cand = patch_arg.with_name(f"{m.group('b')}{'1'.zfill(len(m.group('n')))}{m.group('e')}")
-                            if cand.exists():
-                                first = cand
-                        from unrar import rarfile  # bundled extractall already guards traversal
-                        with rarfile.RarFile(first, pwd=args.password or None) as rf:
-                            rf.extractall(str(patch_dir))
-                except SystemExit:
-                    raise
-                except Exception as exc:
-                    print(f"[ERROR] Patch archive extraction failed ('{patch_arg.name}'): {exc} "
-                          "(corrupt archive, or wrong/missing password)")
-                    sys.exit(1)
+            try:
+                patch_dir = _resolve_patch_dir(patch_arg, td, args.password)
+            except Exception as exc:
+                print(f"[ERROR] Patch archive extraction failed ('{patch_arg.name}'): {exc} "
+                      "(corrupt archive, or wrong/missing password)")
+                sys.exit(1)
             # Temp intermediates we create and may free mid-flow so temp doesn't grow to
             # ~3x the game size (only one of these layers is needed at a time).
             temp_game_dir = None   # the extracted/copied game folder we own (None = patch_inplace)

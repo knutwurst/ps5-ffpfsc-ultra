@@ -248,6 +248,8 @@ def list_pfs_image(image_path):
 # param.json attribute bit 29: the application declares HDR support. The console switches
 # a TV set to "HDR when supported" into HDR only for titles that set it (verified on a PS5).
 PARAM_HDR_BIT = 0x20000000
+
+from backport import SDK_TARGETS as _BACKPORT_TARGETS  # UI-visible target labels (relative to backend/)
 _REPORT_SKIP_DIRS = {"_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner", "__MACOSX"}
 
 
@@ -1467,6 +1469,61 @@ def _fake_sign_tree(folder) -> dict:
     return fake_sign_tree(str(folder), log=lambda m: print(m, flush=True))
 
 
+def _apply_backport(folder, target: str, libs_root=None) -> None:
+    """Backport pass on *folder*, IN PLACE. Runs before fake-sign in the same
+    invocation.
+
+    Two steps: lower the SDK version in every eboot/prx/sprx to the target's
+    SDK words (idlesauce's table), then, if *libs_root* is given, copy every
+    file from libs_root into <folder>/fakelib/ (never overwrites files
+    already there — the user's own copies win).
+
+    Nothing is removed from the game, nothing is added on error. The staging
+    mirror is expected to be a copy already; the caller decides whether this
+    modifies the user's own folder (fake-sign-first path) or the staging one
+    (queue path)."""
+    from pathlib import Path
+    import backport as _bp
+    folder = Path(folder)
+    if target not in _bp.SDK_TARGETS:
+        raise ValueError(f"unknown --backport-target {target!r}; expected one of {sorted(_bp.SDK_TARGETS)}")
+    print(f"[INFO] Backport: lowering SDK to {target} under {folder.name}", flush=True)
+    report = _bp.lower_sdk_in_folder(folder, target)
+    for path, changes in report.written:
+        effective = [c for c in changes if not c.unchanged()]
+        if effective:
+            fields = ", ".join(f"{c.field}={c.before:#010x}->{c.after:#010x}" for c in effective)
+            print(f"  [sdk] {path.relative_to(folder)}: {fields}", flush=True)
+    if report.skipped_no_param:
+        print(f"  [sdk] {len(report.skipped_no_param)} ELF(s) had no SCE param segment; "
+              f"kept as-is (helper modules).", flush=True)
+    if report.skipped_not_elf:
+        print(f"  [sdk] {len(report.skipped_not_elf)} file(s) were not raw ELFs "
+              f"(already fake-signed?); kept as-is.", flush=True)
+    print(f"[INFO] Backport: {report.summary()}", flush=True)
+
+    if libs_root is None:
+        print("[INFO] Backport: --backport-libs not set; no fakelib bundle copied.", flush=True)
+        return
+    libs_root = Path(libs_root)
+    if not libs_root.is_dir():
+        raise FileNotFoundError(f"--backport-libs is not a folder: {libs_root}")
+    fakelib = folder / "fakelib"
+    fakelib.mkdir(exist_ok=True)
+    copied, kept = 0, 0
+    for src in sorted(libs_root.iterdir()):
+        if not src.is_file() or src.name.startswith("."):
+            continue
+        dst = fakelib / src.name
+        if dst.exists():
+            kept += 1
+            continue
+        dst.write_bytes(src.read_bytes())
+        copied += 1
+    print(f"[INFO] Backport: copied {copied} lib(s) into fakelib/; "
+          f"kept {kept} existing file(s) as-is.", flush=True)
+
+
 @contextlib.contextmanager
 def _extracted_zip_source(path: Path, *, temp_root=None, password: str | None = None):
     """Extract a ZIP source into a temporary folder and yield that folder.
@@ -1631,6 +1688,18 @@ def main() -> None:
     parser.add_argument("--fake-sign-first", action="store_true",
                         help="Before packing a game FOLDER, fake-sign its executables in "
                              "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
+    parser.add_argument("--backport-target", type=str, default=None,
+                        choices=list(_BACKPORT_TARGETS),
+                        help="BACKPORT: before fake-signing, lower the SDK version in the "
+                             "game's eboot.bin and every prx/sprx to this target's SDK words "
+                             "(7.61=BackPork sweet spot; 6.02=experimental; 10.xx=SDK only, "
+                             "no fakelib bundle). Applied to a folder source; ignored for "
+                             ".ffpfs/.ffpfsc/.pkg/.exfat sources.")
+    parser.add_argument("--backport-libs", type=str, default=None, metavar="DIR",
+                        help="BACKPORT: folder holding user-supplied, PATCHED Sony system "
+                             "libraries for the selected --backport-target (never bundled "
+                             "with this app). Each file is copied into <source>/fakelib/ "
+                             "before packing. Nothing is done to files already there.")
     parser.add_argument("--param-report", type=str, default=None, metavar="PATH",
                         help="List every game under PATH (folders, .ffpfsc/.ffpfs, .pkg) with its title "
                              "id, version and whether param.json declares HDR support, then exit. Read-only.")
@@ -1690,6 +1759,24 @@ def main() -> None:
             print(f"[ERROR] Extraction failed: {e}", flush=True)
             sys.exit(1)
         sys.exit(rc or 0)
+
+    # ── BACKPORT MODE (standalone) ───────────────────────────────────────────────
+    # Lower the SDK version of every eboot/prx/sprx under a folder, in place. Runs
+    # before --fake-sign in the same invocation. Same standalone shape as fake-sign;
+    # no positional needed. Applied to whatever is under --backport-target's PATH.
+    _backport_dir = getattr(args, "fake_sign", None) or getattr(args, "fake_sign_first", None)
+    if args.backport_target and not (args.batch or _backport_dir is False):
+        # `--backport-target` alone (no --fake-sign, no game_folder positional).
+        # We only run the standalone lowering if the user did NOT ask for anything
+        # else — the pipeline paths call _apply_backport() themselves.
+        pass
+    if args.backport_target and args.fake_sign:
+        try:
+            _apply_backport(Path(args.fake_sign).resolve(), args.backport_target,
+                            Path(args.backport_libs).resolve() if args.backport_libs else None)
+        except Exception as e:
+            print(f"[ERROR] Backport failed: {e}", flush=True)
+            sys.exit(1)
 
     # ── FAKE-SIGN MODE (standalone) ──────────────────────────────────────────────
     # Pure folder operation: needs no game_folder positional, no mkpfs, no temp dirs.
@@ -2256,17 +2343,29 @@ def main() -> None:
             # Opt-in: fake-sign the game's executables in place before packing. Only
             # genuine game FOLDERS can be signed (we can't reach into an opaque disk
             # image / PFS); warn-and-skip for those.
-            if getattr(args, "fake_sign_first", False):
+            if getattr(args, "fake_sign_first", False) or getattr(args, "backport_target", None):
                 if item.is_dir():
-                    print(f"[INFO] Fake-signing executables in {item.name} before packing…", flush=True)
-                    try:
-                        _fake_sign_tree(item)
-                    except Exception as e:
-                        print(f"[ERROR] Fake-sign before pack failed: {e}", flush=True)
-                        sys.exit(1)
+                    if args.backport_target:
+                        try:
+                            _apply_backport(item, args.backport_target,
+                                            Path(args.backport_libs).resolve() if args.backport_libs else None)
+                        except Exception as e:
+                            print(f"[ERROR] Backport before pack failed: {e}", flush=True)
+                            sys.exit(1)
+                    if getattr(args, "fake_sign_first", False):
+                        print(f"[INFO] Fake-signing executables in {item.name} before packing…", flush=True)
+                        try:
+                            _fake_sign_tree(item)
+                        except Exception as e:
+                            print(f"[ERROR] Fake-sign before pack failed: {e}", flush=True)
+                            sys.exit(1)
                 else:
-                    print(f"[WARN] --fake-sign-first only applies to game folders; "
-                          f"ignoring for image/PFS source {item.name}.", flush=True)
+                    if getattr(args, "fake_sign_first", False):
+                        print(f"[WARN] --fake-sign-first only applies to game folders; "
+                              f"ignoring for image/PFS source {item.name}.", flush=True)
+                    if args.backport_target:
+                        print(f"[WARN] --backport-target only applies to game folders; "
+                              f"ignoring for image/PFS source {item.name}.", flush=True)
 
             if (args.batch and not explicit_file) or ffpfs_path.is_dir():
                 current_ffpfs_path = ffpfs_path / f"{title_id}{ext}"

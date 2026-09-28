@@ -3130,6 +3130,56 @@ class JobDialog(ctk.CTkToplevel):
         "6.02":  "6.02 — experimental: a smaller public library set, only some titles run",
         "10.xx": "10.xx — SDK only, no library bundle; for a game newer than the console",
     }
+    _HELP_IDLE = "Hover an option to see what it does and when you need it."
+    _HELP = {
+        "source": "Drop a path here, or pick a file or a folder. A parent folder of games makes one job "
+                  "per game. Archives are extracted when the job runs; a container is unpacked only if "
+                  "something has to change in it.",
+        "look":   "Opens the browser on this image or package: the tree, and single files pulled out "
+                  "without unpacking the rest. A peek, not a job.",
+        "patch":  "Merges an update's files over the game's own before packing — the result is the "
+                  "updated game. A folder, a .zip or a .rar. Applied first, so patched executables are "
+                  "backported and signed too.",
+        "backport": "Lowers the SDK version in eboot.bin and every prx/sprx to the target's published "
+                    "values so an older firmware loads them. System libraries the old firmware lacks "
+                    "must come from your patched-libraries folder; they are copied into the game's "
+                    "fakelib/. Nothing is bundled with this app.",
+        "target": "7.61: public library patches exist, the documented path. 6.02: experimental, a "
+                  "smaller public set, only some titles run. 10.xx: SDK only, no library bundle, for a "
+                  "game newer than the console. Nothing above 10.xx: no public SDK value exists.",
+        "libs":   "Your own patched system libraries for this target (often the two Agc libraries). "
+                  "Copied into fakelib/ without overwriting what is already there. Optional: leave "
+                  "empty to only lower the SDK. The default comes from Settings.",
+        "check":  "Reads the functions the game imports and compares them with what the target "
+                  "firmware's original libraries (Settings) and your patched libraries export — per "
+                  "library: covered, partial or missing. Needs a game folder; a container is checked "
+                  "after it is unpacked at build time.",
+        "sign":   "Fake-signs eboot.bin and every prx/sprx so a jailbroken console loads them. Needed "
+                  "when a dump's executables are still plain ELFs. Already-signed files are skipped, "
+                  "so leaving it on costs nothing. A .pkg is always signed by its builder.",
+        "output": "Folder: a plain /app0 folder (a folder source is changed in place). .ffpfs: "
+                  "uncompressed image, fastest to build and mount, full size. .ffpfsc: compressed "
+                  "image for ShadowMount, built with the 64 KiB block size verified on a console. "
+                  ".pkg: installable package.",
+        "saveto": "Where the result lands. With auto-organize it gets its own folder there, named "
+                  "from the game.",
+        "organize": "Names the folder and the file from the game's own metadata: "
+                    "<Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y]. Long names are shortened to "
+                    "ShadowMount's byte limit.",
+        "keep":   "Only for a same-format copy across drives: keep the original after copying. On "
+                  "the same drive the file is always moved (a rename).",
+        "retail": "Keep on. Drops placeholder license files and issues a valid debug license, sets the "
+                  "retail DRM type and the retail flag in every executable, rebuilds a corrupt PlayGo "
+                  "set and repairs presentation images — the configuration verified on a console. Off "
+                  "only for a byte-exact re-pack or an A/B test.",
+        "playgo": "Discards the source's PlayGo files even when they look valid and lets the builder "
+                  "write a fresh one-chunk set. A corrupt or mismatching set is rebuilt anyway, so this "
+                  "is only for a title that installs but will not start (CE-100022-5).",
+        "hdr":    "auto keeps what the game's param.json declares — the publisher's intent; a console on "
+                  "'HDR when supported' follows this flag. on forces it, off clears it.",
+        "speed":  "normal = Kraken level 7, the smallest package. fast = the encoder's fast preset: "
+                  "quicker, a little larger. Same layout either way.",
+    }
     _KIND_LABEL = {"folder": "Game folder", "parent": "Parent folder", "archive": "Archive",
                    "exfat": "exFAT disk image", "ffpkg": "ffpkg disk image", "ffpfs": ".ffpfs image",
                    "ffpfsc": ".ffpfsc image", "pkg": "PS5 package (.pkg)"}
@@ -3139,8 +3189,8 @@ class JobDialog(ctk.CTkToplevel):
         self.app = app
         self.edit_item = item
         self.title("Edit job" if item else "Add job")
-        self.geometry("780x760")
-        self.minsize(640, 520)
+        self.geometry("820x900")
+        self.minsize(700, 620)
         self.configure(fg_color=BLACK)
         self.transient(app.root)
         self.lift()
@@ -3157,7 +3207,8 @@ class JobDialog(ctk.CTkToplevel):
         if item is not None:
             src0 = str(getattr(item, "archive_path", None) or getattr(item, "path", "") or "")
         self.src_var = tk.StringVar(value=src0)
-        self.detect_var = tk.StringVar(value=self._SOURCE_HINT)
+        self.detect_var = tk.StringVar(value="Choose or drop a source.")
+        self.help_var = tk.StringVar(value=self._HELP_IDLE)
         self.sign_var = tk.BooleanVar(value=bool(getattr(item, "chain_sign", False)) if item else False)
         self.patch_on_var = tk.BooleanVar(value=bool(getattr(item, "patch_source", None)) if item else False)
         self.patch_var = tk.StringVar(value=str(getattr(item, "patch_source", "") or "") if item else "")
@@ -3233,58 +3284,70 @@ class JobDialog(ctk.CTkToplevel):
         self._look_btn = ctk.CTkButton(dline, text="🔎  Look inside…", width=120, height=24, fg_color="transparent",
                                        hover_color=CARD2, text_color=GREEN, font=ctk.CTkFont(size=11),
                                        command=self._look_inside)
+        self._bind_help(self._HELP["source"], sinner)
+        self._bind_help(self._HELP["look"], self._look_btn)
 
-        # 2 · Change the content
+        # 2 · Change the content — each change is a box: its checkbox line, and its options
+        #     frame INSIDE the same box, so the options always sit under their own checkbox.
         crow = self._group("2", "Change the content", "optional · applied in this order")
         cin = ctk.CTkFrame(crow, fg_color=PANEL); cin.pack(fill="x", padx=10, pady=(2, 6))
+
+        def option(var, text, note, help_key):
+            box = ctk.CTkFrame(cin, fg_color=PANEL); box.pack(fill="x", pady=(2, 2))
+            line = ctk.CTkFrame(box, fg_color=PANEL); line.pack(fill="x")
+            cb = ctk.CTkCheckBox(line, text=text, variable=var, checkbox_width=18, checkbox_height=18,
+                                 fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12))
+            cb.pack(side="left")
+            nl = ctk.CTkLabel(line, text=note, text_color=MUTED, font=ctk.CTkFont(size=11))
+            nl.pack(side="left", padx=(10, 0))
+            opts = ctk.CTkFrame(box, fg_color=PANEL)              # packed by _refresh when checked
+            ctk.CTkFrame(opts, width=2, height=1, fg_color=GREEN2).pack(side="left", fill="y", padx=(8, 12), pady=2)   # height=1: a CTkFrame asks for 200 px otherwise
+            inner = ctk.CTkFrame(opts, fg_color=PANEL); inner.pack(side="left", fill="x", expand=True)
+            self._bind_help(self._HELP[help_key], line)
+            return types.SimpleNamespace(box=box, line=line, cb=cb, note=nl, opts=opts, inner=inner)
+
         # Patch
-        prow = ctk.CTkFrame(cin, fg_color=PANEL); prow.pack(fill="x", pady=1)
-        ctk.CTkCheckBox(prow, text="Integrate a patch", variable=self.patch_on_var, checkbox_width=18, checkbox_height=18,
-                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkLabel(prow, text="merge an update (folder, .zip or .rar) into the game", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
-        self._patch_opts = ctk.CTkFrame(cin, fg_color=PANEL)
-        pin = ctk.CTkFrame(self._patch_opts, fg_color=PANEL); pin.pack(fill="x", padx=(26, 0), pady=(0, 4))
+        po = option(self.patch_on_var, "Integrate a patch", "merge an update (folder, .zip or .rar) into the game", "patch")
+        self._patch_opts = po.opts
+        pin = ctk.CTkFrame(po.inner, fg_color=PANEL); pin.pack(fill="x", pady=(2, 4))
         ctk.CTkLabel(pin, text="Patch:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         ctk.CTkEntry(pin, textvariable=self.patch_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(pin, text="File…", width=64, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_patch_file).pack(side="left", padx=(6, 0))
         ctk.CTkButton(pin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_patch_folder).pack(side="left", padx=(6, 0))
+        self._bind_help(self._HELP["patch"], pin)
+
         # Backport
-        brow = ctk.CTkFrame(cin, fg_color=PANEL); brow.pack(fill="x", pady=1)
-        ctk.CTkCheckBox(brow, text="Backport", variable=self.backport_on_var, checkbox_width=18, checkbox_height=18,
-                        fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkLabel(brow, text="lower the SDK so the game runs on an older firmware", text_color=MUTED,
-                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
-        self._backport_opts = ctk.CTkFrame(cin, fg_color=PANEL)
-        b1 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b1.pack(fill="x", padx=(26, 0), pady=(0, 2))
+        bo = option(self.backport_on_var, "Backport", "lower the SDK so the game runs on an older firmware", "backport")
+        self._backport_opts = bo.opts
+        b1 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b1.pack(fill="x", pady=(2, 2))
         ctk.CTkLabel(b1, text="Target firmware:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         ctk.CTkSegmentedButton(b1, values=["7.61", "6.02", "10.xx"], variable=self.backport_target_var,
                                 selected_color=GREEN, selected_hover_color=GREEN2).pack(side="left")
         ctk.CTkLabel(b1, textvariable=self.backport_hint_var, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=380, justify="left").pack(side="left", padx=(10, 0))
-        b2 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b2.pack(fill="x", padx=(26, 0), pady=2)
+        self._bind_help(self._HELP["target"], b1)
+        b2 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b2.pack(fill="x", pady=2)
         ctk.CTkLabel(b2, text="Patched libraries:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
-        ctk.CTkEntry(b2, textvariable=self.backport_libs_var, fg_color=CARD2, text_color=WHITE,
-                     placeholder_text="optional — your own patched system libraries for this target").pack(side="left", fill="x", expand=True)
+        ctk.CTkEntry(b2, textvariable=self.backport_libs_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(b2, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                        command=self._pick_backport_libs).pack(side="left", padx=(6, 0))
-        b3 = ctk.CTkFrame(self._backport_opts, fg_color=PANEL); b3.pack(fill="x", padx=(26, 0), pady=(2, 4))
+        self._bind_help(self._HELP["libs"], b2)
+        b3 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b3.pack(fill="x", pady=(2, 4))
         ctk.CTkLabel(b3, text="Compatibility:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         self._check_btn = ctk.CTkButton(b3, text="Check", width=72, height=26, fg_color=CARD2, hover_color=GREEN2,
                                         text_color=WHITE, command=self._check_compat)
         self._check_btn.pack(side="left")
         ctk.CTkLabel(b3, textvariable=self.check_var, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=440, justify="left").pack(side="left", padx=(10, 0))
-        # Sign
-        sgrow = ctk.CTkFrame(cin, fg_color=PANEL); sgrow.pack(fill="x", pady=1)
-        self._sign_cb = ctk.CTkCheckBox(sgrow, text="Sign executables", variable=self.sign_var, checkbox_width=18,
-                                        checkbox_height=18, fg_color=GREEN, hover_color=GREEN2, text_color=WHITE,
-                                        font=ctk.CTkFont(size=12))
-        self._sign_cb.pack(side="left")
-        self._sign_note = tk.StringVar(value="fake-sign eboot.bin and every prx/sprx")
-        ctk.CTkLabel(sgrow, textvariable=self._sign_note, text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
+        self._bind_help(self._HELP["check"], b3)
+
+        # Sign — for a .pkg the checkbox gives way to a fixed line (the builder always signs)
+        so = option(self.sign_var, "Sign executables", "fake-sign eboot.bin and every prx/sprx", "sign")
+        self._sign_cb, self._sign_note_lbl, self._sign_line = so.cb, so.note, so.line
+        self._sign_fixed = ctk.CTkLabel(so.line, text="✓  Signed by the package builder — every executable in a .pkg is fake-signed",
+                                        text_color=MUTED, font=ctk.CTkFont(size=12))
 
         # 3 · Output
         orow = self._group("3", "Output")
@@ -3294,45 +3357,58 @@ class JobDialog(ctk.CTkToplevel):
         self._to_hint = tk.StringVar(value="")
         ctk.CTkLabel(oin, textvariable=self._to_hint, text_color=MUTED, font=ctk.CTkFont(size=11),
                       wraplength=420, justify="left").pack(side="left", padx=(10, 0))
+        self._bind_help(self._HELP["output"], oin)
         fin = ctk.CTkFrame(orow, fg_color=PANEL); fin.pack(fill="x", padx=10, pady=(4, 2))
-        ctk.CTkLabel(fin, text="Folder:", text_color=MUTED, width=60, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkLabel(fin, text="Save to:", text_color=MUTED, width=64, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         self._out_entry = ctk.CTkEntry(fin, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE)
         self._out_entry.pack(side="left", fill="x", expand=True)
         self._out_btn = ctk.CTkButton(fin, text="Folder…", width=76, fg_color=CARD2, hover_color=GREEN2, text_color=WHITE,
                                       command=self._pick_out)
         self._out_btn.pack(side="left", padx=(6, 0))
+        self._bind_help(self._HELP["saveto"], fin)
         oline = ctk.CTkFrame(orow, fg_color=PANEL); oline.pack(fill="x", padx=10, pady=(2, 6))
         self._organize_cb = ctk.CTkCheckBox(oline, text="Auto-organize — folder and file named from the game's own metadata",
                                             variable=self.organize_var, checkbox_width=18, checkbox_height=18,
                                             fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
         self._organize_cb.pack(side="left")
+        self._bind_help(self._HELP["organize"], self._organize_cb)
         self._keep_cb = ctk.CTkCheckBox(oline, text="Keep the source (cross-drive copy)", variable=self.keep_source_var,
                                         checkbox_width=18, checkbox_height=18, fg_color=GREEN, hover_color=GREEN2,
                                         text_color=WHITE, font=ctk.CTkFont(size=11))
-        # .pkg options — shown only when .pkg is the output
+        self._bind_help(self._HELP["keep"], self._keep_cb)
+        # .pkg options — two rows, shown only when .pkg is the output
         self._pkg_opts = ctk.CTkFrame(orow, fg_color=PANEL)
-        p1 = ctk.CTkFrame(self._pkg_opts, fg_color=PANEL); p1.pack(fill="x", padx=10, pady=(0, 2))
+        ctk.CTkFrame(self._pkg_opts, width=2, height=1, fg_color=GREEN2).pack(side="left", fill="y", padx=(10, 12), pady=2)
+        pk = ctk.CTkFrame(self._pkg_opts, fg_color=PANEL); pk.pack(side="left", fill="x", expand=True)
+        p1 = ctk.CTkFrame(pk, fg_color=PANEL); p1.pack(fill="x", pady=(2, 2))
         ctk.CTkLabel(p1, text=".pkg options:", text_color=MUTED, width=100, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
-        for _var, _text in ((self.retail_var, "Retail fixes"), (self.regen_var, "Rebuild PlayGo")):
-            ctk.CTkCheckBox(p1, text=_text, variable=_var, checkbox_width=18, checkbox_height=18, fg_color=GREEN,
-                            hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(p1, text="HDR:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(6, 6))
-        ctk.CTkSegmentedButton(p1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=GREEN,
+        _rc = ctk.CTkCheckBox(p1, text="Retail fixes", variable=self.retail_var, checkbox_width=18, checkbox_height=18,
+                              fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+        _rc.pack(side="left", padx=(0, 18)); self._bind_help(self._HELP["retail"], _rc)
+        _pc = ctk.CTkCheckBox(p1, text="Rebuild PlayGo", variable=self.regen_var, checkbox_width=18, checkbox_height=18,
+                              fg_color=GREEN, hover_color=GREEN2, text_color=WHITE, font=ctk.CTkFont(size=11))
+        _pc.pack(side="left", padx=(0, 18)); self._bind_help(self._HELP["playgo"], _pc)
+        p2 = ctk.CTkFrame(pk, fg_color=PANEL); p2.pack(fill="x", pady=(2, 6))
+        ctk.CTkLabel(p2, text="", width=100).pack(side="left")
+        _h1 = ctk.CTkFrame(p2, fg_color=PANEL); _h1.pack(side="left")
+        ctk.CTkLabel(_h1, text="HDR:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
+        ctk.CTkSegmentedButton(_h1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=GREEN,
                                 selected_hover_color=GREEN2, height=24).pack(side="left")
-        ctk.CTkLabel(p1, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(14, 6))
-        ctk.CTkSegmentedButton(p1, values=["normal", "fast"], variable=self.speed_var, selected_color=GREEN,
+        self._bind_help(self._HELP["hdr"], _h1)
+        _h2 = ctk.CTkFrame(p2, fg_color=PANEL); _h2.pack(side="left", padx=(18, 0))
+        ctk.CTkLabel(_h2, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
+        ctk.CTkSegmentedButton(_h2, values=["normal", "fast"], variable=self.speed_var, selected_color=GREEN,
                                 selected_hover_color=GREEN2, height=24).pack(side="left")
-        ctk.CTkLabel(self._pkg_opts, text="Defaults are the configuration verified on a console. HDR auto keeps what the "
-                                          "game declares. Executables are always signed for a .pkg.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=700, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(0, 6))
+        self._bind_help(self._HELP["speed"], _h2)
 
-        # Summary + buttons (outside the scroll area, always visible)
+        # Help line + summary + buttons (outside the scroll area, always visible)
         foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(6, 12))
+        ctk.CTkLabel(foot, textvariable=self.help_var, text_color=MUTED, font=ctk.CTkFont(size=11),
+                      wraplength=760, justify="left", anchor="nw", height=48).pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(foot, textvariable=self.summary_var, text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold"),
-                      wraplength=720, justify="left").pack(anchor="w")
+                      wraplength=760, justify="left").pack(anchor="w")
         ctk.CTkLabel(foot, textvariable=self.summary_dest_var, text_color=MUTED, font=ctk.CTkFont(size=11),
-                      wraplength=720, justify="left").pack(anchor="w", pady=(0, 6))
+                      wraplength=760, justify="left").pack(anchor="w", pady=(0, 6))
         btns = ctk.CTkFrame(foot, fg_color=BLACK); btns.pack(fill="x")
         self._add_btn = ctk.CTkButton(btns, text="💾  Save changes" if self.edit_item else "➕  Add to queue",
                                       fg_color=GREEN, hover_color=GREEN2, text_color="#061006",
@@ -3340,6 +3416,32 @@ class JobDialog(ctk.CTkToplevel):
         self._add_btn.pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Cancel", fg_color=CARD2, text_color=WHITE, hover_color=("#b0b0b0", "#2a2a2a"),
                        command=self.destroy).pack(side="right")
+
+    def _bind_help(self, text: str, *widgets):
+        """Show *text* in the help line while the pointer is over any of *widgets* or their
+        children; clear it when the pointer leaves the first widget's box. customtkinter
+        widgets are composites, so every descendant gets the binding."""
+        def _show(_e=None):
+            self.help_var.set(text)
+        def _leave(_e=None):
+            try:
+                w = widgets[0]
+                x, y = self.winfo_pointerxy()
+                inside = (w.winfo_rootx() <= x < w.winfo_rootx() + w.winfo_width()
+                          and w.winfo_rooty() <= y < w.winfo_rooty() + w.winfo_height())
+            except Exception:
+                inside = False
+            if not inside:
+                self.help_var.set(self._HELP_IDLE)
+        def _walk(w):
+            try:
+                w.bind("<Enter>", _show, add="+"); w.bind("<Leave>", _leave, add="+")
+            except Exception:
+                pass
+            for c in w.winfo_children():
+                _walk(c)
+        for w in widgets:
+            _walk(w)
 
     # ── pickers ──────────────────────────────────────────────────────────────
     def _pick_file(self):
@@ -3416,7 +3518,7 @@ class JobDialog(ctk.CTkToplevel):
             pass
         if not p or not p.exists():
             self._kind = "none"
-            self.detect_var.set(self._SOURCE_HINT if not raw else "Not found")
+            self.detect_var.set("Choose or drop a source." if not raw else "Not found")
             self._refresh(); return
         if p.is_dir():
             if is_game_folder(p):
@@ -3491,14 +3593,24 @@ class JobDialog(ctk.CTkToplevel):
     def _refresh(self):
         to = self._to_key()
         # progressive disclosure
-        (self._patch_opts.pack(fill="x") if self.patch_on_var.get() else self._patch_opts.pack_forget())
-        (self._backport_opts.pack(fill="x") if self.backport_on_var.get() else self._backport_opts.pack_forget())
+        (self._patch_opts.pack(fill="x", pady=(2, 2)) if self.patch_on_var.get() else self._patch_opts.pack_forget())
+        (self._backport_opts.pack(fill="x", pady=(2, 2)) if self.backport_on_var.get() else self._backport_opts.pack_forget())
         (self._pkg_opts.pack(fill="x", pady=(2, 0)) if to == "pkg" else self._pkg_opts.pack_forget())
         self.backport_hint_var.set(self._BACKPORT_HINTS.get(self.backport_target_var.get(), ""))
         if to == "pkg":
-            self._sign_cb.configure(state="disabled"); self._sign_note.set("always for a .pkg (the package builder signs)")
+            self._sign_cb.configure(state="disabled")
+            self._sign_cb.pack_forget(); self._sign_note_lbl.pack_forget()
+            if not self._sign_fixed.winfo_manager():
+                self._sign_fixed.pack(side="left")
         else:
-            self._sign_cb.configure(state="normal"); self._sign_note.set("fake-sign eboot.bin and every prx/sprx")
+            self._sign_fixed.pack_forget()
+            if not self._sign_cb.winfo_manager():
+                self._sign_cb.pack(side="left"); self._sign_note_lbl.pack(side="left", padx=(10, 0))
+            self._sign_cb.configure(state="normal")
+        try:
+            self._check_btn.configure(state="normal" if self._kind in ("folder", "parent") else "disabled")
+        except Exception:
+            pass
         self._to_hint.set({"folder": "plain /app0 folder — for a folder source: changes in place",
                            "ffpfs": "uncompressed image — fastest to build and mount, full size",
                            "ffpfsc": "compressed image — mounts with ShadowMount",
@@ -3526,7 +3638,9 @@ class JobDialog(ctk.CTkToplevel):
                 text += f"  × {len(self._games)} game(s)"
             ok = not text.startswith("Nothing to do")
         out = (self.out_var.get() or "").strip()
-        if ok and not in_place and not out:
+        if p is None or self._kind in ("none", "folder-unknown", "file-unknown"):
+            dest = ""
+        elif ok and not in_place and not out:
             ok = False
             dest = "Choose an output folder"
         elif in_place:

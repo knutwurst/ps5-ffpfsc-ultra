@@ -439,7 +439,11 @@ try:
     jd2 = m.JobDialog(app, init_src=str(FF)); root.update()
     ok("job.detect.ffpfsc", jd2._kind == "ffpfsc" and jd2._look_btn.winfo_manager() == "pack", jd2.detect_var.get())
     jd2.to_var.set(".pkg"); jd2.out_var.set(str(OUT / "job")); jd2.speed_var.set("fast"); root.update()
-    ok("job.pkg.sign-forced", jd2._sign_cb.cget("state") == "disabled", str(jd2._sign_cb.cget("state")))
+    ok("job.pkg.sign-forced", jd2._sign_cb.cget("state") == "disabled" and jd2._sign_fixed.winfo_manager() == "pack"
+       and jd2._sign_cb.winfo_manager() == "", str(jd2._sign_cb.cget("state")))
+    # the compatibility check reads a game folder; for a container it is disabled
+    ok("job.check.disabled-for-container", str(jd2._check_btn.cget("state")) == "disabled", str(jd2._check_btn.cget("state")))
+    ok("job.help.idle-line", jd2.help_var.get() == jd2._HELP_IDLE, jd2.help_var.get())
     ok("job.summary.pkg", jd2.summary_var.get() == "Build .pkg", jd2.summary_var.get())
     n0 = len(app.queue); jd2._add(); root.update(); j2 = app.queue[-1]
     ok("job.add.pkg-item", len(app.queue) == n0 + 1 and j2.operation == "chain" and j2.chain_to == "pkg"

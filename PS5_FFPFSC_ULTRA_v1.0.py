@@ -337,85 +337,123 @@ class FirstRunWizard(ctk.CTkToplevel):
 # ─── Detailed Error Dialog ─────────────────────────────────────────────────────
 
 class ErrorDialog(ctk.CTkToplevel):
-    # Title + likely causes per job kind. The pack/MkPFS causes are actively misleading
-    # for a job that never runs MkPFS (a copy moves a finished file; fake-sign rewrites
-    # executables in place), so each kind gets the causes that can actually apply to it.
+    """One error dialog: the window's title bar carries the job kind, the body leads with
+    the short message the backend already wrote, an inline explanation says what that
+    means in plain words, and the log is one paragraph — not fifty repeated lines. The
+    generic 'possible causes' list is gone: whenever we can recognise the failure (a
+    disconnected drive, permission denied, low space, an unreadable archive password) the
+    explanation is specific; otherwise the log stays the primary source of truth."""
+
     _TITLES = {
-        "copy":         "Copy Failed",
-        "unpack":       "Extraction Failed",
-        "fpkg-extract": "fPKG Extraction Failed",
-        "fpkg-build":   "fPKG Build Failed",
-        "fake-sign":    "Fake-Signing Failed",
+        "pack":         "Pack failed",
+        "copy":         "Copy failed",
+        "unpack":       "Extraction failed",
+        "fpkg-extract": "fPKG extraction failed",
+        "fpkg-build":   "fPKG build failed",
+        "fake-sign":    "Fake-signing failed",
+        "chain":        "Job failed",
     }
-    _CAUSES = {
-        "copy": [
-            "• Insufficient free space on the output drive",
-            "• Source or destination drive disconnected or write-protected",
-            "• Destination folder not writable (permissions)",
-            "• The source file was moved or deleted while the job was queued",
-        ],
-        "fake-sign": [
-            "• Folder unavailable or not writable (permissions)",
-            "• An executable is corrupted or not a valid ELF",
-            "• External drive disconnected mid-run",
-        ],
-    }
-    _DEFAULT_CAUSES = [
-        "• Insufficient free space on temp or output drive",
-        "• External drive disconnected or write-protected",
-        "• Temp folder unavailable or permissions issue",
-        "• MkPFS backend failure (corrupted dump or unsupported format)",
-        "• Python not found or wrong version",
-        "• Antivirus blocking backend process",
-    ]
 
     def __init__(self, parent, msg: str, last_cmd: str = "", log_lines: str = "",
                  operation: str = "pack"):
         super().__init__(parent)
         self._op = operation or "pack"
-        self._heading = self._TITLES.get(self._op, "Compression Failed")
+        self._heading = self._TITLES.get(self._op, "Job failed")
         self.title(self._heading)
-        self.geometry("700x560")
+        self.geometry("640x460")
+        self.minsize(520, 380)
         self.resizable(True, True)
         self.grab_set()
         self.configure(fg_color=BLACK)
-        self._msg = msg
+        self._msg = (msg or "").strip() or "The job stopped before it finished."
         self._cmd = last_cmd
-        self._log = log_lines
+        self._log = log_lines or ""
         self._build()
 
+    # ── diagnosis ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _diagnose(msg: str, log: str) -> str | None:
+        """A short, specific sentence for known failure shapes, or None. Reads the
+        backend's own line rather than guessing from a menu of causes."""
+        t = (msg + "\n" + log).lower()
+        # A drop-out on a mounted external drive: the OS returns EACCES on the mount
+        # point itself when the volume vanished mid-run. The message names /Volumes/X.
+        import re as _re
+        m = _re.search(r"permission denied[^\n]*['\"](/volumes/[^'\"]+)", msg, _re.I)
+        if m:
+            vol = m.group(1)
+            return (f"macOS refuses to read or write “{vol}”. The drive most likely disconnected "
+                    f"or went to sleep during the job. Check the cable, wake the drive and rerun "
+                    f"the job.")
+        if "permission denied" in t:
+            m = _re.search(r"permission denied[^\n]*(?::|')\s*['\"]?([^\"'\n]+)", msg, _re.I)
+            path = m.group(1).strip() if m else ""
+            return ("The system refused write access" + (f" to “{path}”" if path else "") +
+                    ". The folder is read-only, on a locked disk, or restricted by macOS privacy "
+                    "settings. Grant access in System Settings → Privacy & Security, or choose a "
+                    "writable folder.")
+        if "no space left on device" in t or "enospc" in t:
+            return ("The drive ran out of free space while writing. Free space, move the output or "
+                    "the temp folder to a larger drive, or lower the compression level.")
+        if "read-only file system" in t or "erofs" in t:
+            return "The target folder is on a read-only volume. Choose a writable folder."
+        if "wrong or missing password" in t or "rarwrongpassword" in t:
+            return "The archive's password is wrong or missing. Set it in Settings → Archive passwords."
+        if "operation cancelled" in t or "cancelled by user" in t:
+            return "You cancelled this job. Nothing was written to the output."
+        if "sigkill" in t or "killed" in t or "-9" in t:
+            return ("The backend was killed by the system. On macOS that is usually memory pressure "
+                    "or a Gatekeeper block — try a lower CPU count in Settings, or run the app once "
+                    "from a Finder open.")
+        if "no eboot" in t or "not a ps5 game" in t:
+            return "The source has no eboot.bin — it is not a PS5 game folder."
+        return None
+
+    # ── layout ───────────────────────────────────────────────────────────────
     def _build(self):
-        ctk.CTkLabel(self, text=self._heading, font=ctk.CTkFont(size=22, weight="bold"),
-                      text_color=RED).pack(anchor="w", padx=20, pady=(20, 4))
+        # No big red repeat of the window title. The heading names what was doing what,
+        # one line, so the message underneath can read.
+        ctk.CTkLabel(self, text=self._heading, font=ctk.CTkFont(size=15, weight="bold"),
+                      text_color=RED).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=600, justify="left",
+                      font=ctk.CTkFont(size=13)).pack(anchor="w", padx=20, pady=(0, 8))
 
-        ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=660, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+        note = self._diagnose(self._msg, self._log)
+        if note:
+            box = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
+            box.pack(fill="x", padx=20, pady=(0, 10))
+            ctk.CTkLabel(box, text="What this means", text_color=YELLOW,
+                          font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(box, text=note, text_color=("#dddddd", "#dddddd"), wraplength=580, justify="left",
+                          font=ctk.CTkFont(size=12)).pack(anchor="w", padx=14, pady=(0, 10))
 
-        causes = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
-        causes.pack(fill="x", padx=20, pady=(0, 12))
-        ctk.CTkLabel(causes, text="Possible Causes:", text_color=YELLOW,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(10, 4))
-        for cause in self._CAUSES.get(self._op, self._DEFAULT_CAUSES):
-            ctk.CTkLabel(causes, text=cause, text_color=MUTED, anchor="w").pack(anchor="w", padx=24, pady=1)
-        ctk.CTkFrame(causes, height=8, fg_color=PANEL).pack()
-
-        ctk.CTkLabel(self, text="Last 50 Log Lines:", text_color=WHITE,
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=20, pady=(0, 4))
-        box = ctk.CTkTextbox(self, fg_color=BLACK, text_color=("#1a7a40", "#4ade80"), border_width=1, border_color=BORDER,
-                              font=ctk.CTkFont(family="Consolas", size=11), height=160, wrap="none")
-        box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-        box.insert("end", self._log or "(No log available)")
-        box.configure(state="disabled")
+        ctk.CTkLabel(self, text="Backend log (last lines)", text_color=MUTED,
+                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 2))
+        log = ctk.CTkTextbox(self, fg_color=BLACK, text_color=("#1a7a40", "#4ade80"),
+                              border_width=1, border_color=BORDER,
+                              font=ctk.CTkFont(family="Menlo", size=11), wrap="word")
+        log.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        log.insert("end", self._tail(self._log) or "(no log available)")
+        log.configure(state="disabled")
 
         btns = ctk.CTkFrame(self, fg_color=BLACK)
-        btns.pack(fill="x", padx=20, pady=(0, 16))
-        ctk.CTkButton(btns, text="Copy Error", width=140, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._copy).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btns, text="Export Raw Log", width=140, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._export_log).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btns, text="Open Log Folder", width=140, fg_color=CARD2, text_color=WHITE,
-                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._open_folder).pack(side="left", padx=(0, 8))
+        btns.pack(fill="x", padx=20, pady=(0, 14))
         ctk.CTkButton(btns, text="Close", width=100, fg_color=RED, text_color=WHITE,
                        hover_color=("#b91c1c", "#5a1a1a"), command=self.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Open log folder", width=132, fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._open_folder).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(btns, text="Copy details", width=110, fg_color=CARD2, text_color=WHITE,
+                       hover_color=("#b0b0b0", "#2a2a2a"), command=self._copy).pack(side="right", padx=(0, 8))
+
+    @staticmethod
+    def _tail(text: str, n: int = 20) -> str:
+        """The last *n* non-empty lines, so the log box does not repeat itself. The header
+        row and the [LAST 10 MB] banner are dropped — they added noise, not context."""
+        if not text:
+            return ""
+        lines = [ln for ln in text.splitlines()
+                 if ln.strip() and not ln.startswith(("[LAST 10 MB", "[COMMAND] "))]
+        return "\n".join(lines[-n:])
 
     def _copy(self):
         text = f"Error: {self._msg}\n\nLast Command: {self._cmd}\n\nLog:\n{self._log}"

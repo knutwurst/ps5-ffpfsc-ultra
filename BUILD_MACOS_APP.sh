@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build "dist/PS5 FFPFSC ULTRA.app" (macOS, Apple Silicon) plus the release zip and its
+# Build "dist/PS5 UltraPack.app" (macOS, Apple Silicon) plus the release zip and its
 # SHA-256. Run from the repository root inside an activated virtual environment.
 set -euo pipefail
 
@@ -17,15 +17,15 @@ fi
 python3 -m pip install -r requirements-build.txt
 python3 -m pip install ./backend/unrar
 (cd backend/unrar && python3 setup.py build_ext --inplace)
-python3 -m PyInstaller --clean --noconfirm PS5_FFPFSC_ULTRA_macos.spec
+python3 -m PyInstaller --clean --noconfirm PS5_UltraPack_macos.spec
 
-APP="dist/PS5 FFPFSC ULTRA.app"
+APP="dist/PS5 UltraPack.app"
 
 # APP_VERSION in the main script is the single source of truth: the spec's regex, with the
 # quote characters written as \x22 / \x27 so the expression can sit inside single quotes.
-VERSION="$(python3 -c 'import re; m = re.search(r"^APP_VERSION\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]", open("PS5_FFPFSC_ULTRA_v1.0.py", encoding="utf-8").read(), re.M); print(m.group(1) if m else "1.0")')"
+VERSION="$(python3 -c 'import re; m = re.search(r"^APP_VERSION\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]", open("PS5_UltraPack.py", encoding="utf-8").read(), re.M); print(m.group(1) if m else "1.0")')"
 
-ZIP="PS5-FFPFSC-ULTRA-${VERSION}-macos-arm64.zip"
+ZIP="PS5-UltraPack-${VERSION}-macos-arm64.zip"
 rm -f "dist/${ZIP}" "dist/${ZIP}.sha256"
 ditto -c -k --keepParent "${APP}" "dist/${ZIP}"
 (cd dist && shasum -a 256 "${ZIP}" > "${ZIP}.sha256")

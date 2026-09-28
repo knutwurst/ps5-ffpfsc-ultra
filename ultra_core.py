@@ -1,9 +1,9 @@
-"""Tk-free core of PS5 FFPFSC ULTRA.
+"""Tk-free core of PS5 UltraPack.
 
 Settings and history files, naming rules (the ShadowMount byte budget, auto-organize),
 drive and space logic (placement needs, the pre-flight gate, drive probes), game-folder
 detection, archive extraction and the GameItem queue model. Nothing here imports Tk, so
-it can be tested and reused without a display. The GUI (PS5_FFPFSC_ULTRA_v1.0.py)
+it can be tested and reused without a display. The GUI (PS5_UltraPack.py)
 re-exports every name, so code and tests that use them through the GUI module keep
 working; mutable module state (e.g. _SETTINGS_CORRUPT_COPY) must be read through this
 module.
@@ -32,23 +32,30 @@ def _bundled_backend_dir() -> Path:
 
 
 if sys.platform == "darwin":
-    APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT"
+    APP_DIR = Path.home() / "Library" / "Application Support" / "PS5_UltraPack"
 else:
-    APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PS5_FFPFSC_ULTRA_BIZKUT"
+    APP_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "PS5_UltraPack"
 # Tests and headless drivers point this at a scratch folder so they never touch the
 # real profile (settings, queue, passwords, reports).
 _ENV_APP_DIR = os.environ.get("PS5_FFPFSC_APP_DIR", "").strip()
 if _ENV_APP_DIR:
     APP_DIR = Path(_ENV_APP_DIR)
 
-# One-time migration after the PRO → ULTRA rename: if the new settings dir doesn't
-# exist yet but the old "…_PRO_BIZKUT" one does, move it over so saved settings,
-# queue, history, passwords and drive config carry across without the user noticing.
-_LEGACY_APP_DIR = APP_DIR.parent / "PS5_FFPFSC_PRO_BIZKUT"
+# One-time migration after the renames (PS5 FFPFSC PRO → PS5 FFPFSC ULTRA → PS5 UltraPack):
+# if the settings dir doesn't exist yet but an older one does, move the newest one over so
+# saved settings, queue, history, passwords, drive config and the backport patch cache
+# carry across without the user noticing.
+_LEGACY_APP_DIRS = (
+    APP_DIR.parent / "PS5_FFPFSC_ULTRA_BIZKUT",
+    APP_DIR.parent / "PS5_FFPFSC_PRO_BIZKUT",
+)
 try:
-    if not _ENV_APP_DIR and not APP_DIR.exists() and _LEGACY_APP_DIR.is_dir():
-        APP_DIR.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(_LEGACY_APP_DIR), str(APP_DIR))
+    if not _ENV_APP_DIR and not APP_DIR.exists():
+        for _legacy in _LEGACY_APP_DIRS:
+            if _legacy.is_dir():
+                APP_DIR.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(_legacy), str(APP_DIR))
+                break
 except Exception:
     pass
 
@@ -2748,7 +2755,7 @@ class GameItem:
 __all__ = [
     "APP_DIR",
     "_ENV_APP_DIR",
-    "_LEGACY_APP_DIR",
+    "_LEGACY_APP_DIRS",
     "RAW_LOG_FILE",
     "FINAL_REPORT_FILE",
     "HISTORY_FILE",

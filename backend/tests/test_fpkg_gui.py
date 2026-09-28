@@ -39,7 +39,7 @@ with zipfile.ZipFile(ZP, "w") as z:
     for f in HBT.rglob("*"):
         if f.is_file(): z.write(f, f"HomebrewTest/{f.relative_to(HBT)}")
 os.chdir(REPO)
-spec = importlib.util.spec_from_file_location("ultra", str(REPO / "PS5_FFPFSC_ULTRA_v1.0.py"))
+spec = importlib.util.spec_from_file_location("ultra", str(REPO / "PS5_UltraPack.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 errors = []
 def showerror(title, msg, **kw): errors.append(f"{title}: {msg}")

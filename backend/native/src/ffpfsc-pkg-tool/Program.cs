@@ -14,7 +14,7 @@ using LibProsperoPkg.PKG;
 namespace PkgTool;
 
 // ffpfsc-pkg-tool: thin CLI over drakmor's LibProsperoPkg 1.2.0 (a53 fpkg-gui 0.5).
-// Purpose: fPKG extract / inspect / build for ps5-ffpfsc-ultra.
+// Purpose: fPKG extract / inspect / build for ps5-ultrapack.
 // Ships as a self-contained osx-arm64 binary under backend/native/.
 
 internal static class Program

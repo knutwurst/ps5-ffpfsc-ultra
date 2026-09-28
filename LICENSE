@@ -27,7 +27,7 @@ Scope
 
 This MIT license covers the source code authored for this project:
 
-  * PS5_FFPFSC_ULTRA_v1.0.py                     (the GUI application)
+  * PS5_UltraPack.py                             (the GUI application)
   * backend/fpkg.py, backend/copy_job.py,        (Python wrappers around the
     backend/fake_sign.py                          bundled tools)
   * backend/cli.py                               (this project's own

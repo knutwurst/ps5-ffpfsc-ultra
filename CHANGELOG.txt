@@ -1,9 +1,34 @@
 ════════════════════════════════════════════════════════════════════════
-  PS5 FFPFSC ULTRA — CHANGELOG
+  PS5 UltraPack — CHANGELOG
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.1.19  (current)
+  v1.2.0  (current)
+────────────────────────────────────────────────────────────────────────
+
+NEW NAME: PS5 UltraPack
+
+  PS5 FFPFSC ULTRA is now PS5 UltraPack. The app reads and writes
+  .pkg, folders, archives and disk images by now, so we took the one
+  format it started with out of the name.
+
+    App bundle        PS5 UltraPack.app
+    Release archive   PS5-UltraPack-<version>-macos-arm64.zip
+    Bundle id         com.knutwurst.ps5ultrapack
+    Settings folder   ~/Library/Application Support/PS5_UltraPack
+    Repository        github.com/knutwurst/ps5-ultrapack
+    Main script       PS5_UltraPack.py
+
+  On the first launch the app moves your settings folder over from
+  PS5_FFPFSC_ULTRA_BIZKUT: settings, queue, history, passwords, drive
+  config and the cached backport patches come along. macOS sees a new
+  bundle id as a new app, so it asks again before the app may read
+  protected folders and removable drives. Delete the old app, and
+  .ffpfsc and .ffpfs files open in the new one. GitHub forwards the
+  old repository address.
+
+────────────────────────────────────────────────────────────────────────
+  v1.1.19
 ────────────────────────────────────────────────────────────────────────
 
 PREPARE THE PATCHED LIBRARIES IN ONE CLICK

@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 # Single source of truth: read APP_VERSION straight from the app script so the
 # bundle version always matches what the UI shows (bump APP_VERSION only).
 _m = _re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
-                open("PS5_FFPFSC_ULTRA_v1.0.py", encoding="utf-8").read(), _re.M)
+                open("PS5_UltraPack.py", encoding="utf-8").read(), _re.M)
 APP_VERSION = _m.group(1) if _m else "1.0"
 
 
@@ -59,7 +59,7 @@ def _backend_datas():
     if not any(p.startswith(_os.path.join("unrar", "_unrar")) and p.endswith(".so") for p in bundled):
         missing.append("unrar/_unrar*.so (build it: cd backend/unrar && python3 setup.py build_ext --inplace)")
     if missing:
-        raise SystemExit("PS5_FFPFSC_ULTRA_macos.spec: runtime files missing from backend/: " + ", ".join(missing))
+        raise SystemExit("PS5_UltraPack_macos.spec: runtime files missing from backend/: " + ", ".join(missing))
     return out
 
 
@@ -71,7 +71,7 @@ datas += cryptography_datas
 
 
 a = Analysis(
-    ["PS5_FFPFSC_ULTRA_v1.0.py"],
+    ["PS5_UltraPack.py"],
     pathex=["backend", "backend/unrar"],
     binaries=cryptography_binaries,
     datas=datas,
@@ -137,7 +137,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="PS5 FFPFSC ULTRA",
+    name="PS5 UltraPack",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -157,19 +157,19 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="PS5 FFPFSC ULTRA",
+    name="PS5 UltraPack",
 )
 
 app = BUNDLE(
     coll,
-    name="PS5 FFPFSC ULTRA.app",
+    name="PS5 UltraPack.app",
     icon=None,
-    # Own identifier (distinct from the old PRO app) so Launch Services associates
-    # .ffpfsc with THIS app, not the legacy PS5 FFPFSC PRO bundle that shared the id.
-    bundle_identifier="com.knutwurst.ps5ffpfscultra",
+    # Own identifier (distinct from the older PS5 FFPFSC PRO and ULTRA bundles) so Launch
+    # Services associates .ffpfsc with THIS app, not a legacy bundle.
+    bundle_identifier="com.knutwurst.ps5ultrapack",
     info_plist={
-        "CFBundleDisplayName": "PS5 FFPFSC ULTRA",
-        "CFBundleName": "PS5 FFPFSC ULTRA",
+        "CFBundleDisplayName": "PS5 UltraPack",
+        "CFBundleName": "PS5 UltraPack",
         "CFBundleShortVersionString": APP_VERSION,
         "CFBundleVersion": APP_VERSION,
         "LSMinimumSystemVersion": "12.0",

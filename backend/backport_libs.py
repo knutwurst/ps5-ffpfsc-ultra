@@ -47,7 +47,7 @@ _REPO_OWNER = "BestPig"
 _REPO_NAME = "BackPork"
 _CONTENTS_URL = "https://api.github.com/repos/{owner}/{repo}/contents/patches/{sub}"
 _RAW_URL = "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/patches/{sub}/{name}"
-_USER_AGENT = "ps5-ffpfsc-ultra"
+_USER_AGENT = "ps5-ultrapack"
 
 
 class BackportLibsError(RuntimeError):

@@ -1,7 +1,7 @@
 """End-to-end test on a REAL game: every conversion path, compared file by file.
 
     python3 backend/tests/test_e2e_corpus.py --source <game.ffpfsc | game folder> --work <scratch dir>
-                                             [--app "<PS5 FFPFSC ULTRA.app>"] [--keep]
+                                             [--app "<PS5 UltraPack.app>"] [--keep]
 
 The source is the reference (a container known to run on the console, or its folder).
 Nothing is written next to it; everything happens in --work, which needs about four times

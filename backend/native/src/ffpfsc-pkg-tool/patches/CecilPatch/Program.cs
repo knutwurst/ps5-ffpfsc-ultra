@@ -1,4 +1,4 @@
-// Applies the ps5-ffpfsc-ultra patches to a pristine LibProsperoPkg 1.2.0 assembly.
+// Applies the ps5-ultrapack patches to a pristine LibProsperoPkg 1.2.0 assembly.
 // Usage: dotnet run -- <path/to/LibProsperoPkg.dll>   (patched in place; a .orig backup is written)
 // See ../README.md for what each patch does and why it is required on a retail PS5.
 using System;

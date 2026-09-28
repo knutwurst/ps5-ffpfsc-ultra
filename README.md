@@ -1,12 +1,13 @@
-# PS5 FFPFSC ULTRA
+# PS5 UltraPack
 
 <p align="center">
-  <img src="images/full-app.jpg" alt="PS5 FFPFSC ULTRA main window" width="900">
+  <img src="images/full-app.jpg" alt="PS5 UltraPack main window" width="900">
 </p>
 
 <p align="center">
   <b>Build PS5 <code>.ffpfsc</code> containers <i>and</i> installable <code>.pkg</code> fake packages on macOS.</b><br>
-  Pack a game dump, a third-party archive, a disk image, or an existing container. Peek inside one and pull a single file out. All in one desktop app.
+  Pack a game dump, a third-party archive, a disk image, or an existing container. Peek inside one and pull a single file out. All in one desktop app.<br>
+  <sub>Formerly PS5 FFPFSC ULTRA.</sub>
 </p>
 
 <p align="center">
@@ -178,12 +179,12 @@ It detects SSD versus HDD per drive, including USB SSDs that report no flash fla
 ```bash
 python3 -m pip install customtkinter pillow tkinterdnd2 py7zr rarfile psutil cryptography
 python3 -m pip install ./backend/unrar
-python3 PS5_FFPFSC_ULTRA_v1.0.py
+python3 PS5_UltraPack.py
 ```
 
 ## Build a standalone app
 
-Run the build script from the repository root inside an activated virtual environment (it refuses to run outside one and installs the pinned inputs from `requirements-build.txt`). It needs the [.NET SDK](https://dotnet.microsoft.com/download) 9 or newer: the fPKG helper is not tracked in git, the script builds it from `backend/native/src/ffpfsc-pkg-tool` with `./BUILD_PKG_TOOL.sh` first. Run that script on its own to use `.pkg` features or the tests from a source checkout. The build produces `dist/PS5 FFPFSC ULTRA.app`, the release archive `dist/PS5-FFPFSC-ULTRA-<version>-macos-arm64.zip` and its `.sha256`:
+Run the build script from the repository root inside an activated virtual environment (it refuses to run outside one and installs the pinned inputs from `requirements-build.txt`). It needs the [.NET SDK](https://dotnet.microsoft.com/download) 9 or newer: the fPKG helper is not tracked in git, the script builds it from `backend/native/src/ffpfsc-pkg-tool` with `./BUILD_PKG_TOOL.sh` first. Run that script on its own to use `.pkg` features or the tests from a source checkout. The build produces `dist/PS5 UltraPack.app`, the release archive `dist/PS5-UltraPack-<version>-macos-arm64.zip` and its `.sha256`:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -193,7 +194,7 @@ python3 -m venv .venv && source .venv/bin/activate
 The app is ad-hoc signed. On a Mac other than the one it was built on, clear the quarantine flag before the first launch:
 
 ```bash
-xattr -dr com.apple.quarantine "PS5 FFPFSC ULTRA.app"
+xattr -dr com.apple.quarantine "PS5 UltraPack.app"
 ```
 
 ## Sources and credits

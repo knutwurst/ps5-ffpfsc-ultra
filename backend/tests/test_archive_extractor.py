@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
-_spec = importlib.util.spec_from_file_location("ultra_under_test", str(REPO / "PS5_FFPFSC_ULTRA_v1.0.py"))
+_spec = importlib.util.spec_from_file_location("ultra_under_test", str(REPO / "PS5_UltraPack.py"))
 m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(m)
 

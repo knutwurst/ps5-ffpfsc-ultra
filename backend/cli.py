@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PS5 FFPFSC ULTRA — backend wrapper (MkPFS 1.0.0, vendored under backend/mkpfs)"""
+"""PS5 UltraPack — backend wrapper (MkPFS 1.0.0, vendored under backend/mkpfs)"""
 import sys
 import os
 
@@ -1679,7 +1679,7 @@ def _extracted_zip_source(path: Path, *, temp_root=None, password: str | None = 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PS5 FFPFSC ULTRA backend — create .ffpfsc containers or extract .ffpfs/.ffpfsc images."
+        description="PS5 UltraPack backend — create .ffpfsc containers or extract .ffpfs/.ffpfsc images."
     )
     parser.add_argument("game_folder", nargs='?', help="Source game folder, .exfat/.ffpkg file, or .ffpfs/.ffpfsc image")
     parser.add_argument("output", nargs='?', default=".", help="Output .ffpfsc file/directory, or extraction directory")
@@ -1879,7 +1879,7 @@ def main() -> None:
                   "and --backport-libs (where the patched files land)", flush=True)
             sys.exit(2)
         import backport_libs as _bpl
-        cache = Path.home() / "Library" / "Application Support" / "PS5_FFPFSC_ULTRA_BIZKUT" / "backport-patches"
+        cache = Path.home() / "Library" / "Application Support" / "PS5_UltraPack" / "backport-patches"
         try:
             r = _bpl.prepare_target(target, fw, out, cache_dir=cache,
                                     log=lambda m: print(m, flush=True))

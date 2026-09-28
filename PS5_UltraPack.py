@@ -94,8 +94,8 @@ except Exception:
     DND_FILES = None
     _HAS_DND = False
 
-APP_NAME = "PS5 FFPFSC ULTRA"
-APP_VERSION = "1.1.19"
+APP_NAME = "PS5 UltraPack"
+APP_VERSION = "1.2.0"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -163,7 +163,7 @@ MUTED   = ("#555555", "#a1a1aa")   # secondary text
 class FirstRunWizard(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.title("PS5 FFPFSC ULTRA — First Run Setup")
+        self.title(f"{APP_NAME} — First Run Setup")
         self.geometry("640x520")
         self.resizable(False, False)
         self.grab_set()
@@ -274,7 +274,7 @@ class FirstRunWizard(ctk.CTkToplevel):
             if self.output_path.get():
                 summary.append(f"Output Folder:  {self.output_path.get()}")
             summary.append("")
-            summary.append("Click Finish to launch PS5 FFPFSC ULTRA.")
+            summary.append(f"Click Finish to launch {APP_NAME}.")
             for line in summary:
                 ctk.CTkLabel(self.body, text=line, text_color=WHITE, anchor="w",
                               font=ctk.CTkFont(family="Consolas", size=12)).pack(anchor="w", padx=14, pady=2)
@@ -751,7 +751,7 @@ def export_diagnostic_zip(last_cmd: str = "", extra_info: str = "") -> Path | No
                 pass
 
             session_info = "\n".join([
-                f"PS5 FFPFSC ULTRA {APP_VERSION}",
+                f"{APP_NAME} {APP_VERSION}",
                 f"Generated:      {now_datetime()}",
                 f"Python:         {sys.version}",
                 f"OS:             {sys.platform} {os.name}",
@@ -4936,7 +4936,7 @@ class App:
 
         title_box = ctk.CTkFrame(header, fg_color=BLACK)
         title_box.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_box, text="PS5 FFPFSC ULTRA",
+        ctk.CTkLabel(title_box, text=APP_NAME,
                       font=ctk.CTkFont(size=26, weight="bold"), text_color=WHITE).pack(anchor="w")
         ctk.CTkLabel(title_box, text=f"v{APP_VERSION}  ·  Bizkut backend  ·  {MKPFS_NAME} v{MKPFS_VERSION}  ·  by Knutwurst",
                       text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=2)

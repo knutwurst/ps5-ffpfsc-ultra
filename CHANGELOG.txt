@@ -3,27 +3,40 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v1.2.0  (current)
+  v2.0.0  (current)
 ────────────────────────────────────────────────────────────────────────
 
 A NEW MAIN WINDOW
 
-  The window has three columns now: a sidebar, the job list, and a
-  card for the selected job.
+  The window has a sidebar, the job list, and a details pane for the
+  selected job that opens when you need it.
 
   - The sidebar switches between Queue, History (past jobs and
     totals), Log (everything the backend printed) and Settings, and
     holds the tools Look inside, Organize and Clean temp.
-  - The job card shows the recipe (source, changes, output), the
-    target folder and, while the job runs, only the stages this job
-    goes through, its speed, elapsed and remaining time, and the last
-    four log lines. Cancel sits on the card and appears only while a
-    job runs.
+  - The details pane is closed at first, so the list takes the full
+    width and each row shows its progress. A click on a job opens it;
+    the button at the right of the queue header, View > Show Details
+    and Option-Cmd-I toggle it, and an empty queue closes it. It shows
+    the recipe (source, changes, output with its compression) and the
+    target folder; a block below lists the job's status (with the
+    reason when it failed), source, changes, compression and the
+    space it needs. While the job runs it also shows only the stages
+    this job goes through, its speed, elapsed and remaining time. The
+    log takes the height that is left, so a taller window shows more
+    of it, and the actions sit at the bottom.
+  - While the queue runs, Start turns into Stop, so you can stop with
+    the details closed.
   - The status bar shows RAM and the free space on the temp and
     output drives. A worker thread reads the drives, so a sleeping
     HDD cannot stall the window.
-  - Compression level, cores and block size fit in one line under
-    the list; Change opens a small panel with the controls.
+  - Compression is a setting of each job. Add job shows it under the
+    output format: a level from 1 to 9 for .ffpfsc, normal or fast for
+    .pkg, one row in the same place for both. Settings › Compression
+    holds the values a new job starts with and the CPU cores, and the
+    editor remembers the last level you used. The details pane names
+    the job's compression. The block size is no longer a setting:
+    every build uses the 64 KiB blocks the PS5 needs.
   - Text follows the macOS sizes, in logical pixels everywhere: 13
     for text and navigation, 12 for second lines, 11 for captions,
     15 and 17 for titles, Menlo 11 for the log and 10 for its preview.
@@ -32,10 +45,17 @@ A NEW MAIN WINDOW
     Green means done, amber a warning, red an error. One set of
     stroke icons replaces the emoji.
   - The window opens at 1280 x 820 and works down to 900 x 600. The
-    job card keeps its width when you resize the window; drag the
+    details pane keeps its width when you resize the window; drag the
     divider to change it, and the app remembers it.
-  - Cmd+N adds a job, Cmd+, opens Settings, Cmd+1 to Cmd+3 switch
-    views. Right-click a job for Edit, Move up, Move down and Remove.
+  - A menu bar: File (Add Job, Look Inside, Organize, Start and Stop
+    Queue, Clean Temp Folder), Edit, View (Queue, History, Log, Show
+    Details, Appearance), Window and Help (the repository, the log
+    folder, the raw backend log, diagnostics). On macOS the app menu
+    carries About and Settings, and Quit asks first while a job runs.
+  - Shortcuts, Cmd on macOS and Ctrl elsewhere: N adds a job, O opens
+    Look inside, R starts, . stops, comma opens Settings, 1 to 3
+    switch views. Right-click a job for Edit, Move up, Move down and
+    Remove.
 
 WORK IN THE MAIN WINDOW, MESSAGES IN WINDOWS OF THEIR OWN
 
@@ -44,9 +64,9 @@ WORK IN THE MAIN WINDOW, MESSAGES IN WINDOWS OF THEIR OWN
   libraries, About. General gains an Appearance switch and a "Clean
   temp now" button.
 
-  The work surfaces open as panels over the content area: Add job,
-  Edit job, Look inside, the compression controls and the first-run
-  setup. The sidebar pauses while a panel is open, Escape or the
+  The work surfaces open as pages over the content area: Add job,
+  Edit job, Look inside and the first-run setup; no small panels
+  float in the window any more. The sidebar pauses while a panel is open, Escape or the
   close button dismisses it, and Return still adds a job.
   Double-clicking a .ffpfsc or .ffpfs in Finder opens it in Look
   inside, in the main window.
@@ -76,9 +96,84 @@ CLEANER CONTROLS
   - Look inside has a dark scrollbar and one primary button. Add job
     lines its option notes up in one column, shows a scrollbar only
     when the options do not fit, and puts the summary next to its
-    buttons. The compression panel is as tall as its content, and the
-    job card's log preview shows exactly the last four lines.
+    buttons. Its help line keeps one height while the pointer moves
+    over the options, so the buttons below it stay put; a three-line
+    hint used to push them up and down.
   - Labels and buttons use sentence case throughout.
+  - The Browse buttons in Settings › Backport & libraries are no
+    longer blue.
+
+BACKPORT: SIGNED GAMES, ONE FOLDER PER FIRMWARE, A CHECK THAT DECIDES
+
+  - Fake-signed games backport now. The app reads their executables
+    through the signature container and changes the two SDK values
+    inside the signed file; every other byte stays. Before, a signed
+    eboot.bin or prx was skipped without a word, so the job lowered
+    nothing. An encrypted executable stops the job with a message.
+  - Settings › Backport & libraries takes one firmware folder with a
+    subfolder per firmware (7.61, 9.60, 10.01, ...). Check compares a
+    game with the target's subfolder and reads it to the bottom, not
+    only its top level; Prepare reads 10.01. The folder comes first on
+    the page and says how many firmwares it found.
+  - Every firmware subfolder is a backport target, with the SDK values
+    that firmware's own system libraries carry. A subfolder whose
+    libraries are encrypted, or come from a newer firmware than its
+    name, is refused with the reason. The target in Add job is a menu
+    now.
+  - The check decides whether a build needs patched libraries. If the
+    target has every function the game uses, lowering the SDK is
+    enough. If it lacks some, a build without patched libraries for
+    that target stops before it changes anything and names the
+    libraries; public sets exist only for 7.61 and 6.02. Functions the
+    game's own modules export count as present; Check used to report
+    them as missing.
+  - Fix: a job copied no patched libraries when it pointed at the
+    folder Prepare fills, because Prepare writes one subfolder per
+    target (since 1.1.19). A job now takes <patched folder>/<target>/.
+  - The patched libraries folder cannot be the firmware libraries
+    folder: the editor and the build refuse it, because the original
+    libraries would land in fakelib/.
+  - Add job shows the SDK of a fake-signed eboot.bin too, and says so
+    when it is encrypted.
+  - Command line: --backport-target takes any firmware from
+    --fw-libs-root; --backport-analyze prints one verdict line and
+    exits 1 while functions are missing.
+
+THE FIRMWARE A GAME NEEDS, IN ITS NAME
+
+  - Organized file names end with the firmware the game needs:
+    <Title> [TID] [vX.Y] [fwN.NN].pkg. The app reads it from the SDK
+    version in eboot.bin; for a .ffpfsc or a .pkg it reads only the
+    headers, through the container. A backport lowers it to the
+    target, and an integrated patch counts with its own eboot.bin.
+    When it cannot be read, the tag is left out rather than guessed.
+    Organize writes the same names.
+  - Command line: --sdk-of SRC prints it for a folder, a .ffpfs/.ffpfsc
+    or a .pkg.
+
+ONE EDITOR FOR EVERY JOB
+
+  Edit (double-click, the details pane or the row's menu) opens the job
+  editor for every kind of job, including ones added by dropping
+  several files at once, by Organize, by the patch detection or from
+  an older saved queue. It opens with the job's own format and
+  choices, and saving replaces the job at its place in the queue.
+
+  - The .pkg options gain "More options…": the package identity
+    (Content ID, Title ID, Title, Version), filled in from a game
+    folder's param.json, and the codec layer; on Windows also the
+    Kraken backend. For a game folder without a param.json the
+    identity opens by itself and Content ID and Title ID are required.
+  - The old Pack, Patch, Convert and small edit dialogs are gone; the
+    editor does all of it.
+  - Fix: an archive job from the editor kept only its archive. After
+    the extraction it ran as a plain .ffpfsc pack and dropped its
+    format, sign, patch and backport (since 1.1.19). It now keeps its
+    job, and the other games of a multi-game archive get the same job;
+    for a .pkg only the compression carries over, each game keeps its
+    own identity.
+  - Fix: the .pkg defaults (retail fixes, HDR, PlayGo, speed, codec)
+    are remembered across restarts again.
 
 FASTER
 
@@ -98,7 +193,17 @@ TESTS
 
   The GUI driver checks that messages open in windows of their own,
   that they wait while the main window is hidden, and that the work
-  surfaces stay panels.
+  surfaces stay panels. It also checks the wiring of the whole main
+  window: every sidebar entry, header button, card action, menu bar
+  and context menu entry and shortcut, the details pane, Start and
+  Stop, the compression controls, the theme switch and the options'
+  scrollbar, and the backport targets, hints and Check of the job
+  editor (194 checks). The job editor's checks replace the old Pack
+  dialog's, one for each older kind of job it now edits.
+
+  The backport suites cover fake-signed files made by the bundled
+  signer, per-firmware targets, the firmware folder checks and the
+  build rule on the command line (36 unit tests, 7 CLI cases).
 
   test_archive_extractor and test_chain_items point the profile at a
   scratch folder before they load the app code, so the settings

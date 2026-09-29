@@ -15,6 +15,7 @@ import signal
 import shutil
 import struct
 import types
+import webbrowser
 import multiprocessing
 from pathlib import Path
 
@@ -95,7 +96,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 UltraPack"
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.0"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -116,6 +117,53 @@ import ultra_core  # noqa: E402
 from ultra_core import *  # noqa: E402,F401,F403
 from ui_kit import (Kit, IconButton, IconView, ArtView, ProgressBar, QueueList,  # noqa: E402
                     Chips, StepStrip, LogText, Tile, RoundBox, ctk_pair, apply_ctk_theme, PALETTE)
+
+
+def _backport_module():
+    """backend/backport.py, imported in-process for its read-only helpers (targets,
+    SDK words, the firmware folder checks). Jobs still run it through the CLI."""
+    _bd = str(backend_base_dir())
+    if _bd not in sys.path:
+        sys.path.insert(0, _bd)
+    import backport
+    return backport
+
+
+def _firmware_folder_status(raw: str) -> str:
+    """One line under the firmware libraries setting: what the app found there."""
+    if not raw:
+        return "Not set: backports use the three public targets, and Check has nothing to compare with."
+    root = Path(raw)
+    if not root.is_dir():
+        return "This folder does not exist."
+    try:
+        folders = _backport_module().firmware_folders(root)
+    except Exception as e:
+        return f"Could not read the folder: {e}"
+    if folders:
+        names = list(folders)
+        span = names[0] if len(names) == 1 else f"{names[0]} … {names[-1]}"
+        return f"{len(names)} firmware folder(s) found: {span}."
+    if any(root.rglob("*.sprx")):
+        return "No firmware subfolders: the libraries here count for every target. Name a subfolder per firmware."
+    return "No firmware subfolders and no .sprx libraries found."
+
+
+def _wrapped_line_count(font, text: str, width: int) -> int:
+    """How many lines *text* takes in *font* when a Tk label wraps it at *width* pixels
+    (breaks between words, like Tk)."""
+    lines = 0
+    for paragraph in str(text).split("\n"):
+        lines += 1
+        used, space = 0, font.measure(" ")
+        for word in paragraph.split():
+            w = font.measure(word)
+            if used and used + space + w > width:
+                lines += 1
+                used = w
+            else:
+                used = used + (space if used else 0) + w
+    return max(1, lines)
 
 
 def _augment_path_for_gui() -> None:
@@ -164,6 +212,19 @@ DANGER_HOVER = ctk_pair("danger_hover")
 WHITE   = ctk_pair("text")            # primary text (dark text in light mode)
 MUTED   = ctk_pair("muted")           # secondary text
 MONO_FONT = "Menlo"                   # ships with macOS (Consolas does not)
+# Shortcuts: Command on macOS, Control elsewhere. ACCEL is what a menu shows (Tk on macOS
+# turns "Command-N" into a real key equivalent), SHORTCUT what a tooltip says.
+IS_MAC = sys.platform == "darwin"
+MOD = "Command" if IS_MAC else "Control"
+_KEYS = {"add": "N", "open": "O", "start": "R", "stop": ".", "settings": ",", "queue": "1",
+         "history": "2", "log": "3", "details": "I"}
+if IS_MAC:
+    ACCEL = {k: ("Command-Option-I" if k == "details" else f"Command-{v}") for k, v in _KEYS.items()}
+    SHORTCUT = {k: ("⌥⌘I" if k == "details" else f"⌘{v}") for k, v in _KEYS.items()}
+else:
+    ACCEL = SHORTCUT = {k: ("Ctrl+Alt+I" if k == "details" else f"Ctrl+{v}") for k, v in _KEYS.items()}
+DETAILS_SEQ = "<Command-Option-i>" if IS_MAC else "<Control-Alt-i>"
+REPO_URL = "https://github.com/knutwurst/ps5-ultrapack"
 # The dialogs use the main window's type scale (see ui_kit.Fonts): logical pixels, which
 # is also what CTkFont sizes are. If a CTk scaling is ever set, set it before any window
 # exists: changing it pins every open CTk window to its current size for a second.
@@ -183,22 +244,48 @@ def set_window_appearance(win, mode: str) -> None:
 
 class ScrollFrame(ctk.CTkScrollableFrame):
     """A CTkScrollableFrame whose scrollbar shows only while the content is taller than
-    the frame; CustomTkinter keeps it on screen even when there is nothing to scroll."""
+    the frame; CustomTkinter keeps it on screen even when there is nothing to scroll.
+
+    The decision compares the content's requested height with the canvas height, once the
+    layout has settled. Deciding from the canvas's scroll fractions instead made the bar
+    blink: they arrive re-entrantly while the frame re-lays out, from a scroll region that
+    is briefly far too large, and hiding the bar re-lays it out again."""
+
+    SETTLE_MS = 60
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._sb_shown = True
-        self._parent_canvas.configure(yscrollcommand=self._on_yscroll)
+        self._sb_job = None
+        self._parent_canvas.bind("<Configure>", lambda e: self._queue_sb_check(), add="+")
+        self.bind("<Configure>", lambda e: self._queue_sb_check(), add="+")
 
-    def _on_yscroll(self, first, last):
-        self._scrollbar.set(first, last)
-        need = float(first) > 0.0 or float(last) < 1.0
+    def _queue_sb_check(self):
+        if self._sb_job is None:
+            self._sb_job = self.after(self.SETTLE_MS, self._sb_check)
+
+    def _sb_check(self):
+        self._sb_job = None
+        try:
+            need = self.winfo_reqheight() > self._parent_canvas.winfo_height() + 2
+        except tk.TclError:
+            return
         if need != self._sb_shown:
             self._sb_shown = need
             if need:
                 self._scrollbar.grid()
             else:
                 self._scrollbar.grid_remove()
+                self._parent_canvas.yview_moveto(0.0)
+
+    def destroy(self):
+        if self._sb_job is not None:
+            try:
+                self.after_cancel(self._sb_job)
+            except tk.TclError:
+                pass
+            self._sb_job = None
+        super().destroy()
 
 
 class PanelHost:
@@ -254,7 +341,8 @@ class PanelHost:
         m = self.MARGIN
         slot = top._slot
         if top.LARGE:
-            slot.place(relx=0.5, y=m, anchor="n", width=min(self.LARGE_MAX_W, W - 2 * m), height=H - 2 * m)
+            max_w = getattr(top, "MAX_W", self.LARGE_MAX_W)
+            slot.place(relx=0.5, y=m, anchor="n", width=min(max_w, W - 2 * m), height=H - 2 * m)
         else:
             pw, ph = top.preferred_size()
             slot.place(relx=0.5, rely=0.5, anchor="center", width=min(pw, W - 2 * m), height=min(ph, H - 2 * m))
@@ -468,6 +556,9 @@ class MessageWindow(ctk.CTkToplevel):
 
 
 class FirstRunWizard(EmbeddedDialog):
+    LARGE = True
+    MAX_W = 700            # a readable column, not the full width of a wide window
+
     def __init__(self, parent):
         super().__init__(parent)
         self.title(f"{APP_NAME} — First Run Setup")
@@ -491,11 +582,10 @@ class FirstRunWizard(EmbeddedDialog):
         self.sub = ctk.CTkLabel(self, text="", text_color=MUTED, wraplength=580, justify="left")
         self.sub.pack(padx=30, anchor="w")
 
-        self.body = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
-        self.body.pack(fill="both", expand=True, padx=30, pady=18)
-
         nav = ctk.CTkFrame(self, fg_color=BLACK)
-        nav.pack(fill="x", padx=30, pady=(0, 20))
+        nav.pack(side="bottom", fill="x", padx=30, pady=(0, 20))
+        self.body = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+        self.body.pack(fill="x", padx=30, pady=18)
         nav.grid_columnconfigure(1, weight=1)
         self.back_btn = ctk.CTkButton(nav, text="← Back", width=100, fg_color=BTN, text_color=WHITE,
                                        hover_color=BTN_HOVER, command=self._back, border_width=1, border_color=BTN_BORDER)
@@ -517,11 +607,12 @@ class FirstRunWizard(EmbeddedDialog):
         self.back_btn.configure(state="normal" if n > 0 else "disabled")
         self.next_btn.configure(text="Finish" if n == 3 else "Next →")
         self._clear_body()
+        ctk.CTkFrame(self.body, height=8, fg_color=PANEL).pack(fill="x")          # top padding of the box
 
         if n == 0:
             self.header.configure(text="Choose a temp folder")
             self.sub.configure(text="Put it on a fast SSD or NVMe drive: a mechanical HDD slows large games down.")
-            ctk.CTkLabel(self.body, text="Temp folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
+            ctk.CTkLabel(self.body, text="Temp folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
             row = ctk.CTkFrame(self.body, fg_color=PANEL)
             row.pack(fill="x", padx=14)
             row.grid_columnconfigure(0, weight=1)
@@ -532,7 +623,7 @@ class FirstRunWizard(EmbeddedDialog):
         elif n == 1:
             self.header.configure(text="Choose an output folder")
             self.sub.configure(text="Finished .ffpfsc files go here. An external drive works, and so does the temp drive.")
-            ctk.CTkLabel(self.body, text="Output folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(14, 4))
+            ctk.CTkLabel(self.body, text="Output folder", text_color=WHITE).pack(anchor="w", padx=14, pady=(6, 4))
             row = ctk.CTkFrame(self.body, fg_color=PANEL)
             row.pack(fill="x", padx=14)
             row.grid_columnconfigure(0, weight=1)
@@ -585,6 +676,8 @@ class FirstRunWizard(EmbeddedDialog):
             for line in summary:
                 ctk.CTkLabel(self.body, text=line, text_color=WHITE, anchor="w",
                               font=ctk.CTkFont(family=MONO_FONT, size=11)).pack(anchor="w", padx=14, pady=2)
+        self._bottom_pad = ctk.CTkFrame(self.body, height=14, fg_color=PANEL)
+        self._bottom_pad.pack(fill="x")                                            # bottom padding of the box
 
     def _probe_temp_drive_type(self, tpath: Path, label, tfree: int) -> None:
         """Detect SSD/HDD for the temp drive on a worker thread (get_drive_type may block
@@ -1093,7 +1186,7 @@ class SettingsView:
     PAGES = [
         ("general", "General", "settings",
          "Where new jobs write, and how the app tells you it is done. Changes apply immediately."),
-        ("compression", "Compression", "package", "Defaults for .ffpfsc and .ffpfs builds."),
+        ("compression", "Compression", "package", "What a new job starts with, and the CPU cores."),
         ("archives", "Archives", "key", "Passwords for protected archives."),
         ("drives", "Drives & space", "drive",
          "Where archives are unpacked, how much free space a job needs, and how drives are kept awake."),
@@ -1205,14 +1298,15 @@ class SettingsView:
                 cb.configure(command=lambda k=key, v=var: save_settings({k: v.get()}))
             cb.pack(anchor="w", padx=14, pady=6)
 
-        # MkPFS tuning sliders
+        # Defaults for new jobs. Each job keeps its own compression (Add job › Output), the
+        # editor starts from these and remembers the last one used; cores are the machine's.
         _st = ctk.CTkFrame(comp, fg_color="transparent")
         _st.pack(fill="x", padx=14, pady=(4, 8))
         _st.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(_st, text="Compression level (0-9):", text_color=WHITE,
+        ctk.CTkLabel(_st, text=".ffpfsc level for new jobs:", text_color=WHITE,
                       font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky="w", pady=4)
-        ctk.CTkSlider(_st, from_=0, to=9, number_of_steps=9,
+        ctk.CTkSlider(_st, from_=1, to=9, number_of_steps=8,
                        variable=self.app.compression_level_var,
                        fg_color=BORDER2, progress_color=ACCENT, button_color=ACCENT,
                        button_hover_color=ACCENT_HOVER).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
@@ -1221,40 +1315,49 @@ class SettingsView:
         _cl_lbl.grid(row=0, column=2)
         def _cl_cb(*_):
             # The app-level var already persists on write (trace added at creation);
-            # this callback only refreshes the window-local label. Guard against firing
-            # after this Settings window was closed (the trace can outlive the label).
+            # this callback only refreshes the page-local label. Guard against firing
+            # after the page was rebuilt (the trace can outlive the label).
             if _cl_lbl.winfo_exists():
                 _cl_lbl.configure(text=str(self.app.compression_level_var.get()))
         self.app.compression_level_var.trace_add("write", _cl_cb)
 
-        ctk.CTkLabel(_st, text="CPU cores (0=auto):", text_color=WHITE,
+        ctk.CTkLabel(_st, text=".pkg speed for new jobs:", text_color=WHITE,
                       font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", pady=4)
+        try:
+            _pkg_fast = int(self.app.fpkg_defaults.get("level", 7)) < 0
+        except (TypeError, ValueError):
+            _pkg_fast = False
+        _pkg_speed = tk.StringVar(value="fast" if _pkg_fast else "normal")
+
+        def _set_pkg_speed(value):
+            self.app.fpkg_defaults["level"] = -4 if value == "fast" else 7
+            save_settings({"fpkg_defaults": self.app.fpkg_defaults})
+        ctk.CTkSegmentedButton(_st, values=["normal", "fast"], variable=_pkg_speed, command=_set_pkg_speed,
+                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+                                height=26).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        ctk.CTkLabel(_st, text="CPU cores (0=auto):", text_color=WHITE,
+                      font=ctk.CTkFont(size=12)).grid(row=2, column=0, sticky="w", pady=4)
         ctk.CTkSlider(_st, from_=0, to=16, number_of_steps=16,
                        variable=self.app.cpu_count_var,
                        fg_color=BORDER2, progress_color=ACCENT, button_color=ACCENT,
-                       button_hover_color=ACCENT_HOVER).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+                       button_hover_color=ACCENT_HOVER).grid(row=2, column=1, sticky="ew", padx=8, pady=4)
         _cpu_lbl = ctk.CTkLabel(_st, text="auto" if self.app.cpu_count_var.get() == 0 else str(self.app.cpu_count_var.get()),
                                   text_color=ACCENT, font=ctk.CTkFont(size=12, weight="bold"), width=24)
-        _cpu_lbl.grid(row=1, column=2)
+        _cpu_lbl.grid(row=2, column=2)
         def _cpu_cb(*_):
             if _cpu_lbl.winfo_exists():
                 v = self.app.cpu_count_var.get()
                 _cpu_lbl.configure(text="auto" if v == 0 else str(v))
         self.app.cpu_count_var.trace_add("write", _cpu_cb)
 
-        ctk.CTkLabel(_st, text="Block size:", text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).grid(row=2, column=0, sticky="w", pady=4)
-        _bs_opts = ["auto", "65536"]
-        _bs_menu = ctk.CTkOptionMenu(
-            _st, values=_bs_opts, variable=self.app.block_size_var,
-            width=110, height=28,
-            font=ctk.CTkFont(size=12),
-            command=lambda v: save_settings({"block_size": v}),
-        )
-        _bs_menu.grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        ctk.CTkLabel(_st, text="PS5 needs 64 KiB. auto = 65536 (recommended). Smaller blocks crash the console.",
-                      text_color=MUTED, font=ctk.CTkFont(size=11)).grid(
-            row=2, column=2, sticky="w", pady=4)
+        ctk.CTkLabel(_st, text="Each job keeps its own compression, set in Add job under Output; a new job starts "
+                               "from these values, and the editor remembers the last one you used. Higher .ffpfsc "
+                               "levels give smaller files and take longer; 7 is the default. Blocks are always "
+                               "64 KiB, the size the PS5 needs. With cores on auto the app decides by game size "
+                               "and uses fewer when the output drive is a slow HDD.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # ── Folder bundles ───────────────────────────────────────────────────
         _cs_cb = ctk.CTkCheckBox(
@@ -1484,33 +1587,69 @@ class SettingsView:
                 self.app.ampr_var.set(c)
                 _save_ampr()
         _ampr_entry.bind("<FocusOut>", lambda e: _save_ampr())
-        ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=_browse_ampr).pack(side="left")
+        ctk.CTkButton(_ampr_row, text="Browse", width=80, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                      border_width=1, border_color=BTN_BORDER, command=_browse_ampr).pack(side="left")
 
         # ── Backport folders ─────────────────────────────────────────────────
-        ctk.CTkLabel(ds, text="Backport — patched libraries folder (default for new jobs):",
+        # The firmware folder comes first: Prepare reads from it, Check compares with it,
+        # and every subfolder in it is a backport target.
+        ctk.CTkLabel(ds, text="Backport — firmware libraries:",
                       text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="Your own patched system libraries for the target firmware (you extract them from "
-                              "your firmware and apply the public patches yourself; nothing ships with this app). "
-                              "Copied into the game's fakelib/ when a job backports.",
+        ctk.CTkLabel(ds, text="Your original system libraries, one subfolder per firmware named by its version "
+                              "(7.61, 10.01, …). Each subfolder becomes a backport target with the SDK values "
+                              "read from its libraries. Check compares a game with the target's subfolder, "
+                              "Prepare reads 10.01. Nothing ships with this app.",
+                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
+                      wraplength=640).pack(anchor="w", padx=14)
+        _fw_row = ctk.CTkFrame(ds, fg_color="transparent")
+        _fw_row.pack(fill="x", padx=14, pady=(4, 0))
+        _fw_entry = ctk.CTkEntry(_fw_row, textvariable=self.app.fw_libs_var,
+                                 placeholder_text="Folder with one subfolder per firmware…")
+        _fw_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _fw_status = tk.StringVar(value="")
+
+        def _show_fw_status():
+            _fw_status.set(_firmware_folder_status((self.app.fw_libs_var.get() or "").strip()))
+
+        def _save_fw(*_):
+            save_settings({"fw_libs_root": self.app.fw_libs_var.get().strip()})
+            _show_fw_status()
+        def _browse_fw():
+            from tkinter import filedialog
+            c = filedialog.askdirectory(title="Select the folder with one subfolder per firmware")
+            if c:
+                self.app.fw_libs_var.set(c)
+                _save_fw()
+        _fw_entry.bind("<FocusOut>", lambda e: _save_fw())
+        ctk.CTkButton(_fw_row, text="Browse", width=80, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                      border_width=1, border_color=BTN_BORDER, command=_browse_fw).pack(side="left")
+        ctk.CTkLabel(ds, textvariable=_fw_status, text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w",
+                      justify="left", wraplength=640).pack(anchor="w", padx=14, pady=(2, 4))
+        _show_fw_status()
+
+        ctk.CTkLabel(ds, text="Backport — patched libraries (default for new jobs):",
+                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
+        ctk.CTkLabel(ds, text="Patched system libraries, one subfolder per target (Prepare below makes 7.61 and "
+                              "6.02). A job copies the set for its target into the game's fakelib/. Needed only "
+                              "when the target lacks functions the game uses.",
                       text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
                       wraplength=640).pack(anchor="w", padx=14)
         _bl_row = ctk.CTkFrame(ds, fg_color="transparent")
         _bl_row.pack(fill="x", padx=14, pady=(4, 4))
         _bl_entry = ctk.CTkEntry(_bl_row, textvariable=self.app.backport_libs_var,
-                                 placeholder_text="Folder with patched .sprx files…")
+                                 placeholder_text="Folder for the patched libraries…")
         _bl_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         def _save_bl(*_):
             save_settings({"backport_libs_root": self.app.backport_libs_var.get().strip()})
         def _browse_bl():
             from tkinter import filedialog
-            c = filedialog.askdirectory(title="Select the folder with your patched PS5 libraries")
+            c = filedialog.askdirectory(title="Select the folder for your patched PS5 libraries")
             if c:
                 self.app.backport_libs_var.set(c)
                 _save_bl()
         _bl_entry.bind("<FocusOut>", lambda e: _save_bl())
-        ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=_browse_bl).pack(side="left")
+        ctk.CTkButton(_bl_row, text="Browse", width=80, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                      border_width=1, border_color=BTN_BORDER, command=_browse_bl).pack(side="left")
 
         # One-click prepare: BestPig BackPork patches (small, ~1 KB total per target) →
         # applied to the user's 10.01 libraries → written into the patched-libraries
@@ -1524,37 +1663,12 @@ class SettingsView:
             ctk.CTkButton(_prep_row, text=f"Prepare {_t}", width=100, height=26,
                            fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
                            command=lambda t=_t: self.app.prepare_backport_libs(t), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(ds, text="Downloads the current .bps patches for the target from BackPork's public "
-                              "GitHub repo, applies them to your 10.01 libraries in the folder ABOVE, and "
-                              "writes the patched files into the patched-libraries folder in a <target> "
-                              "subfolder. The patches are small and cached; the libraries never leave your "
-                              "machine.",
+        ctk.CTkLabel(ds, text="Downloads BackPork's current .bps patches for the target from its public GitHub "
+                              "repo (small, cached), applies them to the libraries in your 10.01 subfolder and "
+                              "writes the result into the patched libraries folder, in a subfolder named after "
+                              "the target. The libraries never leave your machine.",
                       text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
                       wraplength=640).pack(anchor="w", padx=14, pady=(4, 4))
-
-        ctk.CTkLabel(ds, text="Backport — original firmware libraries (for the compatibility check):",
-                      text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(8, 2))
-        ctk.CTkLabel(ds, text="The unmodified system libraries of the target firmware. The job dialog's Check "
-                              "reads which functions they export and compares them with what a game imports, "
-                              "so you see before building whether the game can run there.",
-                      text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w", justify="left",
-                      wraplength=640).pack(anchor="w", padx=14)
-        _fw_row = ctk.CTkFrame(ds, fg_color="transparent")
-        _fw_row.pack(fill="x", padx=14, pady=(4, 4))
-        _fw_entry = ctk.CTkEntry(_fw_row, textvariable=self.app.fw_libs_var,
-                                 placeholder_text="Folder with the firmware's .sprx files…")
-        _fw_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        def _save_fw(*_):
-            save_settings({"fw_libs_root": self.app.fw_libs_var.get().strip()})
-        def _browse_fw():
-            from tkinter import filedialog
-            c = filedialog.askdirectory(title="Select the folder with the firmware's system libraries")
-            if c:
-                self.app.fw_libs_var.set(c)
-                _save_fw()
-        _fw_entry.bind("<FocusOut>", lambda e: _save_fw())
-        ctk.CTkButton(_fw_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=_browse_fw).pack(side="left")
 
         # ── fPKG: optional Sony Publishing Tools DLL ─────────────────────────
         ctk.CTkLabel(ds, text="fPKG — Publishing Tools DLL (optional, Windows only):",
@@ -1580,8 +1694,8 @@ class SettingsView:
                 self.app.pubtools_dll_var.set(c)
                 _save_pt()
         _pt_entry.bind("<FocusOut>", lambda e: _save_pt())
-        ctk.CTkButton(_pt_row, text="Browse", width=80, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=_browse_pt).pack(side="left")
+        ctk.CTkButton(_pt_row, text="Browse", width=80, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
+                      border_width=1, border_color=BTN_BORDER, command=_browse_pt).pack(side="left")
 
 
     def _page_about(self, scroll):
@@ -2669,865 +2783,6 @@ def _hdr_mode(v) -> str:
     return s if s in ("auto", "on", "off") else "auto"
 
 
-class PackDialog(EmbeddedDialog):
-    """Collect a pack source + output folder + FORMAT and ADD a job to the queue.
-
-    Three formats: '.ffpfsc' (compressed), '.ffpfs' (uncompressed) and '.pkg' — an
-    installable fPKG. Picking '.pkg' unfolds the fPKG block (identity + compression)
-    below the format row, and ANY pack source then becomes an fPKG job: a game folder, a
-    parent folder (scanned), an archive, a disk image, a .ffpfs — and a .ffpfsc, which the
-    other two formats refuse because it is already packed.
-
-    Identity for fPKG: sce_sys/param.json of the resolved source is the source of truth
-    at build time (folder, unwrapped image and extracted archive alike). The fields here
-    are pre-filled from param.json when the source is a game folder and are otherwise
-    optional fallbacks — an archive or image needs no identity typed up front.
-
-    Edit mode (item=existing GameItem): opens pre-filled with that item's source / output
-    / format (+ fPKG parameters for an fPKG job). Saving mutates it in place, or swaps a
-    fresh GameItem in at the same queue index when the source or the job kind changes
-    (pack ↔ fPKG)."""
-    LARGE = True
-
-    FORMATS = ("ffpfsc", "ffpfs", "pkg")
-    _FMT_LABEL = {"ffpfsc": ".ffpfsc", "ffpfs": ".ffpfs", "pkg": ".pkg (fPKG)"}
-    _FMT_HINT = {
-        "ffpfsc": "Compressed — smaller; mounted by ShadowMountPlus / MicroMount.",
-        "ffpfs":  "Uncompressed — faster to build and to mount, full size. (Disk images .exfat/.ffpkg "
-                  "are always compressed.)",
-        "pkg":    "Installable PS5 fake package (fPKG) — from ANY source; the identity comes from the "
-                  "game's own sce_sys/param.json. Launches on jailbroken firmware up to at least 11.60 with "
-                  "kstuff-lite 1.13+ (Drakmor's PPR-A53 patch, 2026-09).",
-    }
-    _CID_RE = re.compile(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$")
-    _TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
-    _VER_RE = re.compile(r"^\d{2}\.\d{2,3}(\.\d{3})?$")
-    _INNER   = ("none", "zlib", "kraken")
-    _BACKEND = ("builtin", "publishingtools")
-    # Kraken speed. The built-in encoder has exactly two regimes (measured on 40 MB of
-    # mixed data: levels 0..9 give byte-identical output, -4..-1 the faster/weaker preset),
-    # so the UI offers the honest two-way choice instead of a 0-9 slider.
-    _SPEED = ("normal", "fast")
-    _SPEED_LEVEL = {"normal": 7, "fast": -4}
-    _MIN_HEIGHT = 440          # the window is sized to its content (see _fit); never below this
-    _IDENT_HEAD_FALLBACK = "Package identity  (fallback — the game's sce_sys/param.json decides at build time):"
-    _IDENT_HEAD_REQUIRED = ("Package identity  (REQUIRED — this folder has no sce_sys/param.json; the builder "
-                            "generates one from these fields):")
-    _IMAGE_SUFFIXES   = (".ffpfsc", ".ffpfs", ".exfat", ".ffpkg")
-    _ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z")
-    _IDENT_AUTO = ("Auto — read from the game's sce_sys/param.json at build time. Leave empty; anything "
-                   "typed here only fills what param.json lacks.")
-    _IDENT_AUTO_MULTI = "Auto, per game — each game's own param.json decides. Leave empty."
-
-    def __init__(self, app, item=None, source: Path | None = None, fmt: str | None = None):
-        super().__init__(app.root)
-        self.app = app
-        self.edit_item = item
-        self.configure(fg_color=BLACK)
-        self.resizable(False, False)
-        self.transient(app.root); self.lift(); self.focus_force()
-        self.after(50, self.grab_set)
-
-        # ── initial values: from the item being edited, else the remembered defaults ──
-        if item is not None:
-            is_fpkg  = getattr(item, "operation", "pack") == "fpkg-build"
-            init_src = str(getattr(item, "archive_path", None) or getattr(item, "path", "") or "")
-            init_out = str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip()
-            if is_fpkg:
-                init_fmt = "pkg"
-            else:
-                oc = getattr(item, "output_compressed", None)
-                if oc is None:
-                    oc = app.output_format_var.get() != "ffpfs"
-                init_fmt = "ffpfsc" if oc else "ffpfs"
-            fp = app._fpkg_params_of(item) if is_fpkg else dict(app.fpkg_defaults)
-        else:
-            init_src = str(source) if source else ""
-            init_out = (app.output_var.get() or "").strip()
-            init_fmt = fmt or app.output_format_var.get()
-            fp = dict(app.fpkg_defaults)
-        if init_fmt not in self.FORMATS:
-            init_fmt = "ffpfsc"
-        self.fmt_key = init_fmt
-        init_org = getattr(item, "auto_organize", None) if item is not None else None
-        if init_org is None:
-            init_org = bool(app.auto_organize_var.get())
-        self.organize_var = tk.BooleanVar(value=bool(init_org))
-        # Same-format copy: on cross-drive delete the source after a successful copy so
-        # the job feels like a move (same-drive is always an atomic rename regardless).
-        # The default is app-wide and persisted; per-job overrides land on the item.
-        init_del = getattr(item, "copy_delete_source", None) if item is not None else None
-        if init_del is None:
-            init_del = bool(app.copy_delete_source_var.get()) if hasattr(app, "copy_delete_source_var") else True
-        self.copy_delete_source_var = tk.BooleanVar(value=bool(init_del))
-        self.title("Pack — edit job" if item else "Pack — add job to queue")
-
-        self.src_var   = tk.StringVar(value=init_src)
-        self.out_var   = tk.StringVar(value=init_out)
-        self.fmt_var   = tk.StringVar(value=self._FMT_LABEL[init_fmt])
-        self.fmt_hint  = tk.StringVar()
-        self.out_label = tk.StringVar()
-        self.src_hint  = tk.StringVar()
-        # fPKG block. The version field shows EMPTY for the builder default — empty means
-        # "auto", which is what it is.
-        ver0 = str(fp.get("version") or "")
-        if ver0 == "01.000.000":
-            ver0 = ""
-        self.cid_var   = tk.StringVar(value=fp.get("content_id", "") or "")
-        self.tid_var   = tk.StringVar(value=fp.get("title_id", "") or "")
-        self.title_var = tk.StringVar(value=fp.get("title", "") or "")
-        self.ver_var   = tk.StringVar(value=ver0)
-        self.inner_var = tk.StringVar(value=fp.get("inner") if fp.get("inner") in self._INNER else "kraken")
-        self.back_var  = tk.StringVar(value=fp.get("backend") if fp.get("backend") in self._BACKEND else "builtin")
-        try:
-            lvl = int(fp.get("level", 7))
-        except Exception:
-            lvl = 7
-        self.speed_var = tk.StringVar(value="fast" if lvl < 0 else "normal")
-        # Retail switches — defaults are the configuration verified to launch on a retail
-        # PS5 (CHANGELOG 1.1.12). Off positions exist for byte-exact re-packs and A/B tests.
-        self.retail_var = tk.BooleanVar(value=bool(fp.get("retail_normalize", True)))
-        self.hdr_var    = tk.StringVar(value=_hdr_mode(fp.get("hdr_flag", "auto")))   # auto | on | off
-        self.regen_var  = tk.BooleanVar(value=bool(fp.get("regen_playgo", False)))
-        self.sign_var   = tk.BooleanVar(value=bool(fp.get("fake_sign", True)))
-        self.back_hint = tk.StringVar()
-        self.ident_note = tk.StringVar(value=self._IDENT_AUTO)
-        self.ident_head = tk.StringVar(value=self._IDENT_HEAD_FALLBACK)
-        self.sum_var    = tk.StringVar()
-        self._auto_ident: dict = {}      # identity pre-filled from a folder's param.json (dropped when the source changes)
-        self._panel_shown  = False       # the fPKG panel (summary line) is packed
-        self._adv_shown    = False       # identity + compression rows revealed by "Edit…"
-        self._ident_forced = False       # identity rows forced open (game folder without param.json / invalid entry)
-        self._height       = self._MIN_HEIGHT
-        # The Publishing Tools backend needs a configured DLL AND Windows: LibProsperoPkg's
-        # Reduced-Oodle backend refuses any other OS outright ("requires 64-bit Windows" —
-        # verified with the real DLL on this Mac; the build fails, no fallback). So the row
-        # exists only where it can work; everywhere else 'builtin' is used.
-        self._backend_shown = bool((app.pubtools_dll_var.get() or "").strip()) and sys.platform == "win32"
-        if not self._backend_shown:
-            self.back_var.set("builtin")
-
-        head = "Pack — edit job" if item else "Pack — add job"
-        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
-                      ).pack(anchor="w", padx=20, pady=(16, 2))
-        sub = ("Change this job's source, output folder, format or fPKG parameters. The job stays at "
-               "its current queue position." if item else
-               "Pack a game folder, archive, disk image (.exfat/.ffpkg) or a .ffpfs into its own output "
-               "folder and format — or build an installable .pkg (fPKG) from any of them, a .ffpfsc "
-               "included. Adds a job to the queue.")
-        ctk.CTkLabel(self, text=sub, text_color=MUTED, wraplength=660, justify="left"
-                      ).pack(anchor="w", padx=20, pady=(0, 10))
-
-        # ── Source ──
-        srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(srow, text="Source  (folder OR file — archive, .exfat/.ffpkg, .ffpfs; a .ffpfsc for the .pkg format):",
-                      text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 2))
-        ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        # Tk can't pick a file AND a folder in one native dialog, so two buttons — but no
-        # archive-vs-image triage: ONE broad file filter covers them all, and the kind is
-        # auto-detected from the path at save time.
-        ctk.CTkButton(sinner, text="File…", width=76, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
-                       command=self._pick_file).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(sinner, text="Folder…", width=88, fg_color=BTN, hover_color=BTN_HOVER,
-                       text_color=WHITE, command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-        ctk.CTkLabel(srow, textvariable=self.src_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
-                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
-
-        # ── Output ──
-        orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(orow, textvariable=self.out_label, text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-        oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 4))
-        ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(oinner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                       command=self._pick_out, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-        # Auto-organize: the one switch that makes any source land as
-        # <Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y].ffpfsc|.pkg, named from the game itself.
-        ctk.CTkCheckBox(orow, text="Auto-organize — folder and file named from the game's own metadata (pattern above)",
-                        variable=self.organize_var, command=self._apply_format,
-                        checkbox_width=18, checkbox_height=18, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                        text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(0, 8))
-
-        # ── Format ──
-        frow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); frow.pack(fill="x", padx=20, pady=4)
-        finner = ctk.CTkFrame(frow, fg_color=PANEL); finner.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(finner, text="Format:", text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 10))
-        self._fmt_seg = ctk.CTkSegmentedButton(finner, values=[self._FMT_LABEL[k] for k in self.FORMATS],
-                                                variable=self.fmt_var, selected_color=ACCENT,
-                                                selected_hover_color=ACCENT_HOVER, command=self._on_fmt_selected)
-        self._fmt_seg.pack(side="left")
-        ctk.CTkLabel(frow, textvariable=self.fmt_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
-                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
-
-        # ── Same-format copy row (shown only when the source suffix matches the target ──
-        # format, so no re-encode is needed). Same drive → atomic rename; cross-drive →
-        # chunked copy, then delete the source when this box stays checked.
-        self.copy_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
-        self.copy_hint = tk.StringVar(value="")
-        ctk.CTkLabel(self.copy_row, text="Same format — no re-encode",
-                      text_color=WHITE, font=ctk.CTkFont(size=12, weight="bold")).pack(
-            anchor="w", padx=10, pady=(6, 0))
-        ctk.CTkLabel(self.copy_row, textvariable=self.copy_hint, text_color=MUTED,
-                      font=ctk.CTkFont(size=12), wraplength=620, justify="left").pack(
-            anchor="w", padx=10, pady=(0, 4))
-        ctk.CTkCheckBox(self.copy_row, text="Delete source after successful copy (cross-drive only; same-drive is always a move)",
-                        variable=self.copy_delete_source_var, checkbox_width=18, checkbox_height=18,
-                        fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
-                        font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(0, 8))
-
-        # ── fPKG block (shown for the .pkg format only; packed before the button row) ──
-        # Compact by default: ONE summary line plus "Edit…". The defaults are the best values
-        # there are (identity from param.json, no extra codec layer, normal Kraken speed —
-        # measured, see CHANGELOG 1.1.1), so the identity and compression rows stay hidden
-        # until asked for — or until they are needed: a game folder without param.json must
-        # have its identity typed, and an invalid entry is shown where it can be fixed.
-        self.fpkg_panel = ctk.CTkFrame(self, fg_color="transparent")
-        srow_sum = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8); srow_sum.pack(fill="x", pady=4)
-        sline = ctk.CTkFrame(srow_sum, fg_color=PANEL); sline.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(sline, textvariable=self.sum_var, text_color=WHITE, font=ctk.CTkFont(size=12),
-                      wraplength=500, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
-        self._edit_btn = ctk.CTkButton(sline, text="Edit…", width=92, fg_color=BTN, hover_color=BTN_HOVER,
-                                       text_color=WHITE, command=self._toggle_advanced, border_width=1, border_color=BTN_BORDER)
-        self._edit_btn.pack(side="right", padx=(8, 0))
-        self._sum_hint = ctk.CTkLabel(srow_sum, text="These defaults give the smallest, most compatible package. Edit only for a game "
-                                                    "folder without sce_sys/param.json, or to trade a little size for speed.",
-                                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left")
-        self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
-
-        # Identity rows (packed by _layout_fpkg when revealed or required)
-        self.irow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self.irow, textvariable=self.ident_head, text_color=WHITE, font=ctk.CTkFont(size=12),
-                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(6, 2))
-        grid = ctk.CTkFrame(self.irow, fg_color=PANEL); grid.pack(fill="x", padx=10, pady=(0, 2))
-        grid.grid_columnconfigure(1, weight=1); grid.grid_columnconfigure(3, weight=1)
-        def _cell(r, c, label, var):
-            ctk.CTkLabel(grid, text=label, text_color=MUTED, anchor="w", width=84).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=3)
-            ctk.CTkEntry(grid, textvariable=var, fg_color=CARD2, text_color=WHITE).grid(row=r, column=c + 1, sticky="ew", padx=(0, 14), pady=3)
-        _cell(0, 0, "Content ID", self.cid_var)
-        _cell(0, 2, "Title ID",   self.tid_var)
-        _cell(1, 0, "Title",      self.title_var)
-        _cell(1, 2, "Version",    self.ver_var)
-        ctk.CTkLabel(self.irow, textvariable=self.ident_note, text_color=MUTED, font=ctk.CTkFont(size=12),
-                      wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
-
-        # Compression rows (packed by _layout_fpkg when revealed)
-        self.crow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self.crow, text="Compression:", text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 2))
-        r1 = ctk.CTkFrame(self.crow, fg_color=PANEL); r1.pack(fill="x", padx=10, pady=2)
-        ctk.CTkLabel(r1, text="Codec layer:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        ctk.CTkSegmentedButton(r1, values=list(self._INNER), variable=self.inner_var,
-                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-                                command=lambda *_: self._refresh_hints()).pack(side="left")
-        ctk.CTkLabel(r1, text="  kraken = default, the layout verified on the console",
-                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
-        if self._backend_shown:
-            r2 = ctk.CTkFrame(self.crow, fg_color=PANEL); r2.pack(fill="x", padx=10, pady=2)
-            ctk.CTkLabel(r2, text="Kraken backend:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-            ctk.CTkSegmentedButton(r2, values=list(self._BACKEND), variable=self.back_var,
-                                    selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-                                    command=lambda *_: self._refresh_hints()).pack(side="left")
-            ctk.CTkLabel(self.crow, textvariable=self.back_hint, text_color=MUTED,
-                          font=ctk.CTkFont(size=12), wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 2))
-        r3 = ctk.CTkFrame(self.crow, fg_color=PANEL); r3.pack(fill="x", padx=10, pady=(2, 2))
-        ctk.CTkLabel(r3, text="Kraken speed:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        ctk.CTkSegmentedButton(r3, values=list(self._SPEED), variable=self.speed_var,
-                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-                                command=lambda *_: self._refresh_hints()).pack(side="left")
-        ctk.CTkLabel(r3, text="  normal = smallest (default)  ·  fast = quicker, a little larger",
-                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkLabel(self.crow, text="Every file is Kraken-packed whatever the codec layer. The tuning bar does not "
-                                     "apply to fPKG builds (single-worker outer pass, format-fixed blocks); only its "
-                                     "temp drive is used.",
-                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(4, 8))
-        # Retail options row (packed by _layout_fpkg when revealed). One line of switches
-        # plus one hint line: the expanded dialog has to stay within a laptop screen.
-        self.orow = ctk.CTkFrame(self.fpkg_panel, fg_color=PANEL, corner_radius=8)
-        r4 = ctk.CTkFrame(self.orow, fg_color=PANEL); r4.pack(fill="x", padx=10, pady=(6, 2))
-        ctk.CTkLabel(r4, text="Retail options:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        for _var, _text in ((self.retail_var, "Retail fixes"),
-                            (self.regen_var, "Rebuild PlayGo"), (self.sign_var, "Fake-sign ELFs")):
-            ctk.CTkCheckBox(r4, text=_text, variable=_var, checkbox_width=18, checkbox_height=18,
-                            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=WHITE,
-                            font=ctk.CTkFont(size=12), command=self._update_summary).pack(side="left", padx=(0, 14))
-        # HDR is a three-way choice, not a bool: the source's own param.json declares whether
-        # the title supports HDR, and "auto" keeps exactly that (the publisher's intent).
-        r5 = ctk.CTkFrame(self.orow, fg_color=PANEL); r5.pack(fill="x", padx=10, pady=2)
-        ctk.CTkLabel(r5, text="HDR flag:", text_color=MUTED, width=110, anchor="w").pack(side="left")
-        ctk.CTkSegmentedButton(r5, values=["auto", "on", "off"], variable=self.hdr_var,
-                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-                                command=lambda *_: self._update_summary()).pack(side="left")
-        ctk.CTkLabel(r5, text="  auto = as the source declares  ·  on = force HDR output  ·  off = clear the flag",
-                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkLabel(self.orow, text="Defaults are the configuration verified on the console · Rebuild PlayGo also drops a "
-                                     "valid set (a corrupt one is always rebuilt) · sce_sys/keystone, the save-data key, "
-                                     "is always kept.",
-                      text_color=MUTED, font=ctk.CTkFont(size=12), wraplength=620, justify="left"
-                      ).pack(anchor="w", padx=10, pady=(0, 8))
-        for _v in (self.cid_var, self.tid_var):
-            _v.trace_add("write", lambda *_: self._update_summary())
-
-        # ── Buttons ──
-        self._btns = ctk.CTkFrame(self, fg_color=BLACK); self._btns.pack(fill="x", padx=20, pady=12)
-        save_text = "Save changes" if item else "Add to queue"
-        ctk.CTkButton(self._btns, text=save_text, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
-                       command=self._add).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(self._btns, text="Cancel", fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
-
-        self._apply_format()
-        self._refresh_hints()
-        self.src_var.trace_add("write", lambda *_: self._on_source_changed())
-        if init_src:
-            self._on_source_changed()
-        if item is not None and self.fmt_key == "pkg":
-            # Editing an fPKG job: treat the identity it carries as belonging to ITS source,
-            # so picking a different source drops it (and re-reads the new param.json)
-            # instead of carrying a stale content id over.
-            self._auto_ident = {k: v for k, v in (("content_id", self.cid_var.get().strip()),
-                                                  ("title_id", self.tid_var.get().strip()),
-                                                  ("title", self.title_var.get().strip()),
-                                                  ("version", self.ver_var.get().strip())) if v}
-
-    # ── format ───────────────────────────────────────────────────────────────
-    def set_format(self, key: str) -> None:
-        """Select a format programmatically (what clicking the segmented button does)."""
-        if key not in self.FORMATS:
-            return
-        self.fmt_var.set(self._FMT_LABEL[key])
-        self._on_fmt_selected(self._FMT_LABEL[key])
-
-    def _on_fmt_selected(self, value: str) -> None:
-        for k, label in self._FMT_LABEL.items():
-            if label == value:
-                self.fmt_key = k
-                break
-        self._apply_format()
-        self._on_source_changed()
-
-    def _same_format_source_suffix(self) -> str:
-        """The source's suffix when it matches the target format ('.ffpfsc', '.ffpfs',
-        '.pkg'), else '' — the three cases where 'pack' collapses to a straight copy."""
-        raw = (self.src_var.get() or "").strip()
-        if not raw:
-            return ""
-        p = Path(raw)
-        if not (p.is_file()):
-            return ""
-        suf = p.suffix.lower()
-        want = ".pkg" if self.fmt_key == "pkg" else f".{self.fmt_key}"
-        return suf if suf == want and suf in (".ffpfsc", ".ffpfs", ".pkg") else ""
-
-    def _apply_format(self) -> None:
-        key = self.fmt_key
-        self.fmt_hint.set(self._FMT_HINT[key])
-        org = bool(self.organize_var.get())
-        ext = ".pkg" if key == "pkg" else f".{key}"
-        if org:
-            self.out_label.set(f"Output folder  (auto-organize creates ‹Title [TID] [vX.Y.Z]›/‹Title [TID] [vX.Y]›{ext} inside it):")
-        elif key == "pkg":
-            self.out_label.set("Output folder  (this job's .pkg lands here, named <content-id>-A<app>-V<ver>.pkg):")
-        else:
-            self.out_label.set(f"Output folder  (this job's .{key} lands here):")
-        # Same-format copy row: only when the source is a file whose suffix matches the
-        # target format. Also hide the fPKG panel in that case — no build parameters
-        # apply to a straight copy.
-        copy_suf = self._same_format_source_suffix()
-        if copy_suf:
-            self.copy_hint.set(
-                f"The source is already a {copy_suf}. It will be copied unchanged into the output folder — "
-                "same drive: atomic rename (instant); different drive: chunked copy with progress."
-            )
-            try:
-                self.copy_row.pack(fill="x", padx=20, pady=4, before=self._btns)
-            except Exception:
-                self.copy_row.pack(fill="x", padx=20, pady=4)
-            if self._panel_shown:
-                self.fpkg_panel.pack_forget()
-                self._panel_shown = False
-            self._fit()
-            return
-        try:
-            self.copy_row.pack_forget()
-        except Exception:
-            pass
-        if key == "pkg":
-            if not self._panel_shown:
-                self.fpkg_panel.pack(fill="x", padx=20, before=self._btns)
-                self._panel_shown = True
-            self._layout_fpkg()
-        else:
-            if self._panel_shown:
-                self.fpkg_panel.pack_forget()
-                self._panel_shown = False
-        self._fit()
-
-    # ── fPKG panel: compact summary ↔ revealed rows ──────────────────────────
-    def set_advanced(self, shown: bool) -> None:
-        """Reveal / hide the identity + compression rows (what the Edit… button does)."""
-        self._adv_shown = bool(shown)
-        self._layout_fpkg()
-        self._fit()
-
-    def _toggle_advanced(self) -> None:
-        self.set_advanced(not self._adv_shown)
-
-    def _reveal_identity(self) -> None:
-        """Force the identity rows open (a required or invalid entry must be visible)."""
-        if not (self._adv_shown or self._ident_forced):
-            self._ident_forced = True
-            self._layout_fpkg()
-            self._fit()
-
-    def _layout_fpkg(self) -> None:
-        """Pack the identity / compression rows for the current state, in order:
-        summary → identity → compression. pack_forget + re-pack keeps the order stable."""
-        show_ident = self._adv_shown or self._ident_forced
-        self.irow.pack_forget(); self.crow.pack_forget(); self.orow.pack_forget()
-        if show_ident:
-            self.irow.pack(fill="x", pady=4)
-        self._sum_hint.pack_forget()              # the rows below say it; keep the height down
-        if self._adv_shown:
-            self.crow.pack(fill="x", pady=4)
-            self.orow.pack(fill="x", pady=4)
-        else:
-            self._sum_hint.pack(anchor="w", padx=10, pady=(0, 8))
-        self._edit_btn.configure(text=("Hide" if self._adv_shown else "Edit…"))
-        self._update_summary()
-
-    def _fit(self) -> None:
-        """Size the window to its content — the fPKG rows come and go. Never taller than
-        the screen: macOS clamps an oversized window and the bottom rows (and the
-        buttons) simply disappear, which is what happened when the retail switches were
-        first added as four rows."""
-        self.update_idletasks()
-        req = self.winfo_reqheight()
-        want = max(self._MIN_HEIGHT, int(req) + 16)
-        try:
-            screen_h = int(self.winfo_screenheight())
-            top, bottom = 30, 80                     # menu bar; Dock + margin
-            self._height = min(want, max(self._MIN_HEIGHT, screen_h - top - bottom))
-            x, y = int(self.winfo_x()), int(self.winfo_y())
-            if y + self._height > screen_h - bottom:  # would run under the Dock: move up
-                y = max(top, screen_h - bottom - self._height)
-                self.geometry(f"700x{self._height}+{x}+{y}")
-                return
-        except Exception:
-            self._height = want
-        self.geometry(f"700x{self._height}")
-
-    def _update_summary(self) -> None:
-        """The one line that says what this .pkg job will do."""
-        cid = self.cid_var.get().strip().upper()
-        tid = self.tid_var.get().strip().upper()
-        shown_id = tid or (cid[7:16] if len(cid) >= 16 else cid)
-        auto_cid = str(self._auto_ident.get("content_id", "")).upper()
-        auto_tid = str(self._auto_ident.get("title_id", "")).upper()
-        if not (cid or tid):
-            ident = "identity REQUIRED below" if self._ident_forced else "identity from the game's param.json"
-        elif (cid and cid == auto_cid) or (not cid and tid == auto_tid):
-            ident = f"identity from param.json ({shown_id})"
-        else:
-            ident = f"identity {shown_id} (typed)"
-        parts = [ident, f"codec layer {self.inner_var.get()}", f"Kraken {self.speed_var.get()}"]
-        if self.back_var.get() == "publishingtools":
-            parts.append("Sony DLL backend")
-        if not self.retail_var.get():
-            parts.append("retail fixes OFF")
-        if self.hdr_var.get() in ("on", "off"):
-            parts.append(f"HDR flag {self.hdr_var.get()}")
-        if self.regen_var.get():
-            parts.append("PlayGo rebuilt")
-        if not self.sign_var.get():
-            parts.append("no fake-sign")
-        self.sum_var.set("fPKG:  " + "  ·  ".join(parts))
-
-    # ── pickers ──────────────────────────────────────────────────────────────
-    def _pick_file(self):
-        """Pick any supported SOURCE FILE — one broad filter (archive / disk image / PFS
-        image), no triage; the kind is auto-detected from the path when the job runs. Tk's
-        native askopenfilename is reliable (the JXA NSOpenPanel route didn't open for the user)."""
-        init = (self.src_var.get() or "").strip()
-        p = filedialog.askopenfilename(
-            parent=self,
-            title="Pick a source file (archive, disk image .exfat/.ffpkg, .ffpfs, or a .ffpfsc for .pkg)",
-            initialdir=(init if os.path.isdir(init) else (os.path.dirname(init) if init else "")),
-            filetypes=[("Supported sources", "*.zip *.rar *.7z *.exfat *.ffpkg *.ffpfs *.ffpfsc"),
-                       ("All files", "*.*")],
-        )
-        if p:
-            self.src_var.set(p)
-
-    def _pick_folder(self):
-        """Pick a SOURCE FOLDER — a game folder, or a folder holding games / archives (the
-        folder name is mirrored to the output for bundles)."""
-        init = (self.src_var.get() or "").strip()
-        p = filedialog.askdirectory(
-            parent=self, title="Pick a source folder",
-            initialdir=(init if os.path.isdir(init) else (os.path.dirname(init) if init else "")),
-        )
-        if p:
-            self.src_var.set(p)
-
-    def _pick_out(self):
-        p = filedialog.askdirectory(parent=self, title="Select the output folder for this job")
-        if p:
-            self.out_var.set(p)
-
-    # ── hints + identity pre-fill ────────────────────────────────────────────
-    def _on_source_changed(self):
-        raw = (self.src_var.get() or "").strip()
-        p = Path(raw) if raw else None
-        # Identity values that came from a PREVIOUS source's param.json must not stick to
-        # the next source — drop them (values the user typed themselves are kept).
-        if self._auto_ident:
-            for var, key in ((self.cid_var, "content_id"), (self.tid_var, "title_id"),
-                             (self.title_var, "title"), (self.ver_var, "version")):
-                if var.get().strip() == self._auto_ident.get(key, ""):
-                    var.set("")
-            self._auto_ident = {}
-        if not p or not p.exists():
-            self.src_hint.set("")
-            self.ident_note.set(self._IDENT_AUTO)
-            self._set_ident_forced(False)
-            self._apply_format()   # refresh the copy row for the empty state
-            return
-        suf = p.suffix.lower() if p.is_file() else ""
-        # Same-format shortcut: the "already packed"/"use fPKG⇢" hints do not apply when
-        # the source's format matches the target format — that's the copy path, not a
-        # rejection. _apply_format shows the dedicated copy row for it.
-        if self._same_format_source_suffix():
-            self.src_hint.set(f"Same as target format ({suf}) — will be copied unchanged (see below).")
-            self.ident_note.set(self._IDENT_AUTO)
-            self._set_ident_forced(False)
-            self._apply_format()
-            return
-        if self.fmt_key != "pkg":
-            if suf == ".ffpfsc":
-                self.src_hint.set("A .ffpfsc is already packed — choose the .pkg format to build an fPKG from it, "
-                                  "or use Convert to unpack it.")
-            elif suf == ".pkg":
-                self.src_hint.set("A .pkg is a PS5 fake package — use fPKG⇢ to extract it.")
-            else:
-                self.src_hint.set("")
-            self._apply_format()
-            return
-        # .pkg format
-        if p.is_dir():
-            pj = p / "sce_sys" / "param.json"
-            if pj.is_file():
-                self._prefill_from_param_json(pj)
-            elif is_game_folder(p):
-                self.src_hint.set("Game folder · no sce_sys/param.json — fill in the identity below; the builder "
-                                  "generates param.json from it.")
-                self.ident_note.set("Required here: this folder has no param.json to read from.")
-            else:
-                self.src_hint.set("Folder · scanned for game folders / archives / images when added — each game "
-                                  "becomes its own .pkg job.")
-                self.ident_note.set(self._IDENT_AUTO_MULTI)
-            if is_game_folder(p) and not (p / "eboot.bin").is_file():
-                self.src_hint.set(self.src_hint.get() + "  No eboot.bin — the package will not launch.")
-        elif suf in self._ARCHIVE_SUFFIXES:
-            self.src_hint.set("Archive · extracted when its turn comes, then built into a .pkg.")
-            self.ident_note.set(self._IDENT_AUTO)
-        elif suf in self._IMAGE_SUFFIXES:
-            self.src_hint.set(f"Image ({suf}) · unwrapped on the temp drive first, then built into a .pkg.")
-            self.ident_note.set(self._IDENT_AUTO)
-        elif suf == ".pkg":
-            self.src_hint.set("Already a .pkg — use fPKG⇢ to extract it.")
-        else:
-            self.src_hint.set("Not a game folder, archive or .ffpfsc/.ffpfs/.exfat/.ffpkg image.")
-        # A game folder without param.json cannot get its identity from anywhere else:
-        # the identity rows open by themselves and are marked required.
-        self._set_ident_forced(p.is_dir() and is_game_folder(p) and not (p / "sce_sys" / "param.json").is_file())
-        self._apply_format()   # refresh the copy row (hidden here — this branch is fpkg-source)
-
-    def _set_ident_forced(self, forced: bool) -> None:
-        forced = bool(forced)
-        self.ident_head.set(self._IDENT_HEAD_REQUIRED if forced else self._IDENT_HEAD_FALLBACK)
-        if forced != self._ident_forced:
-            self._ident_forced = forced
-            if self._panel_shown:
-                self._layout_fpkg()
-                self._fit()
-        else:
-            self._update_summary()
-
-    def _prefill_from_param_json(self, pj: Path) -> None:
-        try:
-            d = json.loads(pj.read_text(encoding="utf-8-sig", errors="replace"))
-        except Exception as e:
-            self.src_hint.set(f"Game folder · could not read param.json ({e}); the identity below is used as typed.")
-            self.ident_note.set("param.json unreadable — fill in the identity by hand.")
-            return
-        if not isinstance(d, dict):
-            d = {}
-        cid = str(d.get("contentId") or "").strip()
-        tid = str(d.get("titleId") or "").strip()
-        # Sony layout: localizedParameters = {"defaultLanguage": "en-US", "en-US": {"titleName": …}, …}
-        title = ""
-        try:
-            lp = d.get("localizedParameters") or {}
-            if isinstance(lp, dict):
-                lang = lp.get("defaultLanguage")
-                block = lp.get(lang) if isinstance(lang, str) else None
-                if isinstance(block, dict):
-                    title = str(block.get("titleName") or "")
-                if not title:
-                    for v in lp.values():
-                        if isinstance(v, dict) and v.get("titleName"):
-                            title = str(v["titleName"]); break
-            if not title:
-                title = str(d.get("titleName") or "")
-        except Exception:
-            title = ""
-        ver = str(d.get("contentVersion") or d.get("masterVersion") or "").strip()
-        auto = {}
-        for var, key, val in ((self.cid_var, "content_id", cid), (self.tid_var, "title_id", tid),
-                              (self.title_var, "title", title), (self.ver_var, "version", ver)):
-            if val and not var.get().strip():      # never overwrite what the user typed
-                var.set(val); auto[key] = val
-        self._auto_ident = auto
-        self.src_hint.set(f"Game folder · identity read from sce_sys/param.json ({tid or '?'}).")
-        self.ident_note.set("Read from this folder's param.json. param.json still decides at build time — a "
-                            "differing value here is only used for what it lacks.")
-
-    def _refresh_hints(self, *_):
-        self._update_summary()
-        dll = (self.app.pubtools_dll_var.get() or "").strip()
-        if self.back_var.get() == "publishingtools":
-            if sys.platform != "win32":
-                self.back_hint.set("Windows only: LibProsperoPkg's Publishing Tools (Reduced Oodle) backend refuses "
-                                   "to run on this OS — the build fails, it does not fall back. Use builtin.")
-            elif dll and Path(dll).is_file():
-                self.back_hint.set(f"Uses your Sony libScePubTools.dll: {dll}")
-            else:
-                self.back_hint.set("No Publishing Tools DLL set (Settings → Folders) — the build will fail. "
-                                   "Use builtin, or point Settings at your DLL.")
-        else:
-            self.back_hint.set("Built-in managed Kraken encoder — needs no external file. Console-install is what "
-                               "proves the output; the build log ends with a 17-point validate checklist.")
-
-    # ── validation ───────────────────────────────────────────────────────────
-    def _collect_fpkg_params(self) -> dict | None:
-        """Validate the fPKG block and return a params dict (see App._fpkg_params_of), or
-        None after showing the problem. Identity fields are optional fallbacks, except for
-        a game folder without a param.json (the builder generates one from them)."""
-        cid = self.cid_var.get().strip().upper()
-        tid = self.tid_var.get().strip().upper()
-        ver = self.ver_var.get().strip()
-        title = self.title_var.get().strip()
-        def _bad(title: str, msg: str):
-            self._reveal_identity()          # show the field the message talks about
-            messagebox.showerror(title, msg, parent=self)
-            return None
-        if cid and not self._CID_RE.match(cid):
-            return _bad("Content ID", "Content ID must look like  UP9000-PPSA12345_00-GAMENAME00000000\n"
-                        "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case alphanumerics) "
-                        "— or leave it empty to use the game's param.json.")
-        if tid and not self._TID_RE.match(tid):
-            return _bad("Title ID", "Title ID must look like  PPSA12345  (4 letters + 5 digits) — or leave it "
-                        "empty to use the game's param.json.")
-        if cid and tid and tid not in cid:
-            return _bad("Mismatch", f"The title id {tid} does not appear inside the content id {cid}.")
-        if cid and not tid:
-            tid = cid[7:16]
-        if ver and not self._VER_RE.match(ver):
-            return _bad("Version", "Version must be NN.NNN.NNN (or NN.NN) — or empty to use param.json.")
-        src = Path((self.src_var.get() or "").strip())
-        if (src.is_dir() and is_game_folder(src) and not (src / "sce_sys" / "param.json").is_file()
-                and not (cid and tid)):
-            return _bad("Identity needed", "This game folder has no sce_sys/param.json, so Content ID and "
-                        "Title ID must be filled in here (the builder generates param.json from them).")
-        inner = self.inner_var.get() if self.inner_var.get() in self._INNER else "none"
-        back  = self.back_var.get() if self.back_var.get() in self._BACKEND else "builtin"
-        level = self._SPEED_LEVEL.get(self.speed_var.get(), 7)
-        dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
-        return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
-                "inner": inner, "backend": back, "level": level, "dll": dll,
-                "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
-                "regen_playgo": bool(self.regen_var.get()), "fake_sign": bool(self.sign_var.get())}
-
-    # ── commit ───────────────────────────────────────────────────────────────
-    def _add(self):
-        s = (self.src_var.get() or "").strip()
-        if not s:
-            messagebox.showerror("Missing", "Please choose a source to pack.", parent=self); return
-        src = Path(s)
-        if not src.exists():
-            messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
-        fmt = self.fmt_key
-        suf = src.suffix.lower() if src.is_file() else ""
-        # Same-format shortcut: source suffix == target format → copy job (no re-encode).
-        # This BYPASSES the '.pkg-forbidden' and 'already packed' rejections below because
-        # in these three cases the source IS what the queue is meant to produce.
-        same_fmt_copy = bool(self._same_format_source_suffix())
-        if not same_fmt_copy:
-            if suf == ".pkg":
-                messagebox.showerror("Use fPKG⇢",
-                                     "A .pkg is a PS5 fake package. Use the fPKG⇢ job to extract it to a folder.",
-                                     parent=self); return
-            if fmt != "pkg" and suf == ".ffpfsc":
-                messagebox.showerror("Already packed",
-                                     "A .ffpfsc is already packed. Choose the .pkg format to build an installable fPKG "
-                                     "from it, or use the Convert job to unpack/convert it.",
-                                     parent=self); return
-            if fmt == "pkg" and src.is_file() and suf not in self.app.FPKG_FILE_SOURCES:
-                messagebox.showerror("Wrong type", "For a .pkg the source must be a game folder, an archive "
-                                     "(.zip/.rar/.7z) or a .ffpfsc / .ffpfs / .exfat / .ffpkg image.", parent=self); return
-        outf = (self.out_var.get() or "").strip()
-        if not outf:
-            messagebox.showerror("Missing", "Please choose an output folder for this job.", parent=self); return
-        params = None
-        if fmt == "pkg":
-            params = self._collect_fpkg_params()
-            if params is None:
-                return
-            # Remember the compression choice as the default for the next .pkg job (and for
-            # dropped sources while .pkg is the remembered format). Identity is never remembered.
-            self.app.fpkg_defaults = {"inner": params["inner"], "backend": params["backend"], "level": params["level"],
-                                      "retail_normalize": params["retail_normalize"], "hdr_flag": params["hdr_flag"],
-                                      "regen_playgo": params["regen_playgo"], "fake_sign": params["fake_sign"],
-                                      "v1112": True}
-            save_settings({"fpkg_defaults": self.app.fpkg_defaults})
-
-        organize = bool(self.organize_var.get())
-        if self.edit_item is not None:
-            self._save_edit(src, outf, fmt, params, organize)
-            return
-
-        # ── Add mode ─────────────────────────────────────────────────────────
-        self.app.output_var.set(outf)
-        self.app.output_format_var.set(fmt)    # remembered default; also what the queue snapshot applies
-        self.app.auto_organize_var.set(organize)   # likewise remembered + snapshotted onto the item(s)
-        # Same-format copy job: skip the whole build path — enqueue a copy item and remember
-        # the "delete source after copy" default the user just picked.
-        if same_fmt_copy:
-            delete_src = bool(self.copy_delete_source_var.get())
-            self.app.copy_delete_source_var.set(delete_src)
-            item = self.app._copy_item_for(src, output_path=outf, delete_source=delete_src,
-                                           auto_organize=organize, parent=self)
-            if item is None:
-                return
-            self.app.queue.append(item)
-            self.app.update_queue_box(select_item=item)
-            action = "Move (same-drive rename) or copy+delete (cross-drive)" if delete_src else "Copy (source kept)"
-            self.app.log("OK", f"{action} queued: {item.name} → {outf}.  Press ▶ START to run.")
-            self.destroy()
-            return
-        if fmt == "pkg" and src.is_file() and suf in self._IMAGE_SUFFIXES + self._ARCHIVE_SUFFIXES:
-            # A single packed image or archive → a direct fPKG job carrying the identity
-            # typed here as fallback (the shared add path would queue a .ffpfsc as an UNPACK
-            # and could not carry the identity). The backend unwraps an image on the temp
-            # drive itself; an archive is extracted when its turn comes, like a pack.
-            item = self.app._fpkg_item_for(src, params, output_path=outf, parent=self)
-            if item is None:
-                return
-            item.auto_organize = organize
-            self.app.queue.append(item)
-            self.app.update_queue_box(select_item=item)
-            kind = "image"
-            if suf in self._ARCHIVE_SUFFIXES:
-                kind = "archive"
-                # Encrypted header with no saved password → ask now, so the drive routing
-                # knows the real extracted size (same as the shared add path does).
-                try:
-                    self.app._resolve_archive_password(item)
-                except Exception:
-                    pass
-                self.app.update_queue_box(select_item=item)
-            self.app.log("OK", f"fPKG build queued ({kind}, {params['inner']}/{params['backend']}, level "
-                               f"{params['level']}): {item.name} -> {outf}.  Press ▶ START to run.")
-            self.destroy()
-            return
-        if fmt == "pkg" and src.is_dir() and is_game_folder(src):
-            # The folder scan yields exactly this one item; hand it the identity shown here
-            # (pre-filled from its param.json, or typed for a folder without one).
-            ident = {k: params[k] for k in ("content_id", "title_id", "title", "version") if params.get(k)}
-            if ident.get("version") == "01.000.000":
-                ident.pop("version")
-            self.app._pending_fpkg_identity = (src, ident) if ident else None
-        # Hand off to the shared add-to-queue path: it classifies folder / archive / disk
-        # image / .ffpfs (and scans a parent folder) and queues the right pack item(s);
-        # update_queue_box then applies the remembered format — for .pkg that turns each
-        # fresh pack item into an fPKG job with the remembered compression parameters.
-        self.app.source_var.set(s)
-        try:
-            self.app.unpack_mode_var.set(False)
-        except Exception:
-            pass
-        self.destroy()
-        self.app.add_source_to_queue()
-
-    def _save_edit(self, src: Path, outf: str, fmt: str, params: dict | None, organize: bool = True) -> None:
-        """Edit mode: mutate in place when the source and the job kind are unchanged;
-        otherwise build a fresh GameItem of the right kind and swap it in at the same
-        queue index so the job keeps its position."""
-        it = self.edit_item
-        it.auto_organize = bool(organize)
-        was_fpkg = getattr(it, "operation", "pack") == "fpkg-build"
-        try:
-            old_src_p = Path(str(getattr(it, "archive_path", None) or getattr(it, "path", ""))).resolve()
-            same_source = (old_src_p == src.resolve())
-        except Exception:
-            same_source = False
-
-        # Same source: convert / update IN PLACE so bundle tags, archive password, display
-        # name and queue position all survive a pack ↔ fPKG switch.
-        if fmt == "pkg":
-            if same_source:
-                if was_fpkg:
-                    self.app._apply_fpkg_params(it, params)
-                else:
-                    self.app._as_fpkg_job(it, params)
-                it.output_path = Path(outf)
-                if it.status not in ("Done",):
-                    it.status = "Queued"
-                self.app.update_queue_box(select_item=it)
-                self.app.log("OK", f"Job updated: {it.name}" + ("" if was_fpkg else "  (now an fPKG build)"))
-                self.destroy(); return
-            new_item = self.app._fpkg_item_for(src, params, output_path=outf, parent=self)
-            if new_item is None:
-                return
-        else:
-            comp = (fmt == "ffpfsc")
-            if same_source:
-                if was_fpkg:
-                    it.operation = "pack"
-                    for _a in ("fpkg_content_id", "fpkg_title_id", "fpkg_title", "fpkg_version",
-                               "fpkg_inner_mode", "fpkg_kraken_backend", "fpkg_pubtools_dll", "fpkg_level",
-                               "fpkg_retail_normalize", "fpkg_hdr_flag", "fpkg_regen_playgo", "fpkg_fake_sign",
-                               "backport_target", "backport_libs_root"):
-                        if _a in vars(it):
-                            delattr(it, _a)
-                it.output_path = Path(outf)
-                it.output_compressed = comp
-                if it.status not in ("Done",):
-                    it.status = "Queued"
-                self.app.update_queue_box(select_item=it)
-                self.app.log("OK", f"Job updated: {it.name}" + (f"  (now a pack → .{fmt})" if was_fpkg else ""))
-                self.destroy(); return
-            new_item = self.app._build_pack_item_for(src, parent=self)
-            if new_item is None:
-                return  # validation already shown
-            new_item.output_path = Path(outf)
-            new_item.output_compressed = comp
-        new_item.auto_organize = bool(organize)
-        try:
-            idx = self.app.queue.index(it)
-            self.app.queue[idx] = new_item
-        except ValueError:
-            self.app.queue.append(new_item)
-        self.app.update_queue_box(select_item=new_item)
-        self.app.log("OK", f"Job replaced: {it.name} → {new_item.name}"
-                           + ("  (now an fPKG build)" if fmt == "pkg" and not was_fpkg else "")
-                           + (f"  (now a pack → .{fmt})" if fmt != "pkg" and was_fpkg else ""))
-        self.destroy()
 
 
 class JobDialog(EmbeddedDialog):
@@ -3566,15 +2821,19 @@ class JobDialog(EmbeddedDialog):
                     "must come from your patched-libraries folder; they are copied into the game's "
                     "fakelib/. Nothing is bundled with this app.",
         "target": "7.61: public library patches exist, the documented path. 6.02: experimental, a "
-                  "smaller public set, only some titles run. 10.xx: SDK only, no library bundle, for a "
-                  "game newer than the console. Nothing above 10.xx: no public SDK value exists.",
-        "libs":   "Your own patched system libraries for this target (often the two Agc libraries). "
-                  "Copied into fakelib/ without overwriting what is already there. Optional: leave "
-                  "empty to only lower the SDK. The default comes from Settings.",
+                  "smaller public set, only some titles run. 10.xx: SDK only, for a game newer than "
+                  "the console. Every other entry is a firmware from your firmware libraries folder "
+                  "(Settings), with the SDK values its own libraries carry; Check shows whether it has "
+                  "every function the game uses.",
+        "libs":   "Your own patched system libraries (Prepare in Settings makes the 7.61 and 6.02 "
+                  "sets, one subfolder per target; this job takes the one for its target). Copied into "
+                  "fakelib/ without overwriting what is already there. Needed only when the target "
+                  "lacks functions the game uses; the build checks that when the firmware libraries "
+                  "folder is set.",
         "check":  "Reads the functions the game imports and compares them with what the target "
-                  "firmware's original libraries (Settings) and your patched libraries export — per "
-                  "library: covered, partial or missing. Needs a game folder; a container is checked "
-                  "after it is unpacked at build time.",
+                  "firmware's original libraries (Settings), your patched libraries and the game's own "
+                  "modules export. Tells you whether lowering the SDK is enough or which libraries "
+                  "are missing. Needs a game folder; a container is checked when the job runs.",
         "sign":   "Fake-signs eboot.bin and every prx/sprx so a jailbroken console loads them. Needed "
                   "when a dump's executables are still plain ELFs. Already-signed files are skipped, "
                   "so leaving it on costs nothing. A .pkg is always signed by its builder.",
@@ -3585,7 +2844,8 @@ class JobDialog(EmbeddedDialog):
         "saveto": "Where the result lands. With auto-organize it gets its own folder there, named "
                   "from the game.",
         "organize": "Names the folder and the file from the game's own metadata: "
-                    "<Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y]. Long names are shortened to "
+                    "<Title> [TID] [vX.Y.Z]/<Title> [TID] [vX.Y] [fwN.NN], with the firmware the "
+                    "game needs read from its eboot.bin (a backport lowers it to the target). Long names are shortened to "
                     "ShadowMount's byte limit.",
         "keep":   "Only for a same-format copy across drives: keep the original after copying. On "
                   "the same drive the file is always moved (a rename).",
@@ -3598,14 +2858,30 @@ class JobDialog(EmbeddedDialog):
                   "is only for a title that installs but will not start (CE-100022-5).",
         "hdr":    "auto keeps what the game's param.json declares — the publisher's intent; a console on "
                   "'HDR when supported' follows this flag. on forces it, off clears it.",
-        "speed":  "normal = Kraken level 7, the smallest package. fast = the encoder's fast preset: "
-                  "quicker, a little larger. Same layout either way.",
+        "identity": "The package identity comes from the game's sce_sys/param.json when it is built. Fill these in "
+                    "for a game folder without one (Content ID and Title ID are then required), or to supply what "
+                    "param.json lacks.",
+        "codec":  "The codec layer of the image inside the package. kraken is the verified default; zlib and none "
+                  "are for experiments.",
+        "compression": "How hard this job compresses. .ffpfsc: zlib level 1 to 9, higher gives a smaller "
+                       "file and takes longer; 7 is the default. .pkg: normal is Kraken level 7, the smallest "
+                       "package; fast is the encoder's fast preset, quicker and a little larger. Each job keeps "
+                       "its own; a new job starts from Settings › Compression.",
     }
+    _CID_RE = re.compile(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$")
+    _TID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
+    _VER_RE = re.compile(r"^\d{2}\.\d{2,3}(\.\d{3})?$")
+    _INNER = ("kraken", "zlib", "none")
+    _BACKEND = ("builtin", "publishingtools")
+    _IDENT_OPTIONAL = ("Package identity (optional): the game's sce_sys/param.json decides at build time; a value "
+                       "here only fills what param.json lacks.")
+    _IDENT_REQUIRED = ("Package identity (required): this folder has no sce_sys/param.json, so the builder "
+                       "generates one from these fields.")
     _KIND_LABEL = {"folder": "Game folder", "parent": "Parent folder", "archive": "Archive",
                    "exfat": "exFAT disk image", "ffpkg": "ffpkg disk image", "ffpfs": ".ffpfs image",
                    "ffpfsc": ".ffpfsc image", "pkg": "PS5 package (.pkg)"}
 
-    def __init__(self, app, item=None, init_src: str | None = None):
+    def __init__(self, app, item=None, init_src: str | None = None, init_to: str | None = None):
         super().__init__(app.root)
         self.app = app
         self.edit_item = item
@@ -3630,17 +2906,19 @@ class JobDialog(EmbeddedDialog):
         self.src_var = tk.StringVar(value=src0)
         self.detect_var = tk.StringVar(value="Choose or drop a source.")
         self.help_var = tk.StringVar(value=self._HELP_IDLE)
-        self.sign_var = tk.BooleanVar(value=bool(getattr(item, "chain_sign", False)) if item else False)
+        self.sign_var = tk.BooleanVar(value=(bool(getattr(item, "chain_sign", False))
+                                             or getattr(item, "operation", "") == "fake-sign") if item else False)
         self.patch_on_var = tk.BooleanVar(value=bool(getattr(item, "patch_source", None)) if item else False)
         self.patch_var = tk.StringVar(value=str(getattr(item, "patch_source", "") or "") if item else "")
         self.backport_on_var = tk.BooleanVar(value=bool(getattr(item, "backport_target", None)) if item else False)
         _bt0 = (getattr(item, "backport_target", None) if item else None) or settings.get("backport_target_default") or "7.61"
-        self.backport_target_var = tk.StringVar(value=_bt0 if _bt0 in self._BACKPORT_HINTS else "7.61")
+        self.backport_target_var = tk.StringVar(value=_bt0 if is_backport_target(_bt0) else "7.61")
+        self._hint_cache: dict[str, str] = {}
         _libs0 = (getattr(item, "backport_libs_root", None) if item else None) or settings.get("backport_libs_root") or ""
         self.backport_libs_var = tk.StringVar(value=str(_libs0))
         self.backport_hint_var = tk.StringVar(value="")
         self.check_var = tk.StringVar(value="")
-        self.to_var = tk.StringVar(value=self._TARGET_LABEL.get(getattr(item, "chain_to", None) or "ffpfsc", ".ffpfsc"))
+        self.to_var = tk.StringVar(value=self._TARGET_LABEL.get(self._target_of(item) if item else "ffpfsc", ".ffpfsc"))
         out0 = str(getattr(item, "output_path", "") or "") if item else (app.output_var.get() or "").strip()
         self.out_var = tk.StringVar(value=out0)
         _org = getattr(item, "auto_organize", None) if item else None
@@ -3655,6 +2933,22 @@ class JobDialog(EmbeddedDialog):
         except Exception:
             _lvl = 7
         self.speed_var = tk.StringVar(value="fast" if _lvl < 0 else "normal")
+        _ff0 = getattr(item, "compression_level", None) if item else None
+        try:
+            _ff0 = int(_ff0) if _ff0 is not None else int(app.compression_level_var.get())
+        except Exception:
+            _ff0 = 7
+        self.level_var = tk.IntVar(value=max(1, min(9, _ff0)))
+        _ver0 = str(fp.get("version") or "")
+        self.cid_var = tk.StringVar(value=str(fp.get("content_id") or ""))
+        self.tid_var = tk.StringVar(value=str(fp.get("title_id") or ""))
+        self.title_var = tk.StringVar(value=str(fp.get("title") or ""))
+        self.ver_var = tk.StringVar(value="" if _ver0 == "01.000.000" else _ver0)
+        self.inner_var = tk.StringVar(value=fp.get("inner") if fp.get("inner") in self._INNER else "kraken")
+        self.back_var = tk.StringVar(value=fp.get("backend") if fp.get("backend") in self._BACKEND else "builtin")
+        self._pkg_more = bool(item and (fp.get("content_id") or fp.get("title_id")))   # identity + codec rows
+        self._ident_forced = False       # shown and required: a game folder without param.json
+        self._auto_ident: dict = {}      # the values filled in from param.json (cleared on a new source)
         self.summary_var = tk.StringVar(value="")
         self.summary_dest_var = tk.StringVar(value="")
 
@@ -3667,6 +2961,8 @@ class JobDialog(EmbeddedDialog):
         self.bind("<Return>", lambda e: self._add())
         self.bind("<Escape>", lambda e: self.destroy())
         self._on_source_changed()
+        if init_to in self._TARGET_LABEL:
+            self.to_var.set(self._TARGET_LABEL[init_to])
 
     # ── layout ───────────────────────────────────────────────────────────────
     def _group(self, number: str, title: str, hint: str = ""):
@@ -3771,8 +3067,9 @@ class JobDialog(EmbeddedDialog):
         self._backport_opts = bo.opts
         b1 = ctk.CTkFrame(bo.inner, fg_color=PANEL); b1.pack(fill="x", pady=(2, 2))
         ctk.CTkLabel(b1, text="Target firmware:", text_color=MUTED, width=120, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
-        ctk.CTkSegmentedButton(b1, values=["7.61", "6.02", "10.xx"], variable=self.backport_target_var,
-                                selected_color=ACCENT, selected_hover_color=ACCENT_HOVER).pack(side="left")
+        self._target_menu = ctk.CTkOptionMenu(b1, values=self._backport_targets(), variable=self.backport_target_var,
+                                              width=92, height=26, dynamic_resizing=False)
+        self._target_menu.pack(side="left")
         ctk.CTkLabel(b1, textvariable=self.backport_hint_var, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=380, justify="left").pack(side="left", padx=(10, 0))
         self._bind_help(self._HELP["target"], b1)
@@ -3806,8 +3103,31 @@ class JobDialog(EmbeddedDialog):
         ctk.CTkLabel(oin, textvariable=self._to_hint, text_color=MUTED, font=ctk.CTkFont(size=12),
                       wraplength=420, justify="left").pack(side="left", padx=(10, 0))
         self._bind_help(self._HELP["output"], oin)
+        self._oin = oin
+        # Compression: one row for both compressed formats, each with its own control
+        # (zlib level for .ffpfsc, the Kraken preset for .pkg); packed by _refresh.
+        cr = self._comp_row = ctk.CTkFrame(orow, fg_color=PANEL)
+        ctk.CTkLabel(cr, text="Compression:", text_color=MUTED, width=100, anchor="w",
+                      font=ctk.CTkFont(size=12)).pack(side="left")
+        self._comp_ffpfsc = ctk.CTkFrame(cr, fg_color=PANEL)
+        ctk.CTkSlider(self._comp_ffpfsc, from_=1, to=9, number_of_steps=8, variable=self.level_var, width=180,
+                      height=16, fg_color=BORDER2, progress_color=ACCENT, button_color=ACCENT,
+                      button_hover_color=ACCENT_HOVER).pack(side="left")
+        self._level_lbl = ctk.CTkLabel(self._comp_ffpfsc, text=f"level {self.level_var.get()}", text_color=WHITE,
+                                       width=56, anchor="w", font=ctk.CTkFont(size=12))
+        self._level_lbl.pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(self._comp_ffpfsc, text="higher: smaller file, slower build", text_color=MUTED,
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(4, 0))
+        self.level_var.trace_add("write", lambda *_: self._level_lbl.winfo_exists()
+                                 and self._level_lbl.configure(text=f"level {self.level_var.get()}"))
+        self._comp_pkg = ctk.CTkFrame(cr, fg_color=PANEL)
+        ctk.CTkSegmentedButton(self._comp_pkg, values=["normal", "fast"], variable=self.speed_var, selected_color=ACCENT,
+                                selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
+        ctk.CTkLabel(self._comp_pkg, text="fast: quicker build, a little larger", text_color=MUTED,
+                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(10, 0))
+        self._bind_help(self._HELP["compression"], cr)
         fin = ctk.CTkFrame(orow, fg_color=PANEL); fin.pack(fill="x", padx=10, pady=(4, 2))
-        ctk.CTkLabel(fin, text="Save to:", text_color=MUTED, width=64, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkLabel(fin, text="Save to:", text_color=MUTED, width=100, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
         self._out_entry = ctk.CTkEntry(fin, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE)
         self._out_entry.pack(side="left", fill="x", expand=True)
         self._out_btn = ctk.CTkButton(fin, text="Folder…", width=76, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
@@ -3843,19 +3163,58 @@ class JobDialog(EmbeddedDialog):
         ctk.CTkSegmentedButton(_h1, values=["auto", "on", "off"], variable=self.hdr_var, selected_color=ACCENT,
                                 selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
         self._bind_help(self._HELP["hdr"], _h1)
-        _h2 = ctk.CTkFrame(p2, fg_color=PANEL); _h2.pack(side="left", padx=(18, 0))
-        ctk.CTkLabel(_h2, text="Speed:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
-        ctk.CTkSegmentedButton(_h2, values=["normal", "fast"], variable=self.speed_var, selected_color=ACCENT,
+        p3 = ctk.CTkFrame(pk, fg_color=PANEL); p3.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(p3, text="", width=100).pack(side="left")
+        self._pkg_more_btn = ctk.CTkButton(p3, text="More options…", width=120, height=24, fg_color="transparent",
+                                           hover_color=CARD2, text_color=ACCENT, font=ctk.CTkFont(size=12),
+                                           anchor="w", command=self._toggle_pkg_more)
+        self._pkg_more_btn.pack(side="left")
+        ib = self._pkg_more_box = ctk.CTkFrame(pk, fg_color=PANEL)        # packed by _layout_pkg_more
+        self._ident_head = tk.StringVar(value=self._IDENT_OPTIONAL)
+        ctk.CTkLabel(ib, textvariable=self._ident_head, text_color=WHITE, font=ctk.CTkFont(size=12), anchor="w",
+                      justify="left", wraplength=600).pack(fill="x", pady=(2, 4))
+        ig = ctk.CTkFrame(ib, fg_color=PANEL); ig.pack(fill="x")
+        ig.grid_columnconfigure(1, weight=3); ig.grid_columnconfigure(3, weight=2)
+
+        def _cell(r, c, label, var, hint):
+            ctk.CTkLabel(ig, text=label, text_color=MUTED, font=ctk.CTkFont(size=12), anchor="w").grid(
+                row=r, column=c, sticky="w", padx=(0, 6), pady=2)
+            ctk.CTkEntry(ig, textvariable=var, fg_color=CARD2, text_color=WHITE, height=26,
+                         placeholder_text=hint).grid(row=r, column=c + 1, sticky="ew", padx=(0, 14), pady=2)
+        _cell(0, 0, "Content ID", self.cid_var, "UP9000-PPSA12345_00-GAMENAME00000000")
+        _cell(0, 2, "Title ID", self.tid_var, "PPSA12345")
+        _cell(1, 0, "Title", self.title_var, "")
+        _cell(1, 2, "Version", self.ver_var, "01.000.000")
+        self._ident_note = tk.StringVar(value="")
+        ctk.CTkLabel(ib, textvariable=self._ident_note, text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w",
+                      justify="left", wraplength=600).pack(fill="x", pady=(2, 6))
+        cr = ctk.CTkFrame(ib, fg_color=PANEL); cr.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(cr, text="Codec layer:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+        ctk.CTkSegmentedButton(cr, values=list(self._INNER), variable=self.inner_var, selected_color=ACCENT,
                                 selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
-        self._bind_help(self._HELP["speed"], _h2)
+        self._bind_help(self._HELP["codec"], cr)
+        self._back_row = None
+        if sys.platform == "win32":      # LibProsperoPkg refuses the Publishing Tools backend elsewhere
+            br = self._back_row = ctk.CTkFrame(ib, fg_color=PANEL); br.pack(fill="x", pady=(0, 4))
+            ctk.CTkLabel(br, text="Kraken backend:", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+            ctk.CTkSegmentedButton(br, values=list(self._BACKEND), variable=self.back_var, selected_color=ACCENT,
+                                    selected_hover_color=ACCENT_HOVER, height=24).pack(side="left")
+        self._bind_help(self._HELP["identity"], ig)
 
         # Help line + summary + buttons (outside the scroll area, always visible)
-        foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(0, 14))
+        foot = self._foot = ctk.CTkFrame(self, fg_color=BLACK); foot.pack(fill="x", padx=20, pady=(0, 14))
         ctk.CTkFrame(foot, height=1, corner_radius=0, fg_color=BORDER).pack(fill="x", pady=(0, 10))
-        # Two lines at the full width hold the longest hover text, so the footer never jumps.
-        help_lbl = ctk.CTkLabel(foot, textvariable=self.help_var, text_color=MUTED, font=ctk.CTkFont(size=12),
-                                justify="left", anchor="nw", height=34)
-        help_lbl.pack(fill="x", pady=(0, 8))
+        # The help line keeps one height while the pointer moves: the box is as tall as the
+        # longest hover text needs at the current width, so the buttons below never jump.
+        help_font = ctk.CTkFont(size=12)
+        help_box = ctk.CTkFrame(foot, fg_color=BLACK, corner_radius=0,
+                                height=3 * help_font.metrics("linespace") + 4)
+        help_box.pack(fill="x", pady=(0, 8))
+        help_box.pack_propagate(False)
+        help_lbl = ctk.CTkLabel(help_box, textvariable=self.help_var, text_color=MUTED, font=help_font,
+                                justify="left", anchor="nw")
+        help_lbl.pack(fill="both", expand=True)
+        help_texts = [self._HELP_IDLE, *self._HELP.values()]
         row = ctk.CTkFrame(foot, fg_color=BLACK); row.pack(fill="x")
         btns = ctk.CTkFrame(row, fg_color=BLACK); btns.pack(side="right")
         self._add_btn = ctk.CTkButton(btns, text="Save changes" if self.edit_item else "Add to queue",
@@ -3872,16 +3231,23 @@ class JobDialog(EmbeddedDialog):
                                 justify="left", anchor="w")
         dest_lbl.pack(anchor="w")
 
-        def _wrap(_e=None):
+        def _wrap(_e=None, width=None):
             try:
-                help_lbl.configure(wraplength=max(280, foot.winfo_width() - 8))
+                width = width or max(280, foot.winfo_width() - 8)
+                help_lbl.configure(wraplength=width)
+                lines = max(_wrapped_line_count(help_font, text, width) for text in help_texts)
+                height = lines * help_font.metrics("linespace") + 4
+                if int(float(help_box.cget("height"))) != height:
+                    help_box.configure(height=height)
                 for lbl in (sum_lbl, dest_lbl):
                     lbl.configure(wraplength=max(200, info.winfo_width() - 8))
             except tk.TclError:
                 pass
+        self._help_wrap = _wrap          # also called by the GUI tests with a fixed width
         foot.bind("<Configure>", _wrap, add="+")
         info.bind("<Configure>", _wrap, add="+")
-        self.body.pack(fill="both", expand=True, before=foot)
+        # Inset by the panel's 1 px border: flush, the scroll area painted over the frame's edge.
+        self.body.pack(fill="both", expand=True, padx=1, before=foot)
 
     def _bind_help(self, text: str, *widgets):
         """Show *text* in the help line while the pointer is over any of *widgets* or their
@@ -3954,24 +3320,51 @@ class JobDialog(EmbeddedDialog):
 
     @staticmethod
     def _sdk_text(folder: Path) -> str:
-        """'SDK 8.00' read from eboot.bin's SCE param segment, '' when unreadable."""
+        """'SDK 8.00' read from eboot.bin's SCE param segment (raw or fake-signed),
+        'encrypted eboot' when it cannot be read, '' when there is nothing to show."""
         try:
             eboot = folder / "eboot.bin"
             if not eboot.is_file():
                 return ""
-            with open(eboot, "rb") as f:
-                head = f.read(4 << 20)
-            _bd = str(backend_base_dir())
-            if _bd not in sys.path:
-                sys.path.insert(0, _bd)
-            import backport as _bp
-            hit = _bp._find_param_segment(head)
-            if hit is None:
-                return ""
-            word = struct.unpack_from("<I", head, hit[1] + 0x14)[0]
-            return f"SDK {word >> 24:X}.{(word >> 16) & 0xFF:02X}"
+            _bp = _backport_module()
+            words = _bp.sdk_words_of_file(eboot)
+            if words:
+                return f"SDK {_bp.sdk_firmware(words[0])}"
+            return "encrypted eboot" if _bp.is_encrypted_self(eboot) else ""
         except Exception:
             return ""
+
+    def _fw_root(self) -> Path | None:
+        raw = (self.app.fw_libs_var.get() or "").strip()
+        return Path(raw) if raw and Path(raw).is_dir() else None
+
+    def _backport_targets(self) -> list[str]:
+        """7.61, 6.02, 10.xx and every firmware folder under the firmware libraries folder."""
+        try:
+            names = _backport_module().available_targets(self._fw_root())
+        except Exception:
+            names = list(self._BACKPORT_HINTS)
+        cur = self.backport_target_var.get()
+        if is_backport_target(cur) and cur not in names:
+            names.append(cur)            # a job made with a firmware folder that is gone
+        return names
+
+    def _backport_hint(self, target: str) -> str:
+        """One line under the target: what the target is, or why it cannot be used."""
+        if target in self._BACKPORT_HINTS:
+            return self._BACKPORT_HINTS[target]
+        if target not in self._hint_cache:
+            fw = self._fw_root()
+            try:
+                bp = _backport_module()
+                problem = (bp.firmware_problem(bp.firmware_folder(fw, target), target) if fw
+                           else "no firmware libraries folder set in Settings")
+            except Exception as e:
+                problem = str(e)
+            self._hint_cache[target] = (f"{target}: cannot be used, {problem}" if problem else
+                                        f"{target}: SDK values from your {target} libraries; Check shows "
+                                        f"whether patched libraries are needed")
+        return self._hint_cache[target]
 
     def _on_source_changed(self):
         raw = (self.src_var.get() or "").strip()
@@ -3985,6 +3378,7 @@ class JobDialog(EmbeddedDialog):
         if not p or not p.exists():
             self._kind = "none"
             self.detect_var.set("Choose or drop a source." if not raw else "Not found")
+            self._update_identity_for_source(None)
             self._refresh(); return
         if p.is_dir():
             if is_game_folder(p):
@@ -4021,6 +3415,7 @@ class JobDialog(EmbeddedDialog):
             if kind is None:
                 self._kind = "file-unknown"
                 self.detect_var.set(f"Unsupported file type {suf or '(none)'}")
+                self._update_identity_for_source(None)
                 self._refresh(); return
             self._kind = kind
             tid = ""
@@ -4034,6 +3429,7 @@ class JobDialog(EmbeddedDialog):
             self.detect_var.set(" · ".join(x for x in (self._KIND_LABEL[kind], tid, size) if x))
             if kind in ("ffpfs", "ffpfsc", "pkg"):
                 self._look_btn.pack(side="left", padx=(10, 0))
+        self._update_identity_for_source(p)
         # Remembered choices for this kind of source (add mode only, once per kind).
         if self.edit_item is None and self._defaults_kind != self._kind:
             self._defaults_kind = self._kind
@@ -4042,9 +3438,151 @@ class JobDialog(EmbeddedDialog):
                 self.to_var.set(self._TARGET_LABEL.get(d.get("to", "ffpfsc"), ".ffpfsc"))
                 self.sign_var.set(bool(d.get("sign", False)))
                 self.backport_on_var.set(bool(d.get("backport", False)))
-                if d.get("backport_target") in self._BACKPORT_HINTS:
+                if is_backport_target(d.get("backport_target")):
                     self.backport_target_var.set(d["backport_target"])
         self._refresh()
+
+    @staticmethod
+    def _target_of(item) -> str:
+        """The output format an existing job produces, whatever kind of job it is."""
+        op = getattr(item, "operation", "pack")
+        if op == "chain":
+            return getattr(item, "chain_to", None) or "ffpfsc"
+        if op == "fpkg-build":
+            return "pkg"
+        if op == "unpack":
+            return "folder" if getattr(item, "unwrap", True) else "ffpfs"
+        if op in ("fpkg-extract", "fake-sign"):
+            return "folder"
+        if op == "patch":
+            return "ffpfsc"                  # a patch job always writes "<game> [patched].ffpfsc"
+        if op == "copy":
+            return {".ffpfsc": "ffpfsc", ".ffpfs": "ffpfs", ".pkg": "pkg"}.get(
+                Path(str(getattr(item, "path", "") or "")).suffix.lower(), "ffpfsc")
+        # pack: output_compressed None means "not chosen yet", which packs a .ffpfsc
+        return "ffpfs" if getattr(item, "output_compressed", None) is False else "ffpfsc"
+
+    # ── package identity ─────────────────────────────────────────────────────
+    def _update_identity_for_source(self, p: Path | None):
+        """Fill the identity from a game folder's param.json (never over what was typed),
+        and make it required for a game folder that has none."""
+        for key, val in list(self._auto_ident.items()):       # values of the previous source
+            var = {"content_id": self.cid_var, "title_id": self.tid_var,
+                   "title": self.title_var, "version": self.ver_var}[key]
+            if var.get() == val:
+                var.set("")
+        self._auto_ident = {}
+        forced = False
+        if self._kind == "folder" and p is not None:
+            pj = p / "sce_sys" / "param.json"
+            if pj.is_file():
+                self._prefill_identity(pj)
+            else:
+                forced = True
+                self._ident_note.set("Content ID and Title ID must be filled in; Title and Version are optional.")
+        elif self._kind == "parent":
+            self._ident_note.set("One job per game: each game's own param.json decides. Leave these empty.")
+        else:
+            self._ident_note.set("Read from the game's sce_sys/param.json when it is built. Leave empty; anything "
+                                 "typed here only fills what param.json lacks.")
+        self._ident_forced = forced
+        self._layout_pkg_more()
+
+    def _prefill_identity(self, pj: Path):
+        try:
+            d = json.loads(pj.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, ValueError) as e:
+            self._ident_note.set(f"param.json could not be read ({e}); the identity is used as typed.")
+            return
+        d = d if isinstance(d, dict) else {}
+        title = ""
+        lp = d.get("localizedParameters") or {}
+        if isinstance(lp, dict):
+            lang = lp.get("defaultLanguage")
+            block = lp.get(lang) if isinstance(lang, str) else None
+            if isinstance(block, dict):
+                title = str(block.get("titleName") or "")
+            if not title:
+                title = next((str(v["titleName"]) for v in lp.values() if isinstance(v, dict) and v.get("titleName")), "")
+        title = title or str(d.get("titleName") or "")
+        found = {"content_id": str(d.get("contentId") or "").strip(), "title_id": str(d.get("titleId") or "").strip(),
+                 "title": title, "version": str(d.get("contentVersion") or d.get("masterVersion") or "").strip()}
+        for key, var in (("content_id", self.cid_var), ("title_id", self.tid_var),
+                         ("title", self.title_var), ("version", self.ver_var)):
+            if found[key] and not var.get().strip():
+                var.set(found[key])
+                self._auto_ident[key] = found[key]
+        self._ident_note.set("Read from this folder's param.json, which still decides at build time; a value here "
+                             "only fills what it lacks.")
+
+    def _toggle_pkg_more(self):
+        self._pkg_more = not self._pkg_more
+        self._layout_pkg_more()
+        if self._pkg_more:
+            self._scroll_to_end()
+
+    def _reveal_identity(self):
+        if not self._ident_forced:           # required rows are shown anyway
+            self._pkg_more = True
+        self._layout_pkg_more()
+        self._scroll_to_end()
+
+    def _scroll_to_end(self):
+        """The rows just opened sit at the bottom of the options: scroll them into view."""
+        def _go():
+            try:
+                self.update_idletasks()
+                self.body._parent_canvas.yview_moveto(1.0)
+            except (AttributeError, tk.TclError):
+                pass
+        self.after_idle(_go)
+
+    def _layout_pkg_more(self):
+        shown = self._pkg_more or self._ident_forced
+        try:
+            if shown and not self._pkg_more_box.winfo_manager():
+                self._pkg_more_box.pack(fill="x", pady=(0, 6))
+            elif not shown and self._pkg_more_box.winfo_manager():
+                self._pkg_more_box.pack_forget()
+            self._pkg_more_btn.configure(text="Fewer options" if shown else "More options…",
+                                         state="disabled" if self._ident_forced else "normal")
+            self._ident_head.set(self._IDENT_REQUIRED if self._ident_forced else self._IDENT_OPTIONAL)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _collect_pkg_identity(self) -> dict | None:
+        """Check the identity and codec rows and return them for the package parameters,
+        or None after saying what is wrong (and showing the rows it is about)."""
+        cid = self.cid_var.get().strip().upper()
+        tid = self.tid_var.get().strip().upper()
+        ver = self.ver_var.get().strip()
+        title = self.title_var.get().strip()
+
+        def _bad(head: str, msg: str):
+            self._reveal_identity()
+            messagebox.showerror(head, msg, parent=self)
+            return None
+        if cid and not self._CID_RE.match(cid):
+            return _bad("Content ID", "Content ID must look like  UP9000-PPSA12345_00-GAMENAME00000000\n"
+                        "(2 letters + 4 digits, dash, 4 letters + 5 digits, _00-, 16 upper-case letters or digits), "
+                        "or stay empty to use the game's param.json.")
+        if tid and not self._TID_RE.match(tid):
+            return _bad("Title ID", "Title ID must look like  PPSA12345  (4 letters + 5 digits), or stay empty to "
+                        "use the game's param.json.")
+        if cid and tid and tid not in cid:
+            return _bad("Mismatch", f"The title id {tid} does not appear inside the content id {cid}.")
+        if cid and not tid:
+            tid = cid[7:16]
+        if ver and not self._VER_RE.match(ver):
+            return _bad("Version", "Version must be NN.NNN.NNN (or NN.NN), or stay empty to use param.json.")
+        if self._ident_forced and not (cid and tid):
+            return _bad("Identity needed", "This game folder has no sce_sys/param.json, so Content ID and Title ID "
+                        "must be filled in (the builder generates param.json from them).")
+        inner = self.inner_var.get() if self.inner_var.get() in self._INNER else "kraken"
+        back = self.back_var.get() if (sys.platform == "win32" and self.back_var.get() in self._BACKEND) else "builtin"
+        dll = (self.app.pubtools_dll_var.get() or "").strip() if back == "publishingtools" else ""
+        return {"content_id": cid, "title_id": tid, "title": title, "version": ver or "01.000.000",
+                "inner": inner, "backend": back, "dll": dll}
 
     # ── live state ───────────────────────────────────────────────────────────
     def _stand_in(self, p: Path | None):
@@ -4062,7 +3600,16 @@ class JobDialog(EmbeddedDialog):
         (self._patch_opts.pack(fill="x", pady=(2, 2)) if self.patch_on_var.get() else self._patch_opts.pack_forget())
         (self._backport_opts.pack(fill="x", pady=(2, 2)) if self.backport_on_var.get() else self._backport_opts.pack_forget())
         (self._pkg_opts.pack(fill="x", pady=(2, 0)) if to == "pkg" else self._pkg_opts.pack_forget())
-        self.backport_hint_var.set(self._BACKPORT_HINTS.get(self.backport_target_var.get(), ""))
+        if to in ("ffpfsc", "pkg"):
+            show, hide = (self._comp_pkg, self._comp_ffpfsc) if to == "pkg" else (self._comp_ffpfsc, self._comp_pkg)
+            hide.pack_forget()
+            if not show.winfo_manager():
+                show.pack(side="left")
+            if not self._comp_row.winfo_manager():
+                self._comp_row.pack(fill="x", padx=10, pady=(4, 0), after=self._oin)
+        else:
+            self._comp_row.pack_forget()
+        self.backport_hint_var.set(self._backport_hint(self.backport_target_var.get()))
         if to == "pkg":
             self._sign_cb.configure(state="disabled")
             self._sign_cb.pack_forget(); self._sign_note_lbl.pack_forget()
@@ -4116,7 +3663,9 @@ class JobDialog(EmbeddedDialog):
         self.summary_var.set(text)
         self.summary_dest_var.set(dest)
         try:
-            self._add_btn.configure(state="normal" if ok else "disabled")
+            # Disabled, it greys out like the main window's Start instead of staying blue
+            # with barely readable text.
+            self._add_btn.configure(state="normal" if ok else "disabled", fg_color=ACCENT if ok else BTN)
         except Exception:
             pass
 
@@ -4128,31 +3677,48 @@ class JobDialog(EmbeddedDialog):
         folder = self._games[0]
         target = self.backport_target_var.get()
         libs = (self.backport_libs_var.get() or "").strip()
-        fw = (load_settings().get("fw_libs_root") or "").strip()
+        fw_path = self._fw_root()
+        if fw_path is None:
+            self.check_var.set("Set the firmware libraries folder in Settings (one subfolder per firmware, "
+                               "e.g. 7.61, 10.01) to check a game against its target.")
+            return
+        fw = str(fw_path)
         pycmd = get_backend_python_command()
         if not pycmd:
             self.check_var.set("Backend not found."); return
         cli_py = backend_base_dir() / "cli.py"
         head = pycmd if getattr(sys, "frozen", False) else pycmd + ["-u", str(cli_py)]
-        argv = head + ["--backport-analyze", str(folder), "--backport-target", target]
-        if fw:
-            argv += ["--fw-libs-root", fw]
+        argv = head + ["--backport-analyze", str(folder), "--backport-target", target, "--fw-libs-root", fw]
         if libs:
             argv += ["--backport-libs", libs]
         self.check_var.set("Checking…")
         self._check_btn.configure(state="disabled")
+        result: dict = {}
 
-        def work():
+        def work():                      # no Tk calls here: the main thread polls for the result
             try:
                 r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=600)
-                lines = [l for l in (r.stdout or "").splitlines() if l.startswith("[analyse]")]
-                msg = " · ".join(l.replace("[analyse] ", "") for l in lines) or (r.stderr or "").strip()[-300:] or "no result"
-                if not fw:
-                    msg += "  (no firmware library folder set in Settings — only your patched libraries were counted)"
+                out = (r.stdout or "").splitlines()
+                verdict = next((l[len("[verdict] "):] for l in out if l.startswith("[verdict] ")), "")
+                result["msg"] = verdict or (r.stderr or "").strip()[-300:] or "no result"
             except Exception as e:
-                msg = f"check failed: {e}"
-            self.after(0, lambda: (self.check_var.set(msg), self._check_btn.configure(state="normal")))
-        threading.Thread(target=work, daemon=True).start()
+                result["msg"] = f"check failed: {e}"
+
+        worker = threading.Thread(target=work, daemon=True)
+
+        def poll():
+            try:
+                if not self.winfo_exists():
+                    return
+                if worker.is_alive():
+                    self.after(150, poll)
+                    return
+                self.check_var.set(result.get("msg", "no result"))
+                self._check_btn.configure(state="normal")
+            except tk.TclError:
+                pass                     # the dialog closed while the check ran
+        worker.start()
+        self.after(150, poll)
 
     # ── commit ───────────────────────────────────────────────────────────────
     def _add(self):
@@ -4173,13 +3739,30 @@ class JobDialog(EmbeddedDialog):
         libs = (self.backport_libs_var.get() or "").strip() if self.backport_on_var.get() else ""
         if libs and not Path(libs).is_dir():
             messagebox.showerror("Backport", "The patched-libraries folder does not exist.", parent=self); return
+        if target and libs:
+            misuse = _backport_module().patched_libs_problem(libs, self._fw_root())
+            if misuse:
+                messagebox.showerror("Backport", misuse[0].upper() + misuse[1:] + ".", parent=self); return
+        if target and target not in self._BACKPORT_HINTS:
+            try:
+                _backport_module().target_words(target, self._fw_root())
+            except ValueError as e:
+                messagebox.showerror("Backport", str(e), parent=self); return
         stand = self._stand_in(p)
         if chain_summary(stand).startswith("Nothing to do"):
             messagebox.showerror("Nothing to do", "A folder to a folder with no changes is nothing to do.", parent=self); return
 
         level = -4 if self.speed_var.get() == "fast" else 7
-        pkg_params = {"content_id": "", "title_id": "", "title": "", "version": "01.000.000",
-                      "inner": "kraken", "backend": "builtin", "level": level, "dll": "",
+        ff_level = max(1, min(9, int(self.level_var.get())))
+        ident = {"content_id": "", "title_id": "", "title": "", "version": "01.000.000",
+                 "inner": "kraken", "backend": "builtin", "dll": ""}
+        if to == "pkg":
+            ident = self._collect_pkg_identity()
+            if ident is None:
+                return
+        pkg_params = {"content_id": ident["content_id"], "title_id": ident["title_id"], "title": ident["title"],
+                      "version": ident["version"], "inner": ident["inner"], "backend": ident["backend"],
+                      "level": level, "dll": ident["dll"],
                       "retail_normalize": bool(self.retail_var.get()), "hdr_flag": _hdr_mode(self.hdr_var.get()),
                       "regen_playgo": bool(self.regen_var.get()), "fake_sign": True,
                       "backport_target": target, "backport_libs": libs}
@@ -4203,6 +3786,12 @@ class JobDialog(EmbeddedDialog):
             self.app.fpkg_defaults = {k: pkg_params[k] for k in ("inner", "backend", "level", "retail_normalize",
                                                                 "hdr_flag", "regen_playgo", "fake_sign")}
             self.app.fpkg_defaults["v1112"] = True
+            try:
+                save_settings({"fpkg_defaults": self.app.fpkg_defaults})   # remembered across restarts
+            except Exception:
+                pass
+        elif to == "ffpfsc":
+            self.app.compression_level_var.set(ff_level)   # the next job starts from it (saved, shown in Settings)
         if out:
             self.app.output_var.set(out)
         self.app.auto_organize_var.set(organize)
@@ -4219,6 +3808,7 @@ class JobDialog(EmbeddedDialog):
                 messagebox.showerror("Source", f"Could not read {s}:\n{e}", parent=self); return
             if to == "pkg":
                 self.app._apply_fpkg_params(it, pkg_params)
+            it.compression_level = ff_level if to == "ffpfsc" else None
             it.auto_organize = organize
             made.append(it)
         if not made:
@@ -4255,462 +3845,6 @@ class JobDialog(EmbeddedDialog):
         self.destroy()
 
 
-class PatchDialog(EmbeddedDialog):
-    """Collect a game (.ffpfsc / folder / archive) + a patch (folder / archive) and
-    kick off 'patch into game' — unpack the game, overlay the patch files, repack.
-
-    Edit mode (item=existing GameItem): opens pre-filled with that item's game/patch/
-    output/mode; saving mutates the item in place."""
-    LARGE = True
-
-    def __init__(self, app, item=None):
-        super().__init__(app.root)
-        self.app = app
-        self.edit_item = item
-        self.title("Integrate Patch — edit job" if item else "Integrate Patch into Game")
-        self.geometry("620x440")
-        self.configure(fg_color=BLACK)
-        self.resizable(False, False)
-        self.transient(app.root); self.lift(); self.focus_force()
-        self.after(50, self.grab_set)
-        if item is not None:
-            init_game = str(getattr(item, "path", "") or "")
-            init_patch = str(getattr(item, "patch_source", "") or "")
-            init_mode = "overwrite" if getattr(item, "patch_overwrite", False) else "new"
-            init_out = str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip()
-        else:
-            init_game = ""; init_patch = ""; init_mode = "new"
-            init_out = (app.output_var.get() or "").strip()
-        self.game_var = tk.StringVar(value=init_game)
-        self.patch_var = tk.StringVar(value=init_patch)
-        self.mode_var = tk.StringVar(value=init_mode)
-        self.out_var = tk.StringVar(value=init_out)
-
-        header_text = "Integrate Patch — edit job" if item else "Integrate Patch into Game"
-        ctk.CTkLabel(self, text=header_text,
-                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
-                      ).pack(anchor="w", padx=20, pady=(16, 2))
-        sub = ("Change this patch job's game, patch source, mode, or output. The job stays "
-               "at its current queue position." if item else
-               "Unpacks the game, overlays the patch files (overwrite + new), and repacks. "
-               "Adds a patch job to the queue — press ▶ START to run it.")
-        ctk.CTkLabel(self, text=sub,
-                      text_color=MUTED, wraplength=600, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
-
-        self._file_row("Game  (.ffpfsc, folder, or archive):", self.game_var,
-                       [("Game / Archive", "*.ffpfsc *.zip *.rar *.7z")])
-        self._file_row("Patch  (archive or folder of loose files):", self.patch_var,
-                       [("Archive", "*.zip *.rar *.7z")])
-
-        mode_row = ctk.CTkFrame(self, fg_color=BLACK); mode_row.pack(fill="x", padx=20, pady=(10, 4))
-        ctk.CTkLabel(mode_row, text="Output:", text_color=WHITE).pack(side="left", padx=(0, 10))
-        ctk.CTkRadioButton(mode_row, text="New file ( … [patched].ffpfsc )", variable=self.mode_var,
-                            value="new", fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=6)
-        ctk.CTkRadioButton(mode_row, text="Overwrite original", variable=self.mode_var,
-                            value="overwrite", fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=6)
-
-        out_row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); out_row.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(out_row, text="Output folder  (for the [patched] copy):", text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-        out_inner = ctk.CTkFrame(out_row, fg_color=PANEL); out_inner.pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkEntry(out_inner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE,
-                      placeholder_text="defaults to the game's folder").pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(out_inner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                       command=lambda: self._pick_dir(self.out_var), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-
-        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        save_text = "Save changes" if item else "Add to queue"
-        ctk.CTkButton(btns, text=save_text, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
-                       command=self._go).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
-
-    def _file_row(self, label, var, filetypes):
-        row = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); row.pack(fill="x", padx=20, pady=4)
-        ctk.CTkLabel(row, text=label, text_color=WHITE, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-        inner = ctk.CTkFrame(row, fg_color=PANEL); inner.pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkEntry(inner, textvariable=var, fg_color=CARD2, text_color=WHITE).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(inner, text="File", width=58, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                       command=lambda: self._pick_file(var, filetypes), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(inner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                       command=lambda: self._pick_dir(var), border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-
-    def _pick_file(self, var, filetypes):
-        p = filedialog.askopenfilename(filetypes=filetypes + [("All files", "*.*")])
-        if p:
-            var.set(p)
-
-    def _pick_dir(self, var):
-        p = filedialog.askdirectory()
-        if p:
-            var.set(p)
-
-    def _go(self):
-        g = self.game_var.get().strip(); p = self.patch_var.get().strip()
-        if not g or not p:
-            messagebox.showerror("Missing", "Please select BOTH a game and a patch.", parent=self)
-            return
-        game, patch = Path(g), Path(p)
-        if not game.exists():
-            messagebox.showerror("Not found", f"Game not found:\n{game}", parent=self); return
-        if not patch.exists():
-            messagebox.showerror("Not found", f"Patch not found:\n{patch}", parent=self); return
-        # Accept folder / .ffpfsc / archive game, and folder / archive patch. An archive
-        # game or a .7z patch is extracted to a folder when the job reaches the front of
-        # the queue (_prepare_patch_item); .zip/.rar patches go straight to the backend.
-        ARCH = (".zip", ".rar", ".7z")
-        gsfx, psfx = game.suffix.lower(), patch.suffix.lower()
-        if not (game.is_dir() or gsfx == ".ffpfsc" or gsfx in ARCH):
-            messagebox.showerror(
-                "Unsupported game source",
-                "The game must be a folder, a .ffpfsc, or an archive (.zip/.rar/.7z).",
-                parent=self); return
-        if not (patch.is_dir() or psfx in ARCH):
-            messagebox.showerror(
-                "Unsupported patch source",
-                "The patch must be a folder or an archive (.zip/.rar/.7z).",
-                parent=self); return
-        overwrite = self.mode_var.get() == "overwrite"
-        out_folder = self.out_var.get().strip()
-        out_path = Path(out_folder) if out_folder else game.parent
-
-        # ── Edit mode: mutate the existing patch item in place ───────────────
-        if self.edit_item is not None:
-            it = self.edit_item
-            it.path            = game
-            it.name            = (game.stem if game.suffix.lower() == ".ffpfsc" else game.name)
-            it.display_name    = None   # re-capture the stable queue label from the new name
-            try:
-                it.title_id = parse_title_id(game) or "🩹"
-            except Exception:
-                it.title_id = "🩹"
-            it.patch_source    = patch
-            it.output_path     = out_path
-            it.patch_overwrite = overwrite
-            if it.status not in ("Done",):
-                it.status = "Queued"
-            self.destroy()
-            self.app.update_queue_box(select_item=it)
-            self.app.log("OK", f"Patch job updated: {it.name}")
-            return
-
-        item = GameItem.from_patch(game, patch, output_path=out_path, overwrite=overwrite)
-        self.destroy()
-        self.app.queue.append(item)
-        self.app.update_queue_box(select_item=item)
-        self.app.log("OK", f"Patch job queued: {item.name}.  Press ▶ START to run.")
-        self.app.status_update("Ready", f"Patch queued: {item.name} — press START.",
-                               "Ready", 0, 0, "00:00", "—", "—")
-
-
-class ConverterDialog(EmbeddedDialog):
-    """Stepwise image converter: take a packed image apart one step at a time —
-    .ffpfsc → .ffpfs (decompress, fast) → folder. The chosen conversion is added to the
-    queue; the user then presses START (it reuses the normal unpack pipeline). Compressing
-    a folder or a .ffpfs INTO a .ffpfsc is the normal queue + the top format switch."""
-    LARGE = True
-
-    def __init__(self, app):
-        super().__init__(app.root)
-        self.app = app
-        self.title("Image Converter")
-        self.geometry("820x460")
-        self.configure(fg_color=BLACK)
-        self.resizable(False, False)
-        self.transient(app.root); self.lift(); self.focus_force()
-        self.after(50, self.grab_set)
-        self.src_var = tk.StringVar()
-
-        ctk.CTkLabel(self, text="Image Converter",
-                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
-                      ).pack(anchor="w", padx=24, pady=(18, 2))
-        ctk.CTkLabel(self, text="Pick an image, then choose a step along the chain. The conversion is "
-                                "added to the queue — press ▶ START to run it.",
-                      text_color=MUTED, wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(0, 14))
-
-        # Source row + a detected-type badge.
-        row = ctk.CTkFrame(self, fg_color=BLACK); row.pack(fill="x", padx=24, pady=(0, 6))
-        ctk.CTkEntry(row, textvariable=self.src_var, fg_color=CARD, border_color=BORDER2,
-                      text_color=WHITE, placeholder_text="Select a .ffpfsc / .ffpfs file or a folder…"
-                      ).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(row, text="File…", width=66, fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self._pick_file, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(row, text="Folder…", width=78, fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-
-        badge_row = ctk.CTkFrame(self, fg_color=BLACK); badge_row.pack(fill="x", padx=24, pady=(2, 2))
-        self.badge = ctk.CTkLabel(badge_row, text="—", fg_color=CARD2, corner_radius=6,
-                                   text_color=WHITE, font=ctk.CTkFont(size=13, weight="bold"),
-                                   width=72, height=24)
-        self.badge.pack(side="left")
-        self.type_var = tk.StringVar(value="No file selected.")
-        ctk.CTkLabel(badge_row, textvariable=self.type_var, text_color=MUTED,
-                      wraplength=740, justify="left").pack(side="left", padx=(10, 0))
-
-        # The conversion chain — nodes with transition buttons between them.
-        self.pipe = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
-        self.pipe.pack(fill="x", padx=24, pady=(14, 6))
-
-        self.note_var = tk.StringVar(value="")
-        ctk.CTkLabel(self, textvariable=self.note_var, text_color=MUTED,
-                      font=ctk.CTkFont(size=12), wraplength=832, justify="left").pack(anchor="w", padx=24, pady=(2, 0))
-
-        ctk.CTkButton(self, text="Close", fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER
-                       ).pack(side="right", padx=24, pady=16)
-
-        self.src_var.trace_add("write", lambda *_: self._refresh())
-        self._refresh()
-
-    def _pick_file(self):
-        p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
-                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
-        if p:
-            self.src_var.set(p)
-
-    def _pick_folder(self):
-        p = filedialog.askdirectory(title="Select a folder of .ffpfsc / .ffpfs images")
-        if p:
-            self.src_var.set(p)
-
-    def _node(self, text, current=False):
-        box = ctk.CTkFrame(self.pipe, fg_color=CARD, corner_radius=8,
-                            border_width=2 if current else 1,
-                            border_color=ACCENT if current else BORDER2)
-        box.pack(side="left", padx=4, pady=14)
-        ctk.CTkLabel(box, text=text, text_color=(WHITE if current else MUTED),
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(padx=14, pady=(8, 0))
-        ctk.CTkLabel(box, text=("you have this" if current else "result"),
-                      text_color=(ACCENT if current else MUTED),
-                      font=ctk.CTkFont(size=11)).pack(padx=14, pady=(0, 8))
-
-    def _transition(self, label, action, desc):
-        cell = ctk.CTkFrame(self.pipe, fg_color=PANEL)
-        cell.pack(side="left", padx=2, pady=8)
-        ctk.CTkLabel(cell, text="→", text_color=MUTED, font=ctk.CTkFont(size=20)).pack()
-        ctk.CTkButton(cell, text=label, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
-                       width=118, height=30, font=ctk.CTkFont(size=13),
-                       command=lambda a=action: self._go(a)).pack(pady=(2, 2))
-        ctk.CTkLabel(cell, text=desc, text_color=MUTED, font=ctk.CTkFont(size=11),
-                      wraplength=128, justify="center").pack()
-
-    def _refresh(self):
-        for w in self.pipe.winfo_children():
-            w.destroy()
-        self.note_var.set("")
-        raw = (self.src_var.get() or "").strip()
-        p = Path(raw) if raw else None
-        if not p or not p.exists():
-            self.badge.configure(text="—", fg_color=CARD2)
-            self.type_var.set("No file selected.")
-            ctk.CTkLabel(self.pipe, text="Pick a .ffpfsc / .ffpfs file or a folder above to see the steps.",
-                          text_color=MUTED).pack(padx=16, pady=24)
-            return
-        if p.is_dir():
-            self.badge.configure(text="FOLDER", fg_color=CARD2)
-            self.type_var.set(f"“{p.name}” — a folder; batch-unpack every image inside.")
-            self._node("Images", current=True)
-            self._transition("Unpack all", "batch", "each image → its own folder")
-            self._node("Folders")
-            self.note_var.set("Every .ffpfs / .ffpfsc found in the folder is unpacked to its own folder.")
-        elif p.suffix.lower() == ".ffpfsc":
-            self.badge.configure(text=".ffpfsc", fg_color=ACCENT)
-            self.type_var.set(f"“{p.name}” — compressed image.")
-            self._node(".ffpfsc", current=True)
-            self._transition("Decompress", "decompress", "→ inner .ffpfs (fast, one level)")
-            self._node(".ffpfs")
-            self._transition("Unpack", "folder", "→ game files")
-            self._node("Folder")
-            self._transition("Build fPKG", "fpkg", "→ installable .pkg (one click)")
-            self._node("fPKG")
-            self.note_var.set("Decompress gives the uncompressed .ffpfs (faster to mount, full size). "
-                              "Unpack extracts the game files into a folder. Build fPKG unwraps the image "
-                              "on the temp drive and packages it as an installable .pkg in one job.")
-        elif p.suffix.lower() == ".ffpfs":
-            self.badge.configure(text=".ffpfs", fg_color=CARD2)
-            self.type_var.set(f"“{p.name}” — uncompressed image.")
-            self._node(".ffpfs", current=True)
-            self._transition("Unpack", "folder", "→ game files")
-            self._node("Folder")
-            self._transition("Build fPKG", "fpkg", "→ installable .pkg (one click)")
-            self._node("fPKG")
-            self.note_var.set("To COMPRESS this .ffpfs into a .ffpfsc instead, add it as a source in the "
-                              "main window and use the Output control (Compressed). Build fPKG makes an "
-                              "installable .pkg from it in one job.")
-        else:
-            self.badge.configure(text="?", fg_color=CARD2)
-            self.type_var.set("Not a .ffpfsc / .ffpfs image.")
-            ctk.CTkLabel(self.pipe, text="Unsupported file type.", text_color=MUTED).pack(padx=16, pady=24)
-
-    def _go(self, action):
-        raw = (self.src_var.get() or "").strip()
-        if not raw or not Path(raw).exists():
-            messagebox.showerror("Nothing selected", "Pick a .ffpfsc / .ffpfs file or a folder of images.")
-            return
-        self.app._queue_conversion(Path(raw), action)
-        self.destroy()
-
-
-class JobEditMiniDialog(EmbeddedDialog):
-    """Lightweight edit dialog for jobs whose ConverterDialog/PackDialog/PatchDialog flows
-    don't fit a simple two-field shape: an Unpack/Convert item (the .ffpfsc image source
-    + an output folder) or a Fake-Sign item (just the folder to sign in place). For Pack
-    and Patch use the full PackDialog / PatchDialog in edit mode instead."""
-    LARGE = True
-
-    def __init__(self, app, item):
-        super().__init__(app.root)
-        self.app = app
-        self.edit_item = item
-        op = getattr(item, "operation", "pack")
-        title = {"unpack": "Convert — edit job",
-                 "fake-sign": "Fake Sign — edit job",
-                 "fpkg-extract": "Extract fPKG — edit job"}.get(op, "Edit job")
-        self.title(title)
-        # Two-row variants (source + output) need the extra height for the button row.
-        self.geometry("620x340" if op in ("unpack", "fpkg-extract") else "620x260")
-        self.configure(fg_color=BLACK); self.resizable(False, False)
-        self.transient(app.root); self.lift(); self.focus_force()
-        self.after(50, self.grab_set)
-
-        if op == "unpack":
-            head = "Convert — edit job"
-            sub  = "Change this conversion's source image or output folder. The job stays at its current queue position."
-            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
-            self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
-        elif op == "fpkg-extract":
-            head = "Extract fPKG — edit job"
-            sub  = "Change the .pkg this job extracts or the folder it extracts into. The job stays at its current queue position."
-            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
-            self.out_var = tk.StringVar(value=str(getattr(item, "output_path", "") or (app.output_var.get() or "")).strip())
-        else:   # fake-sign
-            head = "Fake Sign — edit job"
-            sub  = "Change the folder this fake-sign job operates on. The job stays at its current queue position."
-            self.src_var = tk.StringVar(value=str(getattr(item, "path", "") or ""))
-            self.out_var = None
-
-        ctk.CTkLabel(self, text=head,
-                      font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
-                      ).pack(anchor="w", padx=20, pady=(16, 2))
-        ctk.CTkLabel(self, text=sub, text_color=MUTED, wraplength=600, justify="left"
-                      ).pack(anchor="w", padx=20, pady=(0, 10))
-
-        # Source row
-        srow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); srow.pack(fill="x", padx=20, pady=4)
-        src_label = {"unpack": "Source image (.ffpfsc / .ffpfs):",
-                     "fpkg-extract": "Source package (.pkg):"}.get(op, "Folder (to fake-sign in place):")
-        ctk.CTkLabel(srow, text=src_label, text_color=WHITE,
-                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-        sinner = ctk.CTkFrame(srow, fg_color=PANEL); sinner.pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkEntry(sinner, textvariable=self.src_var, fg_color=CARD2, text_color=WHITE
-                      ).pack(side="left", fill="x", expand=True)
-        if op in ("unpack", "fpkg-extract"):
-            ctk.CTkButton(sinner, text="File", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                           command=(self._pick_pkg if op == "fpkg-extract" else self._pick_image), border_width=1, border_color=BTN_BORDER
-                           ).pack(side="left", padx=(6, 0))
-        if op != "fpkg-extract":
-            ctk.CTkButton(sinner, text="Folder", width=72, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                           command=self._pick_folder, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-
-        # Output row (unpack / fpkg-extract)
-        if op in ("unpack", "fpkg-extract"):
-            orow = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8); orow.pack(fill="x", padx=20, pady=4)
-            ctk.CTkLabel(orow, text="Output folder  (where extracted files land):", text_color=WHITE,
-                          font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 0))
-            oinner = ctk.CTkFrame(orow, fg_color=PANEL); oinner.pack(fill="x", padx=10, pady=(2, 8))
-            ctk.CTkEntry(oinner, textvariable=self.out_var, fg_color=CARD2, text_color=WHITE
-                          ).pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(oinner, text="Folder", width=64, fg_color=BTN, hover_color=BTN_HOVER, text_color=WHITE,
-                           command=self._pick_outdir, border_width=1, border_color=BTN_BORDER).pack(side="left", padx=(6, 0))
-
-        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
-        ctk.CTkButton(btns, text="Save changes", fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       text_color=ON_ACCENT, font=ctk.CTkFont(size=13),
-                       command=self._save).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE,
-                       hover_color=BTN_HOVER, command=self.destroy, border_width=1, border_color=BTN_BORDER).pack(side="right")
-
-    def _pick_image(self):
-        p = filedialog.askopenfilename(title="Select a .ffpfsc / .ffpfs image",
-                                       filetypes=[("PFS images", "*.ffpfsc *.ffpfs"), ("All files", "*.*")])
-        if p:
-            self.src_var.set(p)
-
-    def _pick_pkg(self):
-        p = filedialog.askopenfilename(title="Select a PS5 fake package (.pkg)",
-                                       filetypes=[("PS5 package", "*.pkg"), ("All files", "*.*")])
-        if p:
-            self.src_var.set(p)
-
-    def _pick_folder(self):
-        p = filedialog.askdirectory()
-        if p:
-            self.src_var.set(p)
-
-    def _pick_outdir(self):
-        p = filedialog.askdirectory()
-        if p and self.out_var is not None:
-            self.out_var.set(p)
-
-    def _save(self):
-        s = self.src_var.get().strip()
-        if not s:
-            messagebox.showerror("Missing", "Please choose a source.", parent=self); return
-        src = Path(s)
-        if not src.exists():
-            messagebox.showerror("Not found", f"Source not found:\n{src}", parent=self); return
-        it = self.edit_item
-        op = getattr(it, "operation", "pack")
-        if op == "unpack":
-            if not (src.is_file() and src.suffix.lower() in (".ffpfsc", ".ffpfs")):
-                messagebox.showerror("Wrong type", "Convert needs a .ffpfsc or .ffpfs image.", parent=self); return
-            it.path = src
-            it.name = src.stem
-            try:
-                it.title_id = parse_title_id(src) or "📤"
-            except Exception:
-                it.title_id = "📤"
-            try:
-                it.size = src.stat().st_size
-                it.extracted_size = it.size
-            except Exception:
-                pass
-            outf = (self.out_var.get() or "").strip() if self.out_var else ""
-            it.output_path = Path(outf) if outf else None
-        elif op == "fpkg-extract":
-            if not (src.is_file() and src.suffix.lower() == ".pkg"):
-                messagebox.showerror("Wrong type", "Extract fPKG needs a .pkg file.", parent=self); return
-            it.path = src
-            it.name = src.stem
-            try:
-                it.title_id = parse_title_id(src) or "📦"
-            except Exception:
-                it.title_id = "📦"
-            try:
-                it.size = src.stat().st_size
-                it.extracted_size = it.size
-            except Exception:
-                pass
-            outf = (self.out_var.get() or "").strip() if self.out_var else ""
-            it.output_path = Path(outf) if outf else None
-        else:   # fake-sign
-            if not src.is_dir():
-                messagebox.showerror("Wrong type", "Fake Sign needs a folder.", parent=self); return
-            it.path = src
-            it.name = src.name
-            try:
-                it.title_id = parse_title_id(src) or "🖊"
-            except Exception:
-                it.title_id = "🖊"
-        # Only now — every branch above has validated the new source — re-capture the
-        # stable queue label from the new name. A rejected edit keeps the old label.
-        it.display_name = None
-        if it.status not in ("Done",):
-            it.status = "Queued"
-        self.destroy()
-        self.app.update_queue_box(select_item=it)
-        self.app.log("OK", f"Job updated: {it.name}")
 
 
 class ArchivePasswordPrompt(MessageWindow):
@@ -5170,7 +4304,7 @@ class App:
         later; placing the divider before that would leave the card squeezed, because the
         list, not the card, takes the extra width."""
         pw = getattr(self, "_paned_q", None)
-        if not pw:
+        if not pw or not getattr(self, "_inspector_open", False):
             return
         try:
             self.root.update_idletasks()
@@ -5246,7 +4380,7 @@ class App:
                 return default
         # Coerce defensively: a hand-edited / corrupt non-numeric value here would make
         # tk.IntVar(value=...) raise TclError and hard-crash the GUI at startup.
-        self._saved_compression_level = _safe_int(settings.get("compression_level", 7), 7)
+        self._saved_compression_level = max(1, min(9, _safe_int(settings.get("compression_level", 7), 7)))
         self._saved_cpu_count = _safe_int(settings.get("cpu_count", 0), 0)
         self._saved_block_size = settings.get("block_size", "auto")
         # Migrate console-incompatible block sizes: "auto-fit" (picks 4 KiB for many-file
@@ -5349,6 +4483,7 @@ class App:
         self._show_view("queue")
         self.update_stages_display("", 0)
         self._bind_shortcuts()
+        self._build_menubar()
         self._filter_root_configure()
         self.update_queue_box()
 
@@ -5371,7 +4506,6 @@ class App:
         self.source_detail_var = S(value="Source: —")
         self.orig_var = S(value="Original Size: —")
         self.files_var = S(value="Files: —")
-        self.tune_note_var = S(value="")
         self.big_status_var = S(value="Ready")
         self.big_detail_var = S(value="Waiting for a game.")
         self.speed_var = S(value="Speed: —")
@@ -5506,10 +4640,15 @@ class App:
                 pass
 
     def _bind_shortcuts(self):
-        keys = {"<Command-n>": self.open_job_dialog, "<Command-comma>": self.open_settings,
-                "<Command-Key-1>": lambda: self._show_view("queue"),
-                "<Command-Key-2>": lambda: self._show_view("history"),
-                "<Command-Key-3>": lambda: self._show_view("log")}
+        # On macOS the menus' key equivalents answer these keys first; the bindings serve
+        # the other platforms. Neither acts behind an open panel.
+        keys = {f"<{MOD}-n>": self.open_job_dialog, f"<{MOD}-o>": self.open_pfs_browser,
+                f"<{MOD}-comma>": self.open_settings, f"<{MOD}-r>": self.start,
+                f"<{MOD}-period>": self._stop_if_running,
+                f"<{MOD}-Key-1>": lambda: self._show_view("queue"),
+                f"<{MOD}-Key-2>": lambda: self._show_view("history"),
+                f"<{MOD}-Key-3>": lambda: self._show_view("log"),
+                DETAILS_SEQ: self.toggle_inspector}
         for seq, fn in keys.items():
             try:
                 self.root.bind(seq, lambda e, f=fn: (None if self._panels.stack else f(), "break")[1])
@@ -5543,7 +4682,7 @@ class App:
         box.grid_columnconfigure(0, weight=1)
         box.grid_rowconfigure(0, weight=1)
         if mirror is not None:
-            t = LogText(box, kit, mirror=mirror, mirror_lines=4, height=10)
+            t = LogText(box, kit, mirror=mirror, mirror_lines=400, height=10)
         else:
             t = kit.text(box, fg=fg, height=8, state="disabled")
         t.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
@@ -5569,50 +4708,34 @@ class App:
         head, btns = self._column_header(left, "Queue", subtitle_var=self.queue_total_var)
         head.grid(row=0, column=0, sticky="ew", padx=(18, 14), pady=(18, 12))
         self._add_btn = self._small(btns, "Add job", "plus", self.open_job_dialog, variant="secondary",
-                                    tooltip="Pick a source, what to change in it and what comes out (⌘N)")
-        self._add_btn.pack(side="left", padx=(0, 6))
+                                    tooltip=f"Pick a source, what to change in it and what comes out  {SHORTCUT['add']}")
+        self._add_btn.grid(row=0, column=0, padx=(0, 6))
         self.start_btn = self._small(btns, "Start", "play", self.start, variant="primary",
-                                     tooltip="Run the jobs from the top")
-        self.start_btn.pack(side="left")
+                                     tooltip=f"Run the jobs from the top  {SHORTCUT['start']}")
+        self.start_btn.grid(row=0, column=1)
+        # While the queue runs, Stop takes Start's place, so stopping works with the details closed.
+        self.stop_btn = self._small(btns, "Stop", "stop", self.cancel, variant="danger",
+                                    tooltip=f"Cancel the running job and stop the queue  {SHORTCUT['stop']}")
+        self.stop_btn.grid(row=0, column=1)
+        self.stop_btn.grid_remove()
+        self._details_btn = self._small(btns, "", "sidebar-right", self.toggle_inspector,
+                                        tooltip=f"Show or hide the details  {SHORTCUT['details']}")
+        self._details_btn.grid(row=0, column=2, padx=(8, 0))
         self.queue_listbox = QueueList(
-            left, kit, on_select=lambda i: self._on_queue_select(), on_activate=self._on_queue_double_click,
+            left, kit, on_select=lambda i: self._on_queue_clicked(), on_activate=self._on_queue_double_click,
             on_context=self._queue_context_menu, on_key_up=self._lb_key_up, on_key_down=self._lb_key_down,
             on_delete=self.queue_remove_selected, empty_title="Your queue is empty",
             empty_body="Drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg into this window, "
                        "or use Add job.")
         self.queue_listbox.grid(row=1, column=0, sticky="nsew")
-        kit.rule(left).grid(row=2, column=0, sticky="ew")
-        tune = kit.frame(left)
-        tune.grid(row=3, column=0, sticky="ew", padx=(14, 8), pady=5)
-        tune.grid_columnconfigure(1, weight=1)
-        IconView(tune, kit, "settings", size=14, color="faint").grid(row=0, column=0, padx=(0, 7))
-        self._tune_text_var = tk.StringVar()
-        kit.label(tune, fg="faint", font=kit.fonts.caption, textvariable=self._tune_text_var).grid(row=0, column=1, sticky="w")
-        self._small(tune, "Change", None, self._open_tuning,
-                    tooltip="Compression level, CPU cores and block size").grid(row=0, column=2, sticky="e")
-        self._tune_note_lbl = kit.label(tune, fg="warning", font=kit.fonts.caption, textvariable=self.tune_note_var)
-        self._tune_note_lbl.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 3))
-        self._tune_note_lbl.grid_remove()
-        self._bind_dynamic_wrap(tune, [self._tune_note_lbl], padding=16, min_width=200)
-
-        def _tune_text(*_):
-            try:
-                cores = int(self.cpu_count_var.get())
-            except Exception:
-                cores = 0
-            blk = str(self.block_size_var.get() or "auto")
-            blk_txt = "64 KiB blocks" if blk in ("auto", "65536") else f"{blk} B blocks"
-            self._tune_text_var.set(f"Level {self.compression_level_var.get()}  ·  "
-                                    f"{'auto cores' if cores == 0 else f'{cores} cores'}  ·  {blk_txt}")
-        for var in (self.compression_level_var, self.cpu_count_var, self.block_size_var):
-            var.trace_add("write", _tune_text)
-        _tune_text()
 
         # The job card keeps its width when the window is resized (only the list grows),
         # like an inspector. Re-laying out the whole card on every step of a window drag
         # cost ~60 ms per step; the divider still sets its width, and that is remembered.
+        # The details pane is closed at first: a click on a job opens it, the header button,
+        # the View menu and its shortcut toggle it, and the list takes the width it frees.
         right = self._card_pane = kit.frame(pw, bg="inspector")
-        pw.add(right, minsize=340, stretch="never")
+        self._inspector_open = False
         right.grid_columnconfigure(1, weight=1)
         right.grid_rowconfigure(0, weight=1)
         kit.rule(right, bg_token="border_strong", horizontal=False).grid(row=0, column=0, sticky="ns")
@@ -5653,7 +4776,9 @@ class App:
         m.grid(row=1, column=1, sticky="ew", pady=(3, 0))
         tg = kit.label(hdr, bg=B, fg="faint", font=kit.fonts.small, textvariable=self.card_target_var)
         tg.grid(row=2, column=1, sticky="ew", pady=(2, 0))
-        self._bind_dynamic_wrap(hdr, [t, m, tg], padding=84, min_width=160)
+        self._bind_dynamic_wrap(hdr, [t, m, tg], padding=110, min_width=160)
+        self._small(hdr, "", "x", lambda: self._set_inspector(False), bg=B,
+                    tooltip=f"Hide the details  {SHORTCUT['details']}").grid(row=0, column=2, sticky="ne", padx=(8, 0))
 
         self._card_chips = Chips(body, kit, bg=B)
         self._card_chips.grid(row=1, column=0, sticky="ew", pady=(14, 0))
@@ -5689,16 +4814,40 @@ class App:
             Tile(tiles, kit, cap, var, bg=B).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
         prog.grid_remove()
 
-        # A short preview of the log (the Log view has all of it): four lines, small mono.
-        tail_box = RoundBox(body, kit, bg=B, pad=10,
-                            height=4 * kit.fonts.mono_small.metrics("linespace") + 2 * 10 + 2)
-        tail_box.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        # The job itself, whatever it is doing: status, source, changes, compression, space.
+        info = kit.frame(body, bg=B)
+        info.grid(row=4, column=0, sticky="ew", pady=(18, 0))
+        info.grid_columnconfigure(1, weight=1)
+        self._card_info_rows = {}
+        for r, key in enumerate(self._CARD_INFO_KEYS):
+            var = tk.StringVar(value="")
+            k = kit.label(info, bg=B, fg="faint", font=kit.fonts.small, text=key, anchor="nw")
+            v = kit.label(info, bg=B, fg="muted", font=kit.fonts.small, textvariable=var, anchor="nw",
+                          justify="left")
+            k.grid(row=r, column=0, sticky="nw", padx=(0, 16), pady=(0, 5))
+            v.grid(row=r, column=1, sticky="ew", pady=(0, 5))
+            self._card_info_rows[key] = (var, k, v)
+        self._bind_dynamic_wrap(info, [v for _var, _k, v in self._card_info_rows.values()],
+                                padding=110, min_width=160)
+
+        # The log, as much of it as fits (the Log view has all of it): it takes the height
+        # the pane has left, so a tall window shows more lines; the actions sit below it.
+        line = kit.fonts.mono_small.metrics("linespace")
+        tail_box = RoundBox(body, kit, bg=B, pad=10, height=4 * line + 2 * 10 + 2)
+        tail_box.grid(row=5, column=0, sticky="nsew", pady=(14, 0))
+        body.grid_rowconfigure(5, weight=1)
         self._log_tail = kit.text(tail_box.inner, bg="surface2", fg="log", font=kit.fonts.mono_small, height=4,
                                   state="disabled", padx=0, pady=0, wrap="none")
         tail_box.set_child(self._log_tail)
 
+        def _tail_resized(e, line=line):
+            box = getattr(self, "log_box", None)
+            if box is not None and e.height > 1:
+                box.set_mirror_visible(max(1, e.height // line))
+        self._log_tail.bind("<Configure>", _tail_resized, add="+")
+
         acts = kit.frame(body, bg=B)
-        acts.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        acts.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         acts.grid_columnconfigure(4, weight=1)
         for col, (text, icon, cmd, tip) in enumerate((
                 ("Full log", "terminal", lambda: self._show_view("log"), "The whole log  ⌘3"),
@@ -5726,8 +4875,13 @@ class App:
         try:
             if running:
                 self._progress_box.grid()
+                self.start_btn.grid_remove()
+                self.stop_btn.configure(state="normal")
+                self.stop_btn.grid()
             else:
                 self._progress_box.grid_remove()
+                self.stop_btn.grid_remove()
+                self.start_btn.grid()
         except Exception:
             pass
 
@@ -5740,6 +4894,8 @@ class App:
             self.start_btn.configure(variant="secondary" if empty else "primary")
             if not self._batch_running:
                 self.start_btn.configure(state="disabled" if empty else "normal")
+            if empty:
+                self._set_inspector(False)
         except Exception:
             pass
 
@@ -5752,15 +4908,79 @@ class App:
             self._card_empty.configure(text="Select a job to see its details." if self.queue else "")
             self._card_empty.grid(row=0, column=1, sticky="nsew")
 
+    # ── Details pane ─────────────────────────────────────────────────────────
+    def _on_queue_clicked(self):
+        """A click on a job shows it, and opens the details pane if it is closed."""
+        self._on_queue_select()
+        if self.queue and self._queue_sel_idx() is not None:
+            self._set_inspector(True)
+
+    def toggle_inspector(self):
+        self._set_inspector(not getattr(self, "_inspector_open", False))
+
+    def _set_inspector(self, open_: bool):
+        pw, card = getattr(self, "_paned_q", None), getattr(self, "_card_pane", None)
+        if pw is None or card is None or bool(open_) == getattr(self, "_inspector_open", False):
+            return
+        try:
+            if open_:
+                pw.add(card, minsize=340, stretch="never")
+                self._inspector_open = True
+                self._place_inspector()
+            else:
+                self._save_sashes()
+                pw.forget(card)
+                self._inspector_open = False
+        except tk.TclError:
+            return
+        try:
+            self._details_btn.configure(variant="secondary" if open_ else "ghost")
+            self._view_menu.entryconfigure(self._details_menu_index,
+                                           label="Hide Details" if open_ else "Show Details")
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _place_inspector(self, tries: int = 0):
+        """Give the opened pane its remembered width (first time: 560 px)."""
+        pw = self._paned_q
+        try:
+            self.root.update_idletasks()
+            W = pw.winfo_width()
+            if W < 626:
+                if tries < 20:                       # the window is not laid out yet
+                    self.root.after(100, lambda: self._place_inspector(tries + 1))
+                return
+            card_w = load_settings().get("job_card_width")
+            if not isinstance(card_w, int):
+                card_w = 560
+            card_w = max(340, min(card_w, W - 286))
+            pw.sash_place(0, W - card_w - int(pw.cget("sashwidth")), 1)
+        except (tk.TclError, ValueError):
+            pass
+
     def _toggle_command(self):
         if self._cmd_frame.winfo_ismapped():
             self._cmd_frame.grid_remove()
         else:
             self.update_command_preview()
-            self._cmd_frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+            self._cmd_frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
 
-    def _job_recipe(self, item) -> list[str]:
-        """The job as chips: source kind → changes → output."""
+    def _job_recipe(self, item, detail: bool = False) -> list[str]:
+        """The job as chips: source kind → changes → output. With *detail* (the details
+        pane) the output names its compression too: ".ffpfsc, level 7", ".pkg, fast"."""
+        parts = self._job_recipe_parts(item)
+        if detail and parts:
+            if parts[-1] == ".ffpfsc":
+                parts[-1] = f".ffpfsc, level {self._ffpfsc_level(item)}"
+            elif parts[-1] == ".pkg":
+                try:
+                    fast = int(getattr(item, "fpkg_level", 7) or 0) < 0
+                except (TypeError, ValueError):
+                    fast = False
+                parts[-1] = ".pkg, fast" if fast else ".pkg, normal"
+        return parts
+
+    def _job_recipe_parts(self, item) -> list[str]:
         op = getattr(item, "operation", "pack")
         kind = chain_source_kind(item)
         src = {"folder": "Folder", "archive": "Archive"}.get(kind, f".{kind}" if kind and kind != "file" else "File")
@@ -5891,54 +5111,96 @@ class App:
         self._space_busy = True
         threading.Thread(target=_work, daemon=True).start()
 
-    def _open_tuning(self):
-        """The compression controls, in a small window next to the queue."""
-        w = getattr(self, "_tuning_win", None)
-        if w is not None and w.winfo_exists():
-            w.lift()
-            w.focus_force()
-            return
-        w = self._tuning_win = EmbeddedDialog()
-        w.geometry("520x380")
-        w.title("Compression")
-        w.resizable(False, False)
-        w.configure(fg_color=ctk_pair("surface"))
-        try:
-            w.transient(self.root)
-        except Exception:
-            pass
-        acc, acc2 = ctk_pair("accent_fill"), ctk_pair("accent_hover")
-        txt, mut = ctk_pair("text"), ctk_pair("muted")
-        body = ctk.CTkFrame(w, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=22, pady=18)
-        body.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(body, text="Compression", text_color=txt, font=ctk.CTkFont(size=15, weight="bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w")
-        ctk.CTkLabel(body, text="Used by .ffpfsc and .ffpfs builds. A .pkg job carries its own settings.",
-                     text_color=mut, font=ctk.CTkFont(size=12)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 14))
+    # ── Menus ────────────────────────────────────────────────────────────────
+    def _build_menubar(self):
+        """File, Edit, View, Window and Help, with the same shortcuts as the buttons. On
+        macOS the application menu carries About, Settings… and Quit (Tk routes the last
+        two here); elsewhere Settings and Exit sit in File and About in Help. Entries that
+        would act behind an open panel do nothing until it is closed."""
+        root = self.root
+        guard = lambda fn: (lambda: None if self._panels.stack else fn())
+        mod_key = (lambda k: f"Command-{k}") if IS_MAC else (lambda k: f"Ctrl+{k}")
+        mb = tk.Menu(root)
+        if IS_MAC:
+            appm = tk.Menu(mb, name="apple", tearoff=0)
+            appm.add_command(label=f"About {APP_NAME}", command=guard(lambda: self._open_settings_page("about")))
+            appm.add_separator()
+            mb.add_cascade(menu=appm)
+            root.createcommand("tk::mac::ShowPreferences", guard(self.open_settings))
+            root.createcommand("tk::mac::Quit", self._on_close)
+        fm = tk.Menu(mb, tearoff=0)
+        fm.add_command(label="Add Job…", accelerator=ACCEL["add"], command=guard(self.open_job_dialog))
+        fm.add_command(label="Look Inside…", accelerator=ACCEL["open"], command=guard(self.open_pfs_browser))
+        fm.add_command(label="Organize…", command=guard(self.organize_folder_dialog))
+        fm.add_separator()
+        fm.add_command(label="Start Queue", accelerator=ACCEL["start"], command=guard(self.start))
+        fm.add_command(label="Stop Queue", accelerator=ACCEL["stop"], command=self._stop_if_running)
+        fm.add_separator()
+        fm.add_command(label="Clean Temp Folder", command=guard(self.clear_temp_files))
+        if not IS_MAC:
+            fm.add_separator()
+            fm.add_command(label="Settings…", accelerator=ACCEL["settings"], command=guard(self.open_settings))
+            fm.add_separator()
+            fm.add_command(label="Exit", command=self._on_close)
+        mb.add_cascade(label="File", menu=fm)
+        em = tk.Menu(mb, tearoff=0)
+        for label, key, ev in (("Cut", "X", "<<Cut>>"), ("Copy", "C", "<<Copy>>"), ("Paste", "V", "<<Paste>>")):
+            em.add_command(label=label, accelerator=mod_key(key), command=lambda e=ev: self._edit_event(e))
+        em.add_separator()
+        em.add_command(label="Select All", accelerator=mod_key("A"), command=lambda: self._edit_event("<<SelectAll>>"))
+        mb.add_cascade(label="Edit", menu=em)
+        vm = self._view_menu = tk.Menu(mb, tearoff=0)
+        for label, key in (("Queue", "queue"), ("History", "history"), ("Log", "log")):
+            vm.add_command(label=label, accelerator=ACCEL[key], command=guard(lambda k=key: self._show_view(k)))
+        vm.add_separator()
+        vm.add_command(label="Show Details", accelerator=ACCEL["details"], command=guard(self.toggle_inspector))
+        self._details_menu_index = vm.index("end")
+        vm.add_separator()
+        self._appearance_var = tk.StringVar(value=self._theme)
+        am = tk.Menu(vm, tearoff=0)
+        for label, mode in (("Dark", "dark"), ("Light", "light")):
+            am.add_radiobutton(label=label, value=mode, variable=self._appearance_var,
+                               command=lambda m=mode: self._set_theme(m))
+        vm.add_cascade(label="Appearance", menu=am)
+        mb.add_cascade(label="View", menu=vm)
+        if IS_MAC:
+            mb.add_cascade(label="Window", menu=tk.Menu(mb, name="window", tearoff=0))
+        hm = tk.Menu(mb, name="help", tearoff=0)
+        hm.add_command(label=f"{APP_NAME} on GitHub", command=lambda: webbrowser.open(REPO_URL))
+        hm.add_separator()
+        hm.add_command(label="Open Log Folder", command=self._open_log_folder)
+        hm.add_command(label="Raw Backend Log", command=self.open_raw_log)
+        hm.add_command(label="Export Diagnostics…", command=self.export_diagnostics)
+        if not IS_MAC:
+            hm.add_separator()
+            hm.add_command(label=f"About {APP_NAME}", command=guard(lambda: self._open_settings_page("about")))
+        mb.add_cascade(label="Help", menu=hm)
+        root.configure(menu=mb)
+        self._menubar = mb
 
-        def slider_row(r, label, var, lo, hi, fmt):
-            ctk.CTkLabel(body, text=label, text_color=txt, font=ctk.CTkFont(size=13)).grid(row=r, column=0, sticky="w", pady=6)
-            ctk.CTkSlider(body, from_=lo, to=hi, number_of_steps=hi - lo, variable=var, width=220,
-                          fg_color=ctk_pair("track"), progress_color=acc, button_color=acc,
-                          button_hover_color=acc2).grid(row=r, column=1, sticky="ew", padx=12)
-            val = ctk.CTkLabel(body, text=fmt(var.get()), text_color=txt, width=44, anchor="e",
-                               font=ctk.CTkFont(size=13, weight="bold"))
-            val.grid(row=r, column=2, sticky="e")
-            var.trace_add("write", lambda *_: val.winfo_exists() and val.configure(text=fmt(var.get())))
-        slider_row(2, "Level", self.compression_level_var, 0, 9, str)
-        slider_row(3, "CPU cores", self.cpu_count_var, 0, 16, lambda v: "auto" if int(v) == 0 else str(int(v)))
-        ctk.CTkLabel(body, text="Block size", text_color=txt, font=ctk.CTkFont(size=13)).grid(row=4, column=0, sticky="w", pady=6)
-        ctk.CTkOptionMenu(body, values=["auto", "65536"], variable=self.block_size_var, width=120,
-                          command=lambda v: save_settings({"block_size": v})).grid(row=4, column=1, sticky="w", padx=12)
-        ctk.CTkLabel(body, text="The PS5 needs 64 KiB blocks, and auto picks them. With cores on auto the "
-                                "app decides by game size and uses fewer when the output drive is a slow HDD.",
-                     text_color=mut, font=ctk.CTkFont(size=12), wraplength=380, justify="left").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(12, 14))
-        ctk.CTkButton(body, text="Done", command=w.destroy, fg_color=acc, hover_color=acc2, text_color="#ffffff",
-                      width=90).grid(row=6, column=2, sticky="e")
-        w.update_idletasks()
-        w.geometry(f"520x{w.winfo_reqheight()}")
+    def _open_settings_page(self, key):
+        self.open_settings()
+        try:
+            self._settings_view.show(key)
+        except (AttributeError, StopIteration, tk.TclError):
+            pass
+
+    def _edit_event(self, event_name):
+        """Cut, Copy, Paste and Select All act on the text field that has the focus."""
+        w = self.root.focus_get()
+        if w is not None:
+            try:
+                w.event_generate(event_name)
+            except tk.TclError:
+                pass
+
+    def _stop_if_running(self):
+        if self._batch_running:
+            self.cancel()
+
+    def _open_log_folder(self):
+        ensure_app_dir()
+        open_path(APP_DIR)
 
     def _init_state_vars(self):
         """The Tk variables behind the settings and the job defaults (paths, formats,
@@ -6091,6 +5353,10 @@ class App:
         self._theme = "light" if self._theme == "dark" else "dark"
         ctk.set_appearance_mode(self._theme)
         save_settings({"appearance_mode": self._theme})
+        try:
+            self._appearance_var.set(self._theme)
+        except AttributeError:
+            pass
         for w in [self.root] + [c for c in self.root.winfo_children() if isinstance(c, tk.Toplevel)]:
             set_window_appearance(w, self._theme)
         # CTk widgets (the dialogs) follow their (light, dark) tuples on their own; the
@@ -6100,13 +5366,7 @@ class App:
         except Exception:
             pass
 
-    def _open_patch_dialog(self):
-        # No busy-guard: adding a job to the queue while another runs is fine (it just
-        # waits its turn) — same as Pack/Convert/Sign.
-        PatchDialog(self)
 
-    def open_pack_dialog(self):
-        PackDialog(self)
 
     def organize_folder_dialog(self):
         """Walk a folder tree, batch-enqueue every .ffpfsc/.ffpfs/.pkg as a copy job.
@@ -6189,8 +5449,7 @@ class App:
     def open_settings(self):
         self._show_view("settings")
 
-    def open_converter(self):
-        ConverterDialog(self)
+
 
     def _backend_cmd(self, *args) -> list:
         """Build a backend invocation for arbitrary args (list/extract image, …),
@@ -6208,6 +5467,32 @@ class App:
         """The one door for every job: source → change the content → output (JobDialog)."""
         JobDialog(self, init_src=init_src)
 
+    def _ffpfsc_level(self, item) -> int:
+        """The zlib level of a .ffpfsc build: the job's own, else the default in Settings."""
+        for value in (getattr(item, "compression_level", None), self.compression_level_var.get()):
+            try:
+                if value is not None:
+                    return max(1, min(9, int(value)))
+            except (TypeError, ValueError):
+                continue
+        return 7
+
+    def _backport_args(self, item) -> list[str]:
+        """--backport-target, --backport-libs and --fw-libs-root for a job that backports.
+        The firmware libraries folder is global (Settings): with it the backend reads the
+        SDK values of non-public targets and checks the game's functions before building."""
+        bt = getattr(item, "backport_target", None)
+        if not is_backport_target(bt):
+            return []
+        args = ["--backport-target", bt]
+        blr = getattr(item, "backport_libs_root", None)
+        if blr:
+            args += ["--backport-libs", str(blr)]
+        fw = (self.fw_libs_var.get() or "").strip()
+        if fw:
+            args += ["--fw-libs-root", fw]
+        return args
+
     def prepare_backport_libs(self, target: str) -> None:
         """Prepare the patched-libraries folder for *target* from BestPig BackPork.
         Runs in a background thread; per-library progress goes to the app log. The user
@@ -6216,8 +5501,12 @@ class App:
         fw = (self.fw_libs_var.get() or "").strip()
         out = (self.backport_libs_var.get() or "").strip()
         if not fw or not Path(fw).is_dir():
-            self.log("ERROR", f"Prepare {target}: set the ORIGINAL firmware libraries folder in Settings first "
-                              f"(“Backport — original firmware libraries”).")
+            self.log("ERROR", f"Prepare {target}: set the firmware libraries folder in Settings first "
+                              f"(“Backport — firmware libraries”), with your 10.01 libraries in a 10.01 subfolder.")
+            return
+        if _backport_module().firmware_folder(Path(fw), "10.01") is None:
+            self.log("ERROR", f"Prepare {target}: no 10.01 folder in {fw}. The BackPork patches apply to "
+                              f"10.01 libraries only.")
             return
         if not out:
             self.log("ERROR", f"Prepare {target}: set the PATCHED libraries folder in Settings first "
@@ -6293,36 +5582,6 @@ class App:
         self.update_queue_box(select_item=item)
         self.log("OK", f"fPKG extract queued: {pkg.name} -> {out}.  Press ▶ START to run.")
 
-    def fpkg_build_dialog(self, source: Path | None = None):
-        """Open the Pack dialog with the .pkg (fPKG) format pre-selected — the one door
-        for building an installable package from any source. Press START to run."""
-        PackDialog(self, source=source, fmt="pkg")
-
-    def _queue_conversion(self, path: Path, action: str):
-        """Add a converter job to the queue (the user then presses START — it reuses the
-        normal unpack pipeline). action: 'decompress' (.ffpfsc → inner .ffpfs, one level),
-        'folder' (full unpack to a folder), 'batch' (a folder of images → unpack each)."""
-        if not (self.output_var.get() or "").strip():
-            base = path.parent if path.is_file() else path
-            self.output_var.set(str(base))
-        if action == "batch":
-            self.source_var.set(str(path))
-            self.unpack_mode_var.set(True)        # the folder-scan unpack path reads this
-            self.add_source_to_queue()
-            return
-        if action == "fpkg":
-            # One-click image → installable .pkg: the Pack dialog with .pkg pre-selected
-            # and the image as source (identity is read from its param.json at build time).
-            self.fpkg_build_dialog(source=path)
-            return
-        item = GameItem.from_pfs_image(path)
-        item.unwrap = (action != "decompress")    # decompress = stop at the inner .ffpfs
-        self.queue.append(item)
-        self.update_queue_box(select_item=item)
-        what = "decompress → .ffpfs" if action == "decompress" else "unpack → folder"
-        self.log("OK", f"Conversion queued ({what}): {path.name}.  Press ▶ START to run.")
-        self.status_update("Ready", f"Conversion queued: {path.name} — press START.",
-                            "Ready", 0, 0, "00:00", "—", "—")
 
     # ── Drag & drop ───────────────────────────────────────────────────────────
     def _on_drop(self, event):
@@ -6565,13 +5824,14 @@ class App:
         return out
 
     def _copy_item_payload(self, target: GameItem, source: GameItem) -> None:
-        # An fPKG job stays an fPKG job whatever the archive turned out to hold (a game
-        # folder, a disk image, a .ffpfsc — the backend unwraps images itself). Its
-        # fpkg_* parameters live on the target and are untouched here.
-        keep_fpkg = getattr(target, "operation", "pack") == "fpkg-build"
+        # An fPKG job stays an fPKG job, and a job-editor chain stays a chain (its output
+        # format, sign, patch and backport), whatever the archive turned out to hold: a
+        # game folder, a disk image, a .ffpfsc; the backend unwraps images itself. Those
+        # fields live on the target and are untouched here.
+        keep_op = getattr(target, "operation", "pack") in ("fpkg-build", "chain")
         target.path         = source.path
         target.archive_path = source.archive_path
-        target.operation    = "fpkg-build" if keep_fpkg else source.operation
+        target.operation    = target.operation if keep_op else source.operation
         target.name         = source.name
         target.title_id     = source.title_id
         target.size         = source.size
@@ -7851,47 +7111,14 @@ class App:
             self.log("INFO", "This job is already done — remove and re-add to run it again with new settings.")
             return "break"
 
-        op = getattr(item, "operation", "pack")
+        # One editor for every kind of job: it shows the job as source → changes → output,
+        # and saving replaces the job at its place in the queue.
         try:
-            if op == "chain":
-                JobDialog(self, item=item)
-            elif op in ("pack", "fpkg-build"):
-                PackDialog(self, item=item)     # fPKG is the Pack dialog's third format
-            elif op == "patch":
-                PatchDialog(self, item=item)
-            elif op in ("unpack", "fake-sign", "fpkg-extract"):
-                JobEditMiniDialog(self, item)
-            else:
-                self.log("WARN", f"No editor for job type '{op}'.")
+            JobDialog(self, item=item)
         except Exception as e:
-            self.log("ERROR", f"Could not open editor: {e}")
+            self.log("ERROR", f"Could not open the editor: {e}")
         return "break"
 
-    def _build_pack_item_for(self, src: Path, parent=None):
-        """Build the right GameItem flavour for a pack source path so the Pack edit
-        dialog can REPLACE an item at the same queue index without going through
-        add_source_to_queue (which only appends). Returns None and shows an error
-        dialog (parented to *parent* if provided) when *src* is not a valid pack source."""
-        try:
-            if src.is_file() and src.suffix.lower() == ".ffpfs":
-                return GameItem.from_exfat(src)
-            if src.is_file() and src.suffix.lower() in DISK_IMAGE_SUFFIXES:
-                return GameItem.from_exfat(src)
-            if src.is_file() and src.suffix.lower() in (".zip", ".rar", ".7z"):
-                return GameItem.from_archive(src)
-            if src.is_dir():
-                # GameItem(path) is the plain folder constructor — it scans size/files
-                # synchronously, which is fine for an explicit edit action.
-                return GameItem(src)
-        except Exception as e:
-            messagebox.showerror("Build failed", f"Could not classify the source:\n{e}",
-                                 parent=parent or self.root)
-            return None
-        messagebox.showerror("Unsupported source",
-                             f"Not a valid pack source:\n{src}\n\nUse a folder, archive, "
-                             ".exfat/.ffpkg, or .ffpfs.",
-                             parent=parent or self.root)
-        return None
 
     # ── fPKG jobs — the Pack dialog's '.pkg' format ─────────────────────────────
     # A queued fPKG build is a GameItem with operation "fpkg-build" plus fpkg_* fields.
@@ -7925,6 +7152,25 @@ class App:
             "backport_libs":    getattr(item, "backport_libs_root", None) or "",
         }
 
+    def _as_chain_job(self, extra, tpl) -> None:
+        """Give another game from a multi-game archive the job of the first one: output
+        format, folder, sign and backport. A patch belongs to one game and is not copied;
+        for a .pkg only the compression settings are, the identity comes from each game."""
+        extra.operation = "chain"
+        extra.chain_to = getattr(tpl, "chain_to", None) or "ffpfsc"
+        extra.chain_sign = bool(getattr(tpl, "chain_sign", False))
+        extra.patch_source = None
+        extra.backport_target = getattr(tpl, "backport_target", None)
+        extra.backport_libs_root = getattr(tpl, "backport_libs_root", None)
+        extra.copy_delete_source = bool(getattr(tpl, "copy_delete_source", True))
+        extra.output_path = getattr(tpl, "output_path", None)
+        extra.output_compressed = extra.chain_to != "ffpfs"
+        extra.compression_level = getattr(tpl, "compression_level", None)
+        if getattr(tpl, "auto_organize", None) is not None:
+            extra.auto_organize = tpl.auto_organize
+        if extra.chain_to == "pkg":
+            self._apply_fpkg_params(extra, self._fpkg_compression_of(tpl))
+
     def _fpkg_compression_of(self, item) -> dict:
         """Only the build-option part of an fPKG job's parameters (inner / backend / level /
         dll / retail switches) — what sibling jobs made from the same source share. Identity
@@ -7951,7 +7197,7 @@ class App:
         item.fpkg_regen_playgo     = bool(params.get("regen_playgo", False))
         item.fpkg_fake_sign        = bool(params.get("fake_sign", True))
         bt = params.get("backport_target")
-        item.backport_target = bt if bt in ("7.61", "6.02", "10.xx") else None
+        item.backport_target = bt if is_backport_target(bt) else None
         blr = str(params.get("backport_libs", "") or "").strip()
         item.backport_libs_root = blr or None
         dll = str(params.get("dll", "") or "").strip()
@@ -8123,6 +7369,8 @@ class App:
         except Exception as e:
             self.log("WARN", f"Auto-organize: could not read the game's metadata from {p.name}: {e}")
             ident = None
+        if ident and "fw" not in ident:
+            ident["fw"] = self._source_fw(p)
         if ident:
             # Fill gaps from the source name (a '[PPSA…]' / version in a release name).
             if not ident.get("title_id"):
@@ -8227,6 +7475,74 @@ class App:
             return None
         return {"title": title, "title_id": tid.upper(), "version": ver}
 
+    def _source_fw(self, p: Path) -> str:
+        """The firmware the game in *p* needs, from its eboot.bin's SDK version: read in
+        place for a folder, through the backend for a .ffpfs/.ffpfsc/.pkg (headers only).
+        '' when unreadable (an encrypted eboot, a disk image)."""
+        try:
+            if p.is_dir():
+                bp = _backport_module()
+                words = bp.sdk_words_of_file(p / "eboot.bin")
+                return bp.sdk_firmware(words[0]) if words else ""
+            if p.suffix.lower() in (".ffpfs", ".ffpfsc", ".pkg"):
+                r = subprocess.run(self._backend_cmd("--sdk-of", str(p)), capture_output=True, text=True,
+                                   errors="replace", timeout=120)
+                for line in (r.stdout or "").splitlines():
+                    if line.startswith("SDK_JSON: "):
+                        return str(json.loads(line[len("SDK_JSON: "):]).get("fw") or "")
+        except Exception:
+            pass
+        return ""
+
+    def _patch_fw(self, patch: Path) -> str | None:
+        """The firmware a patch's own eboot.bin needs. None when the patch carries no
+        eboot.bin (the game keeps its own), '' when it has one this cannot read."""
+        bp = _backport_module()
+        try:
+            if patch.is_dir():
+                hits = sorted(patch.rglob("eboot.bin"), key=lambda q: len(q.parts))
+                if not hits:
+                    return None
+                words = bp.sdk_words_of_file(hits[0])
+                return bp.sdk_firmware(words[0]) if words else ""
+            if patch.suffix.lower() == ".zip":
+                with zipfile.ZipFile(patch) as z:
+                    names = sorted((n for n in z.namelist() if n.rsplit("/", 1)[-1] == "eboot.bin"),
+                                   key=lambda n: n.count("/"))
+                    if not names:
+                        return None
+                    info = z.getinfo(names[0])
+                    with z.open(info) as f:
+                        def read(offset, n, f=f):
+                            f.seek(offset)
+                            return f.read(n)
+                        words = bp.sdk_words_from_reader(read, info.file_size)
+                    return bp.sdk_firmware(words[0]) if words else ""
+        except Exception:
+            return ""
+        return ""                              # .rar / .7z: not read before the build
+
+    def _job_fw(self, item, source_fw: str) -> str:
+        """The firmware the job's OUTPUT needs: the source's, unless an integrated patch
+        brings its own eboot.bin, lowered to the target by a backport. '' (no tag) when
+        it cannot be known — never a guess."""
+        bp = _backport_module()
+        fw = source_fw or ""
+        patch = getattr(item, "patch_source", None)
+        if patch:
+            pfw = self._patch_fw(Path(str(patch)))
+            if pfw is not None:
+                fw = pfw
+        bt = getattr(item, "backport_target", None)
+        if fw and is_backport_target(bt):
+            target = bp.sdk_firmware(bp.SDK_TARGETS["10.xx"][0]) if bt == "10.xx" else bt
+            try:
+                if bp._fw_key(target) < bp._fw_key(fw):
+                    fw = target
+            except ValueError:
+                pass
+        return fw
+
     def _organized_layout(self, item, out: Path, ext: str):
         """(base_dir, file_name) for the auto-organize layout under *out*, or (None, None)
         when no identity is readable — the caller then keeps today's naming (logged once)."""
@@ -8240,6 +7556,7 @@ class App:
                 self.log("WARN", f"Auto-organize: no param.json readable for {getattr(item, 'display_name', None) or item.name} "
                                  f"— naming from the source name instead.")
             return None, None
+        ident = dict(ident, fw=self._job_fw(item, ident.get("fw", "")))
         folder, fname = organized_names(ident, ext, item)
         return out / folder, fname
 
@@ -8598,24 +7915,6 @@ class App:
         if getattr(item, "operation", "pack") == "chain":
             mode = chain_summary(item)
         self.title_var.set(f"Title ID: {item.title_id}  |  Mode: {mode}")
-        # Tell the user which tuning controls the selected job actually honours.
-        try:
-            _op = getattr(item, "operation", "pack")
-            if _op == "fpkg-build":
-                _lvl = getattr(item, "fpkg_level", None)
-                _spd = "fast" if (_lvl is not None and int(_lvl) < 0) else "normal"
-                self.tune_note_var.set(
-                    f"fPKG build selected: none of these controls apply to it. The job carries its own Kraken speed "
-                    f"({_spd} — edit via double-click); the outer-PFS pass runs on one worker and the format fixes its "
-                    f"own block sizes.")
-                self._tune_note_lbl.grid()
-            elif _op == "fpkg-extract":
-                self.tune_note_var.set("fPKG extract selected: none of these controls apply to it.")
-                self._tune_note_lbl.grid()
-            else:
-                self.tune_note_var.set(""); self._tune_note_lbl.grid_remove()
-        except Exception:
-            pass
         self.source_detail_var.set(f"Source: {item.path}")
         if shows_extracted_size(item):
             self.orig_var.set(f"Original Size: ~{format_size(item.extracted_size)} unpacked  "
@@ -8649,9 +7948,80 @@ class App:
             self.card_meta_var.set("   ·   ".join(meta))
             out = self._job_output_dir(item)
             self.card_target_var.set(f"→  {out}" if out else "→  no output folder set")
-            self._card_chips.set_parts(self._job_recipe(item))
+            self._card_chips.set_parts(self._job_recipe(item, detail=True))
+            self._fill_card_info(item)
         except Exception:
             pass
+
+    _CARD_INFO_KEYS = ("Status", "Source", "Changes", "Compression", "Space")
+
+    def _fill_card_info(self, item):
+        rows = getattr(self, "_card_info_rows", None)
+        if not rows or item is None:
+            return
+        info = self._card_info_text(item)
+        for key, (var, k, v) in rows.items():
+            text = info.get(key, "")
+            if var.get() != text:
+                var.set(text)
+            if text and not v.winfo_manager():
+                k.grid(); v.grid()
+            elif not text and v.winfo_manager():
+                k.grid_remove(); v.grid_remove()
+
+    def _card_info_text(self, item) -> dict:
+        """The details pane's facts about *item*, one short text per row."""
+        info = {}
+        status = str(getattr(item, "status", "") or "Queued")
+        if getattr(self, "_batch_running", False) and item is getattr(self, "_active_item", None):
+            status = "Running"
+        status = {"Pending Extract": "Queued; the archive is extracted when its turn comes",
+                  "Pending": "Queued"}.get(status, status)
+        note = str(getattr(item, "status_note", "") or "").strip()
+        if note and status in ("Failed", "Skipped", "Cancelled"):
+            status = f"{status}: {note}"
+        info["Status"] = status
+        src = getattr(item, "archive_path", None) or getattr(item, "path", None)
+        if src:
+            info["Source"] = str(src)
+        changes = []
+        patch = getattr(item, "patch_source", None)
+        if patch:
+            changes.append(f"Integrate the patch from {patch}")
+        bt = getattr(item, "backport_target", None)
+        if bt:
+            libs = getattr(item, "backport_libs_root", None)
+            fw = (self.fw_libs_var.get() or "").strip()
+            line = f"Backport to {bt}"
+            line += f"; patched libraries from {libs}" if libs else "; no patched libraries set"
+            line += "; the functions are checked against your firmware folder" if fw else \
+                    "; no function check (no firmware folder in Settings)"
+            changes.append(line)
+        out = self._job_recipe_parts(item)[-1] if self._job_recipe_parts(item) else ""
+        if getattr(item, "chain_sign", False) or getattr(item, "operation", "") == "fake-sign":
+            changes.append("Fake-sign the executables")
+        elif out == ".pkg":
+            changes.append("Executables signed by the package builder")
+        info["Changes"] = "\n".join(changes) if changes else "None"
+        if out == ".ffpfsc":
+            try:
+                cores = int(self.cpu_count_var.get())
+            except (TypeError, ValueError):
+                cores = 0
+            info["Compression"] = (f".ffpfsc, zlib level {self._ffpfsc_level(item)}, 64 KiB blocks, "
+                                   f"{'cores by game size' if cores == 0 else f'{cores} cores'}")
+        elif out == ".pkg":
+            p = self._fpkg_params_of(item)
+            speed = "fast preset" if int(p.get("level", 7)) < 0 else "level 7"
+            info["Compression"] = (f".pkg, Kraken {speed}, codec layer {p.get('inner', 'kraken')}; "
+                                   f"retail fixes {'on' if p.get('retail_normalize', True) else 'off'}, "
+                                   f"HDR {p.get('hdr_flag', 'auto')}")
+        elif out == ".ffpfs":
+            info["Compression"] = ".ffpfs, uncompressed"
+        space = (self.temp_space_var.get() or "").strip()
+        if space and not space.endswith("—"):
+            info["Space"] = space.replace("  |  ", " · ")
+        return info
 
     def _refresh_space_for_item(self, item=None):
         """Recalculate free-space vs what this game needs and update the stats label."""
@@ -8673,9 +8043,8 @@ class App:
             return
         try:
             tp = self.temp_var.get().strip()
-            op = self.output_var.get().strip()
             temp_dir = Path(tp) if tp else None
-            out_dir  = Path(op) if op else None
+            out_dir  = self._job_output_dir(item)
             if temp_dir is None:
                 self.temp_space_var.set(f"Peak Needed: ~{format_size(int(_build_size_of(item) * _peak_factor_for(item)))}")
                 return
@@ -8867,12 +8236,7 @@ class App:
             _ps = getattr(item, "patch_source", None)
             if _ps:
                 cmd += ["--patch", str(_ps)]
-            _bt = getattr(item, "backport_target", None)
-            if _bt in ("7.61", "6.02", "10.xx"):
-                cmd += ["--backport-target", _bt]
-                _blr = getattr(item, "backport_libs_root", None)
-                if _blr:
-                    cmd += ["--backport-libs", str(_blr)]
+            cmd += self._backport_args(item)
             if getattr(item, "chain_sign", False):
                 cmd.append("--sign")
             if getattr(item, "_build_temp", None) is None:
@@ -8885,7 +8249,7 @@ class App:
             if tstr:
                 cmd += ["--temp-dir", tstr]
             if to in ("ffpfs", "ffpfsc"):
-                _cl = self.compression_level_var.get()
+                _cl = self._ffpfsc_level(item)
                 if _cl != 7:
                     cmd += ["--compression-level", str(_cl)]
                 _cpu = getattr(item, "_cpu_retry_override", None)
@@ -9025,12 +8389,7 @@ class App:
             # Backport: --backport-target lowers eboot/prx/sprx SDK words to the
             # target's public values BEFORE the C# tool spiegels+signs+packs. Runs
             # in-place on a folder source, same as --fake-sign-first.
-            _bt = getattr(item, "backport_target", None)
-            if _bt in ("7.61", "6.02", "10.xx"):
-                cmd += ["--backport-target", _bt]
-                _blr = getattr(item, "backport_libs_root", None)
-                if _blr:
-                    cmd += ["--backport-libs", str(_blr)]
+            cmd += self._backport_args(item)
             # Identity fields are FALLBACKS: the backend reads sce_sys/param.json of the
             # resolved source first (folder, unwrapped image, extracted archive alike) and
             # only uses these for what it lacks. Empty fields are simply not passed.
@@ -9087,7 +8446,7 @@ class App:
             tstr = str(Path(bt)) if bt else str(temp)
             if tstr:
                 cmd += ["--temp-dir", tstr]
-            _cl = self.compression_level_var.get()
+            _cl = self._ffpfsc_level(item)
             if _cl != 7:
                 cmd += ["--compression-level", str(_cl)]
             _cpu = getattr(item, "_cpu_retry_override", None)
@@ -9141,7 +8500,7 @@ class App:
         if self.verify_output_var.get():
             cmd.append("--verify")
         # MkPFS tuning
-        comp_level = self.compression_level_var.get()
+        comp_level = self._ffpfsc_level(item)
         if comp_level != 7:  # only pass if non-default
             cmd += ["--compression-level", str(comp_level)]
         # An OOM auto-retry pins an explicit (lower) core count on the item — honour it
@@ -9208,14 +8567,10 @@ class App:
         # Backport for a pack (mkpfs) job: same semantics as for fpkg — lowers
         # SDK words in place on the folder source before the pack, and pipes
         # the user's fakelib folder into sce_sys/../fakelib/.
-        _bt_pack = getattr(item, "backport_target", None)
-        if (_bt_pack in ("7.61", "6.02", "10.xx") and not is_patch_job and not _resume_ok
+        if (not is_patch_job and not _resume_ok
                 and getattr(item, "operation", "pack") == "pack"
                 and getattr(item, "path", None) and Path(item.path).is_dir()):
-            cmd += ["--backport-target", _bt_pack]
-            _blr = getattr(item, "backport_libs_root", None)
-            if _blr:
-                cmd += ["--backport-libs", str(_blr)]
+            cmd += self._backport_args(item)
         cmd.append("--overwrite")
         return cmd, backend, out if out.suffix.lower() not in (".ffpfsc", ".ffpfs") else out.parent, temp
 
@@ -9898,12 +9253,14 @@ class App:
                 return True
         return False
 
-    def _retire_failed(self, item, status: str = "Failed") -> None:
+    def _retire_failed(self, item, status: str = "Failed", reason: str = "") -> None:
         """Keep a failed/skipped item in the queue (marked, moved to the END) instead of
         discarding it — only SUCCESSFUL items leave the queue. Works whether the item is
-        still in the queue (move it) or was already popped (re-add it)."""
+        still in the queue (move it) or was already popped (re-add it). *reason* is shown
+        in the details pane."""
         try:
             item.status = status
+            item.status_note = " ".join(str(reason or "").split())[:300]
             if item in self.queue:
                 self.queue.remove(item)
             self.queue.append(item)
@@ -10013,6 +9370,7 @@ class App:
             self._update_batch_counter()
             return
         item.status = "Running"
+        item.status_note = ""
         self.update_queue_box()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -10221,6 +9579,7 @@ class App:
         self._last_cmd_str = " ".join(cmd)
         self.cancel_requested = False
         item.status = "Running"
+        item.status_note = ""
         self.update_queue_box()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -10238,6 +9597,7 @@ class App:
         # worker's still-queued progress updates (the "Cancel does nothing" symptom).
         try:
             self.cancel_btn.configure(state="disabled")
+            self.stop_btn.configure(state="disabled")
             self.big_status_var.set("Cancelling…")
             self.big_detail_var.set("Stopping the current job and reclaiming temp space…")
             self.footer_var.set("● Cancelling…")
@@ -10534,6 +9894,12 @@ class App:
         try:
             self._tick_space_status()
             self._sync_run_ui()
+            self._card_tick = getattr(self, "_card_tick", 0) + 1
+            if self._card_tick >= 5 and getattr(self, "_inspector_open", False):
+                self._card_tick = 0
+                item = getattr(self, "_details_item", None)
+                if item is not None and (item in self.queue or item is getattr(self, "_active_item", None)):
+                    self._fill_card_info(item)
         except Exception:
             pass
         try:
@@ -10832,7 +10198,10 @@ class App:
                     item, extra_items = payload
                 else:
                     item, extra_items = payload, []
-                if extra_items and getattr(item, "operation", "pack") == "fpkg-build":
+                if extra_items and getattr(item, "operation", "pack") == "chain":
+                    for extra in extra_items:
+                        self._as_chain_job(extra, item)
+                elif extra_items and getattr(item, "operation", "pack") == "fpkg-build":
                     # A multi-game archive queued as an fPKG job: every extra game becomes an
                     # fPKG job with the same COMPRESSION settings only — identity is per game
                     # and comes from each game's param.json at build time. Main thread here.
@@ -10993,7 +10362,7 @@ class App:
                     self._cleanup_inner_image(completed_item)   # terminal failure / gave up — no resume
                     # Keep the failed item in the queue (marked Failed, moved to the end) —
                     # only successful items disappear.
-                    self._retire_failed(completed_item, "Failed")
+                    self._retire_failed(completed_item, "Failed", msg)
                 self.update_queue_box()
                 # Batch resilience: one failure must not abort the rest of the queue.
                 if self._batch_running and self._has_pending():

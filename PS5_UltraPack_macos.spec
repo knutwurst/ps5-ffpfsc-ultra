@@ -27,6 +27,7 @@ _BACKEND_SKIP_SUFFIXES = (".pyc", ".pyo", ".md")
 # Files every bundle must contain; a missing one is a broken build, so fail early.
 _BACKEND_REQUIRED = [
     "cli.py", "fpkg.py", "copy_job.py", "fake_sign.py", "make_fself.py",
+    "backport.py", "self_file.py", "backport_libs.py", "bps_patch.py",
     _os.path.join("mkpfs", "cli.py"), _os.path.join("mkpfs", "pfs.py"),
     _os.path.join("unrar", "__init__.py"), _os.path.join("unrar", "rarfile.py"),
     _os.path.join("native", "ffpfsc-pkg-tool"),

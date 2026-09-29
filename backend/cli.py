@@ -216,6 +216,47 @@ def _open_inner_pfs(image_path, pfs, consts):
         raise
 
 
+def required_firmware(src) -> dict:
+    """{'fw': '10.00', 'ps5': .., 'ps4': ..} for the game's eboot.bin in *src*: a game
+    folder, a .ffpfs/.ffpfsc (only the headers and the param struct are read, through the
+    image) or a .pkg (the tool pulls eboot.bin out of it). {} when unreadable."""
+    import backport as _bp
+    src = Path(src)
+    words = None
+    suf = src.suffix.lower()
+    if src.is_dir():
+        words = _bp.sdk_words_of_file(src / "eboot.bin")
+    elif suf in (".ffpfs", ".ffpfsc"):
+        pfs, consts = _import_mkpfs()
+        with _open_inner_pfs(src, pfs, consts) as fh:
+            errors: list[str] = []
+            header = pfs.parse_image_header(fh)
+            inodes = pfs.parse_image_inodes(fh, header)
+            uroot, *_rest = pfs.parse_superroot_and_indexes(fh, header, inodes, errors)
+            file_inodes, _dirs, _de = pfs.build_tree_from_uroot(fh, header, inodes, uroot, errors)
+            ino = next((i for rel, i in file_inodes.items() if rel.strip("/") == "eboot.bin"), None)
+            if ino is not None:
+                inode = inodes[ino]
+                size = int(inode.logical_size)
+                if getattr(inode, "is_compressed", False) or inode.db_sig or inode.ib_sig:
+                    data = b"".join(pfs.iter_inode_logical_blocks(fh, header, inode))
+                    read = lambda off, n: data[off:off + n]
+                else:
+                    base = inode.db[0] * header.block_size
+                    read = lambda off, n: pfs.read_image_bytes(fh, header, base + off, max(0, min(n, size - off)))
+                words = _bp.sdk_words_from_reader(read, size)
+    elif suf == ".pkg":
+        import fpkg as _fpkg
+        with tempfile.TemporaryDirectory(prefix="sdk-of-") as td:
+            members = Path(td) / "members.txt"
+            members.write_text("eboot.bin\n", encoding="utf-8")
+            _fpkg.extract_members(src, Path(td) / "out", members, on_line=lambda _l: None)
+            words = _bp.sdk_words_of_file(Path(td) / "out" / "eboot.bin")
+    if not words:
+        return {}
+    return {"fw": _bp.sdk_firmware(words[0]), "ps5": words[0], "ps4": words[1]}
+
+
 def list_pfs_image(image_path):
     """Return the directory tree of a .ffpfs/.ffpfsc as a dict (no full decompression)."""
     pfs, consts = _import_mkpfs()
@@ -250,6 +291,23 @@ def list_pfs_image(image_path):
 PARAM_HDR_BIT = 0x20000000
 
 from backport import SDK_TARGETS as _BACKPORT_TARGETS  # UI-visible target labels (relative to backend/)
+
+
+def _backport_target_arg(value: str) -> str:
+    """--backport-target: a public target (7.61, 6.02, 10.xx) or a firmware whose
+    original libraries sit in --fw-libs-root (9.60, 11.00, ...)."""
+    v = (value or "").strip()
+    if v in _BACKPORT_TARGETS or re.fullmatch(r"\d{1,2}\.\d{2}", v):
+        return v
+    raise argparse.ArgumentTypeError(f"{value!r}: expected 7.61, 6.02, 10.xx or a firmware such as 9.60")
+
+
+def _backport_dirs(args):
+    """(--backport-libs, --fw-libs-root) as resolved paths, None when not given."""
+    libs = getattr(args, "backport_libs", None)
+    fw = getattr(args, "fw_libs_root", None)
+    return (Path(libs).expanduser().resolve() if libs else None,
+            Path(fw).expanduser().resolve() if fw else None)
 _REPORT_SKIP_DIRS = {"_extracted", "_ffpfsc_extract", "_ffpfsc_temp", "_ffpfsc_inner", "__MACOSX"}
 
 
@@ -1469,26 +1527,56 @@ def _fake_sign_tree(folder) -> dict:
     return fake_sign_tree(str(folder), log=lambda m: print(m, flush=True))
 
 
-def _apply_backport(folder, target: str, libs_root=None) -> None:
+def _apply_backport(folder, target: str, libs_root=None, fw_root=None) -> None:
     """Backport pass on *folder*, IN PLACE. Runs before fake-sign in the same
-    invocation.
+    invocation. Everything that can stop the job is decided before a byte changes:
 
-    Two steps: lower the SDK version in every eboot/prx/sprx to the target's
-    SDK words (idlesauce's table), then, if *libs_root* is given, copy every
-    file from libs_root into <folder>/fakelib/ (never overwrites files
-    already there — the user's own copies win).
+    1. The target's SDK words: the public table for 7.61/6.02/10.xx, otherwise read
+       from that firmware's own libraries under *fw_root* (one subfolder per firmware).
+    2. Encrypted executables are refused: nothing in them can be read or changed.
+    3. With *fw_root*, the check: which functions does the game use that the target
+       firmware lacks? None: lowering the SDK is enough. Some: patched libraries for
+       the target (*libs_root*, or its <target> subfolder) are required.
+    4. Lower the SDK words in every eboot/prx/sprx, raw or fake-signed (in place).
+    5. Copy the patched libraries into <folder>/fakelib/ (never overwrites files
+       already there — the user's own copies win).
 
-    Nothing is removed from the game, nothing is added on error. The staging
-    mirror is expected to be a copy already; the caller decides whether this
-    modifies the user's own folder (fake-sign-first path) or the staging one
+    The staging mirror is expected to be a copy already; the caller decides whether
+    this modifies the user's own folder (fake-sign-first path) or the staging one
     (queue path)."""
     from pathlib import Path
     import backport as _bp
     folder = Path(folder)
-    if target not in _bp.SDK_TARGETS:
-        raise ValueError(f"unknown --backport-target {target!r}; expected one of {sorted(_bp.SDK_TARGETS)}")
-    print(f"[INFO] Backport: lowering SDK to {target} under {folder.name}", flush=True)
-    report = _bp.lower_sdk_in_folder(folder, target)
+    if libs_root is not None and not Path(libs_root).is_dir():
+        raise FileNotFoundError(f"--backport-libs is not a folder: {libs_root}")
+    misuse = _bp.patched_libs_problem(libs_root, fw_root)
+    if misuse:
+        raise RuntimeError(misuse[0].upper() + misuse[1:] + ".")
+    words = _bp.target_words(target, fw_root)
+    locked = _bp.encrypted_selfs(folder)
+    if locked:
+        names = ", ".join(str(p.relative_to(folder)) for p in locked[:4]) + (", …" if len(locked) > 4 else "")
+        raise RuntimeError(f"{len(locked)} executable(s) are encrypted ({names}). A backport needs "
+                           f"decrypted or fake-signed executables.")
+    libs = _bp.patched_libs_folder(libs_root, target) if libs_root else None
+    if libs_root and libs is None:
+        print(f"[WARN] Backport: {libs_root} holds no patched libraries for {target}.", flush=True)
+    if fw_root:
+        check = _bp.analyse_backport(folder, target, fw_libs_root=fw_root, backport_libs_root=libs_root)
+        missing = check.unresolved_count()
+        if check.firmware_note or not check.firmware_checked:
+            print(f"[WARN] Backport: {check.verdict()}", flush=True)
+        elif missing and libs is None:
+            raise RuntimeError(check.verdict(patched=False))
+        else:
+            print(f"[{'WARN' if missing else 'INFO'}] Backport: {check.verdict(patched=libs is not None)}",
+                  flush=True)
+    else:
+        print(f"[WARN] Backport: no firmware libraries folder given, so the functions the game uses "
+              f"were not checked against {target}.", flush=True)
+    print(f"[INFO] Backport: lowering SDK to {target} (ps5 {words[0]:#010x}, ps4 {words[1]:#010x})",
+          flush=True)
+    report = _bp.lower_sdk_in_folder(folder, target, words)
     for path, changes in report.written:
         effective = [c for c in changes if not c.unchanged()]
         if effective:
@@ -1498,20 +1586,18 @@ def _apply_backport(folder, target: str, libs_root=None) -> None:
         print(f"  [sdk] {len(report.skipped_no_param)} ELF(s) had no SCE param segment; "
               f"kept as-is (helper modules).", flush=True)
     if report.skipped_not_elf:
-        print(f"  [sdk] {len(report.skipped_not_elf)} file(s) were not raw ELFs "
-              f"(already fake-signed?); kept as-is.", flush=True)
+        print(f"  [sdk] {len(report.skipped_not_elf)} file(s) named like executables are not; "
+              f"kept as-is.", flush=True)
     print(f"[INFO] Backport: {report.summary()}", flush=True)
 
-    if libs_root is None:
-        print("[INFO] Backport: --backport-libs not set; no fakelib bundle copied.", flush=True)
+    if libs is None:
+        if libs_root is None:
+            print("[INFO] Backport: no patched libraries given; nothing copied into fakelib/.", flush=True)
         return
-    libs_root = Path(libs_root)
-    if not libs_root.is_dir():
-        raise FileNotFoundError(f"--backport-libs is not a folder: {libs_root}")
     fakelib = folder / "fakelib"
     fakelib.mkdir(exist_ok=True)
     copied, kept = 0, 0
-    for src in sorted(libs_root.iterdir()):
+    for src in sorted(libs.iterdir()):
         if not src.is_file() or src.name.startswith("."):
             continue
         dst = fakelib / src.name
@@ -1638,8 +1724,7 @@ def _chain_transforms(root: Path, args, scratch_root: Path) -> list[str]:
         print(f"[OK] Applied {applied} patch file(s).", flush=True)
         done.append("patch")
     if args.backport_target:
-        _apply_backport(root, args.backport_target,
-                        Path(args.backport_libs).resolve() if args.backport_libs else None)
+        _apply_backport(root, args.backport_target, *_backport_dirs(args))
         done.append(f"backport {args.backport_target}")
     if getattr(args, "chain_sign", False):
         counts = _fake_sign_tree(root)
@@ -1813,13 +1898,14 @@ def main() -> None:
     parser.add_argument("--fake-sign-first", action="store_true",
                         help="Before packing a game FOLDER, fake-sign its executables in "
                              "place first (ignored for .exfat/.ffpkg/.ffpfs sources).")
-    parser.add_argument("--backport-target", type=str, default=None,
-                        choices=list(_BACKPORT_TARGETS),
+    parser.add_argument("--backport-target", type=_backport_target_arg, default=None, metavar="FW",
                         help="BACKPORT: before fake-signing, lower the SDK version in the "
-                             "game's eboot.bin and every prx/sprx to this target's SDK words "
-                             "(7.61=BackPork sweet spot; 6.02=experimental; 10.xx=SDK only, "
-                             "no fakelib bundle). Applied to a folder source; ignored for "
-                             ".ffpfs/.ffpfsc/.pkg/.exfat sources.")
+                             "game's eboot.bin and every prx/sprx (raw or fake-signed) to this "
+                             "target's SDK words: 7.61 (public library patches), 6.02 "
+                             "(small public library set), 10.xx (SDK only), or any firmware whose original "
+                             "libraries are in --fw-libs-root (the words are read from them). "
+                             "With --fw-libs-root the game's functions are checked first; if the "
+                             "target lacks some, --backport-libs is required.")
     parser.add_argument("--to", dest="chain_to", choices=("folder", "ffpfs", "ffpfsc", "pkg"), default=None,
                         help="CHAIN: turn the SOURCE positional (folder, .zip/.rar, .exfat/.ffpkg, .ffpfs, "
                              ".ffpfsc or .pkg) into this output, applying --patch, --backport-target and "
@@ -1846,9 +1932,13 @@ def main() -> None:
                              "NIDs it imports, and (with --fw-libs-root) compare them to the target "
                              "firmware and your --backport-libs. Read-only; nothing is built.")
     parser.add_argument("--fw-libs-root", type=str, default=None, metavar="DIR",
-                        help="BACKPORT: folder holding ORIGINAL target-firmware libraries (never "
-                             "bundled with this app); used by --backport-analyze to determine which "
-                             "NIDs the console can supply on its own.")
+                        help="BACKPORT: folder with your ORIGINAL firmware libraries, one subfolder "
+                             "per firmware named by its version (7.61/, 10.01/, ...; never bundled "
+                             "with this app). The check reads <DIR>/<target>, --prepare-backport-libs "
+                             "reads <DIR>/10.01, and every subfolder is a backport target.")
+    parser.add_argument("--sdk-of", type=str, default=None, metavar="SRC",
+                        help="Print the firmware the game in SRC needs (its eboot.bin's SDK version) as "
+                             "JSON, then exit. SRC: a game folder, a .ffpfs/.ffpfsc or a .pkg. Read-only.")
     parser.add_argument("--list-image", type=str, default=None, metavar="IMG",
                         help="PFS BROWSE: print the directory tree of a .ffpfs/.ffpfsc as JSON "
                              "(only metadata blocks are decompressed), then exit.")
@@ -1878,7 +1968,14 @@ def main() -> None:
             print("[ERROR] --prepare-backport-libs needs --fw-libs-root (your 10.01 libraries) "
                   "and --backport-libs (where the patched files land)", flush=True)
             sys.exit(2)
+        import backport as _bp
         import backport_libs as _bpl
+        fw10 = _bp.firmware_folder(fw, "10.01")
+        if fw10 is None:
+            print(f"[ERROR] no 10.01 folder in {fw}: the BackPork patches apply to 10.01 libraries only",
+                  flush=True)
+            sys.exit(1)
+        fw = fw10
         # Same profile folder as the GUI (tests point PS5_FFPFSC_APP_DIR at a scratch one).
         _profile = os.environ.get("PS5_FFPFSC_APP_DIR", "").strip()
         cache = (Path(_profile) if _profile else
@@ -1893,7 +1990,8 @@ def main() -> None:
 
     if args.backport_analyze:
         if not args.backport_target:
-            print("[ERROR] --backport-analyze needs --backport-target 7.61|6.02|10.xx", flush=True)
+            print("[ERROR] --backport-analyze needs --backport-target (7.61, 6.02, 10.xx or a firmware)",
+                  flush=True)
             sys.exit(2)
         src = Path(args.backport_analyze).expanduser().resolve()
         if not src.is_dir():
@@ -1905,18 +2003,31 @@ def main() -> None:
         report = _bp.analyse_backport(src, args.backport_target, fw_libs_root=fw, backport_libs_root=fk)
         # human-readable, one line per library
         print(f"[analyse] {report.summary()}", flush=True)
-        print(f"{'STATUS':<8} {'LIBRARY':<32} {'USED':>5} {'FW':>5} {'FAKE':>5} {'MISS':>5}")
+        print(f"{'STATUS':<8} {'LIBRARY':<32} {'USED':>5} {'FW':>5} {'FAKE':>5} {'GAME':>5} {'MISS':>5}")
         for lr in report.per_library:
             print(f"{lr.status:<8} {lr.library:<32} "
                   f"{len(lr.used_nids):>5} {len(lr.firmware_covers):>5} "
-                  f"{len(lr.fakelib_covers):>5} {len(lr.unresolved):>5}")
+                  f"{len(lr.fakelib_covers):>5} {len(lr.game_covers):>5} {len(lr.unresolved):>5}")
         if report.unnamed_imports:
             print(f"[warn] {report.unnamed_imports} import(s) had no resolvable library name")
-        # exit 0 when every library is fully covered, 1 otherwise — the shell can chain
-        blockers = report.blocking_libraries()
-        if blockers:
-            print(f"[analyse] blocked by: {', '.join(blockers)}")
-        sys.exit(0 if not blockers else 1)
+        for name in report.unreadable[:20]:
+            print(f"[warn] encrypted, not read: {name}")
+        patched = bool(fk and not _bp.patched_libs_problem(fk, fw)
+                       and _bp.patched_libs_folder(fk, args.backport_target))
+        print(f"[verdict] {report.verdict(patched=patched)}", flush=True)
+        # exit 0 when every function is covered, 1 otherwise — the shell can chain
+        ok = report.firmware_checked and not report.firmware_note and not report.unreadable \
+            and not report.unresolved_count()
+        sys.exit(0 if ok else 1)
+
+    if args.sdk_of:
+        try:
+            info = required_firmware(Path(args.sdk_of).expanduser().resolve())
+        except Exception as e:
+            print(f"[ERROR] --sdk-of: {e}", flush=True)
+            sys.exit(1)
+        print("SDK_JSON: " + json.dumps(info), flush=True)
+        sys.exit(0 if info else 1)
 
     if args.list_image:
         img = Path(args.list_image).resolve()
@@ -1966,8 +2077,7 @@ def main() -> None:
         pass
     if args.backport_target and args.fake_sign:
         try:
-            _apply_backport(Path(args.fake_sign).resolve(), args.backport_target,
-                            Path(args.backport_libs).resolve() if args.backport_libs else None)
+            _apply_backport(Path(args.fake_sign).resolve(), args.backport_target, *_backport_dirs(args))
         except Exception as e:
             print(f"[ERROR] Backport failed: {e}", flush=True)
             sys.exit(1)
@@ -2235,8 +2345,7 @@ def main() -> None:
             # is here.
             if getattr(args, "backport_target", None):
                 try:
-                    _apply_backport(build_src, args.backport_target,
-                                    Path(args.backport_libs).resolve() if args.backport_libs else None)
+                    _apply_backport(build_src, args.backport_target, *_backport_dirs(args))
                 except Exception as e:
                     if staged is not None:
                         shutil.rmtree(staged, ignore_errors=True)
@@ -2619,8 +2728,7 @@ def main() -> None:
                 if item.is_dir():
                     if args.backport_target:
                         try:
-                            _apply_backport(item, args.backport_target,
-                                            Path(args.backport_libs).resolve() if args.backport_libs else None)
+                            _apply_backport(item, args.backport_target, *_backport_dirs(args))
                         except Exception as e:
                             print(f"[ERROR] Backport before pack failed: {e}", flush=True)
                             sys.exit(1)

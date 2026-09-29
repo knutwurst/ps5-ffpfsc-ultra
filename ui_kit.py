@@ -149,7 +149,7 @@ class Fonts:
 # ── Icons ────────────────────────────────────────────────────────────────────────────
 # Ops on a 24x24 grid: l = polyline, p = closed outline, c = circle, cf = filled circle,
 # ck = knob (circle filled with the background), r = rounded rect, pie = filled pie slice,
-# pf = filled polygon.
+# pf = filled polygon, rf = filled rounded rect.
 ICONS: dict[str, list[tuple]] = {
     "queue": [("l", 4, 6.5, 5.5, 8, 8, 5), ("l", 4, 12.5, 5.5, 14, 8, 11), ("l", 4, 18.5, 5.5, 20, 8, 17),
               ("l", 11, 6.5, 20, 6.5), ("l", 11, 12.5, 20, 12.5), ("l", 11, 18.5, 20, 18.5)],
@@ -161,6 +161,8 @@ ICONS: dict[str, list[tuple]] = {
                  ("ck", 9, 7, 2.2), ("ck", 15, 12, 2.2), ("ck", 7.5, 17, 2.2)],
     "plus": [("l", 12, 5, 12, 19), ("l", 5, 12, 19, 12)],
     "play": [("pf", 8.5, 6.5, 18, 12, 8.5, 17.5)],
+    "stop": [("rf", 6.5, 6.5, 17.5, 17.5, 2.5)],
+    "sidebar-right": [("r", 3, 5, 21, 19, 2.5), ("l", 14.5, 5, 14.5, 19)],
     "x": [("l", 6.5, 6.5, 17.5, 17.5), ("l", 17.5, 6.5, 6.5, 17.5)],
     "check-circle": [("c", 12, 12, 9), ("l", 8, 12.5, 11, 15.3, 16.2, 9.3)],
     "alert": [("p", 12, 3.8, 21, 19.5, 3, 19.5), ("l", 12, 9.5, 12, 13.5), ("cf", 12, 16.6, 0.9)],
@@ -262,9 +264,12 @@ def draw_icon(cv: tk.Canvas, name: str, x: float, y: float, size: float, color: 
                 cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, fill=color, width=1, **common)
             else:
                 cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, fill=bg or "", width=w, **common)
-        elif kind == "r":
-            round_rect(cv, x + args[0] * s, y + args[1] * s, x + args[2] * s, y + args[3] * s, args[4] * s,
-                       outline=color, fill="", width=w, **common)
+        elif kind in ("r", "rf"):
+            box = (x + args[0] * s, y + args[1] * s, x + args[2] * s, y + args[3] * s, args[4] * s)
+            if kind == "r":
+                round_rect(cv, *box, outline=color, fill="", width=w, **common)
+            else:
+                round_rect(cv, *box, fill=color, **common)
         elif kind == "pie":
             cx, cy, r = x + args[0] * s, y + args[1] * s, args[2] * s
             cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=args[3], extent=args[4],
@@ -1001,6 +1006,7 @@ class LogText(tk.Text):
         super().__init__(parent, bd=0, highlightthickness=0, relief="flat", wrap="none",
                          padx=10, pady=8, font=kit.fonts.mono, **kw)
         self.kit, self.mirror, self.mirror_lines = kit, mirror, mirror_lines
+        self.mirror_visible = mirror_lines      # lines that fit in the tail widget right now
         kit.style(self, bg="surface", fg="log", insertbackground="log", selectbackground="select",
                   selectforeground="text")
         kit.register(self)
@@ -1028,15 +1034,33 @@ class LogText(tk.Text):
             try:
                 m.configure(state="normal")
                 m.insert("end", chars, *args)
-                # Keep exactly the newest mirror_lines lines and show them from the top: a
-                # view scrolled to the end would show the empty line after the last
-                # newline and a sliver of the line above.
-                last = int(m.index("end-1c").split(".")[0])
-                text_lines = last - 1 if m.get(f"{last}.0", "end-1c") == "" else last
-                if text_lines > self.mirror_lines:
+                text_lines = self._mirror_line_count()
+                if text_lines > self.mirror_lines:           # a bounded history
                     m.delete("1.0", f"{text_lines - self.mirror_lines + 1}.0")
-                m.yview_moveto(0.0)
+                    text_lines = self.mirror_lines
+                self._show_mirror_tail(text_lines)
                 m.configure(state="disabled")
+            except tk.TclError:
+                pass
+
+    def _mirror_line_count(self) -> int:
+        m = self.mirror
+        last = int(m.index("end-1c").split(".")[0])
+        return last - 1 if m.get(f"{last}.0", "end-1c") == "" else last
+
+    def _show_mirror_tail(self, text_lines: int | None = None):
+        """Show the newest mirror_visible lines, the oldest of them at the top: a view
+        scrolled to the end would show the empty line after the last newline and a
+        sliver of the line above."""
+        n = self._mirror_line_count() if text_lines is None else text_lines
+        self.mirror.yview(f"{max(1, n - self.mirror_visible + 1)}.0")
+
+    def set_mirror_visible(self, lines: int):
+        """The tail widget changed its height: show as many lines as fit now."""
+        self.mirror_visible = max(1, int(lines))
+        if self.mirror is not None:
+            try:
+                self._show_mirror_tail()
             except tk.TclError:
                 pass
 

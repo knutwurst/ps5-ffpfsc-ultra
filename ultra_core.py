@@ -361,6 +361,15 @@ def chain_source_kind(item) -> str:
             ".ffpfsc": "ffpfsc", ".pkg": "pkg"}.get(suf, suf.lstrip(".") or "file")
 
 
+_BACKPORT_TARGET = re.compile(r"^(?:\d{1,2}\.\d{2}|10\.xx)$")
+
+
+def is_backport_target(name) -> bool:
+    """A backport target the backend accepts: 7.61, 6.02, 10.xx, or a firmware whose
+    original libraries the user keeps in the firmware libraries folder (9.60, ...)."""
+    return isinstance(name, str) and bool(_BACKPORT_TARGET.match(name))
+
+
 def chain_changes(item) -> list[str]:
     """The content changes a chain job applies, in backend order: patch → backport → sign."""
     out: list[str] = []
@@ -1214,7 +1223,8 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
                             name_override: str | None = None,
                             tid_override: str | None = None,
                             ver_override: str | None = None,
-                            v_prefix: bool = False) -> str:
+                            v_prefix: bool = False,
+                            fw_override: str | None = None) -> str:
     """Build a findable output filename for *item*:
     '<Game Name> [<TITLEID>] [v<version>]<ext>'  (version omitted if unknown).
     Falls back to the title id alone if the name is missing. *ext* is '.ffpfsc'
@@ -1222,7 +1232,8 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
 
     The *_override* arguments feed the auto-organize layout: the title / id / version read
     from the game's own metadata instead of the source name; *v_prefix* writes the short
-    version tag as '[v01.200]' (the library convention) instead of '[01.200]'."""
+    version tag as '[v01.200]' (the library convention) instead of '[01.200]'; *fw_override*
+    adds the firmware the game needs as '[fw10.00]'."""
     if not ext.startswith("."):
         ext = "." + ext
     PLACEHOLDERS = {"Unknown", "📦", "💾", "📤", ""}
@@ -1275,6 +1286,8 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
         # Shortened version tag (e.g. [01.007]) — matches shorten_ffpfsc_versions.sh;
         # the auto-organize layout writes it as [v01.007].
         suffix_parts.append(f"[{'v' if v_prefix else ''}{short_version(ver)}]")
+    if fw_override:
+        suffix_parts.append(f"[fw{fw_override}]")
     suffix = (" " + " ".join(suffix_parts)) if suffix_parts else ""
     # Reserve room (by UTF-8 bytes) for the [version][TITLEID] suffix + extension so those
     # collision-resistant tags survive the filename-length cap instead of being truncated.
@@ -1319,10 +1332,11 @@ def canonical_game_title(title: str) -> str:
 
 def organized_names(ident: dict, ext: str, item=None) -> tuple[str, str]:
     """The auto-organize layout for one game — (folder, file):
-         '<Title> [<TITLEID>] [vXX.YYY.ZZZ]'          the per-game folder (full version)
-         '<Title> [<TITLEID>] [vXX.YYY]<ext>'         the file inside it (short version)
-    *ident* carries 'title', 'title_id', 'version' as read from param.json (any may be
-    empty; missing tags are simply left out). The file name goes through the same
+         '<Title> [<TITLEID>] [vXX.YYY.ZZZ]'                the per-game folder (full version)
+         '<Title> [<TITLEID>] [vXX.YYY] [fwN.NN]<ext>'      the file inside it (short version,
+                                                            the firmware the game needs)
+    *ident* carries 'title', 'title_id', 'version' as read from param.json and 'fw' from
+    the executable's SDK version (any may be empty; missing tags are simply left out). The file name goes through the same
     ShadowMount byte budget / edition-fluff trimming as every other output name."""
     title = canonical_game_title(ident.get("title") or "")
     tid = (ident.get("title_id") or "").strip().upper()
@@ -1331,7 +1345,8 @@ def organized_names(ident: dict, ext: str, item=None) -> tuple[str, str]:
     # Without a title the id already names the folder; do not repeat it as a tag.
     tid_tag = f"[{tid}]" if tid and tid.lower() not in base.lower() else ""
     folder = sanitize_filename(" ".join(p for p in (base, tid_tag, f"[v{ver}]" if ver else "") if p))
-    fname = descriptive_ffpfsc_name(item, ext, name_override=base, tid_override=tid, ver_override=ver, v_prefix=True)
+    fname = descriptive_ffpfsc_name(item, ext, name_override=base, tid_override=tid, ver_override=ver, v_prefix=True,
+                                    fw_override=(ident.get("fw") or "").strip() or None)
     return folder, fname
 
 
@@ -2486,10 +2501,12 @@ class GameItem:
     patch_inplace = False   # patch: overlay onto a throwaway temp extract (archive game source)
     unwrap = True           # convert/unpack: True = unwrap to a folder, False = stop at inner .ffpfs
     copy_delete_source = True  # copy: delete the source after a successful cross-drive copy
-    backport_target = None  # None|"7.61"|"6.02"|"10.xx": lower SDK before pack/fpkg (opt-in)
+    backport_target = None  # None|"7.61"|"6.02"|"10.xx"|another firmware: lower SDK before the build
     backport_libs_root = None  # str: folder of user-supplied patched sprx dropped into fakelib/
     chain_to = None         # chain job: "folder" | "ffpfs" | "ffpfsc" | "pkg"
     chain_sign = False      # chain job: fake-sign executables (after patch and backport)
+    compression_level = None  # .ffpfsc job: zlib level 1-9 chosen in the job editor; None → the default
+    status_note = ""        # why the job failed or was skipped (shown in the details pane)
 
     def __init__(self, path: Path):
         self.path       = path
@@ -2703,7 +2720,7 @@ class GameItem:
         obj.chain_to           = to if to in CHAIN_TARGETS else "ffpfsc"
         obj.chain_sign         = bool(sign)
         obj.patch_source       = Path(patch_source) if patch_source else None
-        obj.backport_target    = backport_target if backport_target in ("7.61", "6.02", "10.xx") else None
+        obj.backport_target    = backport_target if is_backport_target(backport_target) else None
         obj.backport_libs_root = str(backport_libs_root) if backport_libs_root else None
         obj.copy_delete_source = bool(delete_source)
         obj.output_path        = Path(output_path) if output_path else None
@@ -2848,6 +2865,7 @@ __all__ = [
     "ARCHIVE_SUFFIXES",
     "chain_source_kind",
     "chain_changes",
+    "is_backport_target",
     "chain_needs_unpack",
     "chain_summary",
     "is_first_run",

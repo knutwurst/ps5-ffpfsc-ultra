@@ -76,7 +76,7 @@ def pump(cond, timeout=20.0):
         time.sleep(0.05)
     return cond()
 def close_toplevels():
-    # Work dialogs are panels of the main window since 1.2.0 (app._panels.stack); messages
+    # Work dialogs are panels of the main window since 2.0.0 (app._panels.stack); messages
     # (job result, error report, prompts) are windows of their own.
     for w in list(app._panels.stack):
         try: w.destroy()
@@ -112,106 +112,107 @@ try:
         _ext_out = next((a for a in cmd2 if a.startswith(str(OUT / "ext"))), "")
         ok("build_command.fpkg-extract", "--fpkg-extract" in cmd2 and _ext_out.endswith(" [extracted]")
            and Path(_ext_out).parent == OUT / "ext", " ".join(cmd2[-4:]))
-    # 3) Pack dialog, .pkg format, FOLDER source → identity pre-filled from param.json; add goes through
-    #    the shared classifier (async scan) and lands as an fpkg-build job carrying that identity
-    dlg = m.PackDialog(app, source=HBT, fmt="pkg"); root.update()
-    ok("dialog.autofill.cid", dlg.cid_var.get() == "UP9000-PPSA99099_00-PROSPERO00000000", dlg.cid_var.get())
+    # 3) the job editor, .pkg output, FOLDER source → identity filled in from param.json; the job
+    #    carries it with the codec and speed chosen
+    CID = "UP9000-PPSA99099_00-PROSPERO00000000"
+    L = m.JobDialog._TARGET_LABEL
+    dlg = m.JobDialog(app, init_src=str(HBT), init_to="pkg"); root.update()
+    ok("dialog.autofill.cid", dlg.cid_var.get() == CID, dlg.cid_var.get())
     ok("dialog.autofill.tid", dlg.tid_var.get() == "PPSA99099", dlg.tid_var.get())
-    ok("dialog.pkg.panel-shown", dlg._panel_shown and dlg.fmt_key == "pkg", dlg.geometry())
-    dlg.out_var.set(str(OUT)); dlg.inner_var.set("kraken"); dlg.speed_var.set("fast"); dlg._refresh_hints()
-    n0 = len(app.queue); dlg._add(); pump(lambda: len(app.queue) > n0)
-    ok("dialog.add.queued", len(app.queue) == n0 + 1 and app.queue[-1].operation == "fpkg-build", f"queue={len(app.queue)} errors={errors}")
-    q = app.queue[-1]
-    ok("dialog.add.fields", q.fpkg_inner_mode == "kraken" and q.fpkg_level == -4 and q.fpkg_content_id == "UP9000-PPSA99099_00-PROSPERO00000000"
+    ok("dialog.pkg.panel-shown", dlg._to_key() == "pkg" and dlg._pkg_opts.winfo_manager() != "", dlg._to_key())
+    dlg.out_var.set(str(OUT)); dlg.inner_var.set("kraken"); dlg.speed_var.set("fast")
+    n0 = len(app.queue); dlg._add(); root.update()
+    q = app.queue[-1] if app.queue else None
+    ok("dialog.add.queued", len(app.queue) == n0 + 1 and q.operation == "chain" and q.chain_to == "pkg", f"queue={len(app.queue)} errors={errors[-1:]}")
+    ok("dialog.add.fields", q.fpkg_inner_mode == "kraken" and q.fpkg_level == -4 and q.fpkg_content_id == CID
        and q.files > 0 and q.path == HBT, f"{q.fpkg_inner_mode}/{q.fpkg_level}/{q.fpkg_content_id}/files={q.files}")
-    ok("dialog.add.remembered", app.output_format_var.get() == "pkg" and app.fpkg_defaults["inner"] == "kraken"
-       and app.fpkg_defaults["level"] == -4 and app._pending_fpkg_identity is None, f"{app.output_format_var.get()} {app.fpkg_defaults}")
+    ok("dialog.add.remembered", app.fpkg_defaults["inner"] == "kraken" and app.fpkg_defaults["level"] == -4, str(app.fpkg_defaults))
     cmdq, *_ = app.build_command(q)
-    ok("build_command.fast-preset", cmdq[cmdq.index("--compression-level")+1] == "-4", " ".join(cmdq[-6:]))
-    # 4) .pkg format with an IMAGE source → identity stays empty (auto at build time), direct fPKG job
-    dlg2 = m.PackDialog(app, source=FF, fmt="pkg"); root.update()
+    ok("build_command.fast-preset", "--compression-level" in cmdq and cmdq[cmdq.index("--compression-level")+1] == "-4", " ".join(cmdq[-8:]))
+    # 4) .pkg with an IMAGE source → identity stays empty (read at build time)
+    dlg2 = m.JobDialog(app, init_src=str(FF), init_to="pkg"); root.update()
     ok("dialog.image.identity-empty", dlg2.cid_var.get() == "" and dlg2.tid_var.get() == "", f"{dlg2.cid_var.get()!r}")
-    ok("dialog.image.hint", "unwrapped" in dlg2.src_hint.get(), dlg2.src_hint.get())
+    ok("dialog.image.hint", "param.json" in dlg2._ident_note.get(), dlg2._ident_note.get())
     dlg2.out_var.set(str(OUT)); n1 = len(app.queue); dlg2._add(); root.update()
-    ok("dialog.image.queued", len(app.queue) == n1 + 1 and app.queue[-1].path == FF and app.queue[-1].operation == "fpkg-build", f"errors={errors}")
+    ok("dialog.image.queued", len(app.queue) == n1 + 1 and app.queue[-1].path == FF and app.queue[-1].chain_to == "pkg", f"errors={errors[-1:]}")
     cmd3, *_ = app.build_command(app.queue[-1])
-    ok("build_command.image-source", cmd3[cmd3.index("--fpkg-build")+1] == str(FF) and "--content-id" not in cmd3, " ".join(cmd3[-10:]))
-    # 5) edit round trip (same source, stays fPKG)
-    dlg3 = m.PackDialog(app, item=q); root.update()
-    ok("dialog.edit.preselects-pkg", dlg3.fmt_key == "pkg" and dlg3._panel_shown and dlg3.speed_var.get() == "fast", f"{dlg3.fmt_key}/{dlg3.speed_var.get()}")
-    dlg3.speed_var.set("normal"); dlg3.title_var.set("Edited"); dlg3._add(); root.update()
-    ok("dialog.edit.saved", q.fpkg_level == 7 and q.fpkg_title == "Edited", f"{q.fpkg_level}/{q.fpkg_title} errors={errors}")
-    # 5b) edit: switch fPKG → .ffpfsc on the SAME source converts the job in place (same object,
-    #     same index, fpkg_* fields dropped) — and back
+    ok("build_command.image-source", str(FF) in cmd3 and "--content-id" not in cmd3, " ".join(cmd3[-10:]))
+    # 5) edit round trip: the editor opens with the job's own choices, saving replaces it in place
     idx = app.queue.index(q)
-    dlg3b = m.PackDialog(app, item=q); root.update(); dlg3b.set_format("ffpfsc"); root.update()
-    ok("dialog.edit.panel-hidden", not dlg3b._panel_shown, dlg3b.geometry())
+    dlg3 = m.JobDialog(app, item=q); root.update()
+    ok("dialog.edit.preselects-pkg", dlg3._to_key() == "pkg" and dlg3._pkg_opts.winfo_manager() != ""
+       and dlg3.speed_var.get() == "fast", f"{dlg3._to_key()}/{dlg3.speed_var.get()}")
+    dlg3.speed_var.set("normal"); dlg3.title_var.set("Edited"); dlg3._add(); root.update()
+    q = app.queue[idx]
+    ok("dialog.edit.saved", q.fpkg_level == 7 and q.fpkg_title == "Edited", f"{q.fpkg_level}/{q.fpkg_title} errors={errors[-1:]}")
+    dlg3b = m.JobDialog(app, item=q); root.update(); dlg3b.to_var.set(L["ffpfsc"]); root.update()
+    ok("dialog.edit.panel-hidden", dlg3b._pkg_opts.winfo_manager() == "", dlg3b._to_key())
     dlg3b._add(); root.update()
     rep = app.queue[idx]
-    ok("dialog.edit.to-pack", rep is q and rep.operation == "pack" and rep.output_compressed is True and rep.path == HBT
-       and "fpkg_level" not in vars(rep), f"{rep.operation} errors={errors}")
-    dlg3c = m.PackDialog(app, item=rep); root.update(); dlg3c.set_format("pkg"); root.update(); dlg3c._add(); root.update()
+    ok("dialog.edit.to-pack", rep.chain_to == "ffpfsc" and rep.output_compressed is True and rep.path == HBT
+       and "fpkg_level" not in vars(rep), f"{rep.chain_to} errors={errors[-1:]}")
+    dlg3c = m.JobDialog(app, item=rep); root.update(); dlg3c.to_var.set(L["pkg"]); root.update(); dlg3c._add(); root.update()
     q = app.queue[idx]
-    ok("dialog.edit.back-to-pkg", q.operation == "fpkg-build" and q.fpkg_content_id == "UP9000-PPSA99099_00-PROSPERO00000000", f"{q.operation} errors={errors}")
-    # 6) validation rejects a bad content id (uses our patched showerror) — and reveals the identity rows
-    dlg4 = m.PackDialog(app, source=HBT, fmt="pkg"); root.update()
-    ok("dialog.compact-by-default", not dlg4._adv_shown and not dlg4._ident_forced and dlg4.irow.winfo_manager() == ""
-       and dlg4.crow.winfo_manager() == "", f"adv={dlg4._adv_shown} forced={dlg4._ident_forced}")
-    # the summary reflects the REMEMBERED compression choice (test 3 picked kraken/fast for this app)
-    ok("dialog.summary", "identity from param.json (PPSA99099)" in dlg4.sum_var.get()
-       and f"codec layer {app.fpkg_defaults['inner']}" in dlg4.sum_var.get()
-       and ("Kraken fast" if app.fpkg_defaults["level"] < 0 else "Kraken normal") in dlg4.sum_var.get(), dlg4.sum_var.get())
-    ok("dialog.backend-row-hidden", not dlg4._backend_shown and dlg4.back_var.get() == "builtin", f"dll={app.pubtools_dll_var.get()!r}")
-    # even with a DLL configured the backend row stays away on macOS (LibProsperoPkg: Windows only, hard failure)
+    ok("dialog.edit.back-to-pkg", q.chain_to == "pkg" and q.fpkg_content_id == CID, f"{q.chain_to} errors={errors[-1:]}")
+    # 6) the identity rows: folded away by default, a bad content id is refused and shows them
+    dlg4 = m.JobDialog(app, init_src=str(HBT), init_to="pkg"); root.update()
+    ok("dialog.compact-by-default", not dlg4._pkg_more and not dlg4._ident_forced and dlg4._pkg_more_box.winfo_manager() == "",
+       f"more={dlg4._pkg_more} forced={dlg4._ident_forced}")
+    ok("dialog.summary", "Build .pkg" in dlg4.summary_var.get(), dlg4.summary_var.get())
+    ok("dialog.backend-row-hidden", (dlg4._back_row is None and dlg4.back_var.get() == "builtin") if sys.platform != "win32"
+       else dlg4._back_row is not None, f"dll={app.pubtools_dll_var.get()!r}")
     _prev_dll = app.pubtools_dll_var.get(); app.pubtools_dll_var.set("/nonexistent/libScePubTools.dll")
-    dlg4x = m.PackDialog(app, source=HBT, fmt="pkg"); root.update()
-    ok("dialog.backend-row-windows-only", (not dlg4x._backend_shown and dlg4x.back_var.get() == "builtin") if sys.platform != "win32" else dlg4x._backend_shown, f"shown={dlg4x._backend_shown}")
+    dlg4x = m.JobDialog(app, init_src=str(HBT), init_to="pkg"); root.update()
+    ok("dialog.backend-row-windows-only", (dlg4x._back_row is None) if sys.platform != "win32" else dlg4x._back_row is not None, "")
     px = m.GameItem(HBT); app._as_fpkg_job(px, {"inner": "none", "backend": "publishingtools", "level": 7, "dll": "/nonexistent/x.dll"})
     ok("as-fpkg.publishingtools-forced-builtin", (px.fpkg_kraken_backend == "builtin" and px.fpkg_pubtools_dll == "") if sys.platform != "win32" else px.fpkg_kraken_backend == "publishingtools", f"{px.fpkg_kraken_backend}")
     dlg4x.destroy(); app.pubtools_dll_var.set(_prev_dll)
     dlg4.out_var.set(str(OUT)); dlg4.cid_var.set("garbage"); n2 = len(app.queue); dlg4._add(); root.update()
     ok("dialog.validation.bad-cid", len(app.queue) == n2 and any("Content ID" in e for e in errors), str(errors[-1:]))
-    ok("dialog.validation.reveals-identity", dlg4._ident_forced and dlg4.irow.winfo_manager() == "pack", f"forced={dlg4._ident_forced}")
+    ok("dialog.validation.reveals-identity", dlg4._pkg_more and dlg4._pkg_more_box.winfo_manager() == "pack", f"more={dlg4._pkg_more}")
     dlg4.destroy()
-    # 6a) a game folder WITHOUT param.json opens the identity rows by itself and marks them required
+    # 6a) a game folder WITHOUT param.json opens the identity rows by itself and requires them
     NOP = S / "hbt_noparam"
     if NOP.exists(): shutil.rmtree(NOP)
     shutil.copytree(HBT, NOP); (NOP / "sce_sys" / "param.json").unlink()
-    dlg4b = m.PackDialog(app, source=NOP, fmt="pkg"); root.update(); dlg4b.update_idletasks()
-    ok("dialog.noparam.identity-forced", dlg4b._ident_forced and dlg4b.irow.winfo_manager() == "pack"
-       and "REQUIRED" in dlg4b.ident_head.get() and "REQUIRED" in dlg4b.sum_var.get() and dlg4b.crow.winfo_manager() == "",
-       f"forced={dlg4b._ident_forced} head={dlg4b.ident_head.get()[:40]}")
-    ok("dialog.noparam.fits", 0 < dlg4b.winfo_reqheight() <= dlg4b._height, f"req={dlg4b.winfo_reqheight()} h={dlg4b._height}")
+    dlg4b = m.JobDialog(app, init_src=str(NOP), init_to="pkg"); root.update()
+    ok("dialog.noparam.identity-forced", dlg4b._ident_forced and dlg4b._pkg_more_box.winfo_manager() == "pack"
+       and "required" in dlg4b._ident_head.get() and dlg4b._pkg_more_btn.cget("state") == "disabled",
+       f"forced={dlg4b._ident_forced} head={dlg4b._ident_head.get()[:40]}")
     dlg4b.out_var.set(str(OUT)); n2b = len(app.queue); dlg4b._add(); root.update()
     ok("dialog.noparam.requires-identity", len(app.queue) == n2b and any("Identity needed" in e for e in errors), str(errors[-1:]))
     dlg4b.src_var.set(str(HBT)); root.update()
-    ok("dialog.noparam.unforced-on-good-source", not dlg4b._ident_forced and dlg4b.irow.winfo_manager() == "", f"forced={dlg4b._ident_forced}")
+    ok("dialog.noparam.unforced-on-good-source", not dlg4b._ident_forced and dlg4b._pkg_more_box.winfo_manager() == ""
+       and dlg4b.cid_var.get() == CID, f"forced={dlg4b._ident_forced} cid={dlg4b.cid_var.get()!r}")
     dlg4b.destroy()
-    # 6b) a .ffpfsc source with the .ffpfsc TARGET format → same-format copy job (1.1.8+).
-    # The pre-1.1.8 refusal ("already packed — pick .pkg to build an fPKG") is gone: the file
-    # is already in the target format, so it's transported as-is via the queue's copy op.
-    dlg5 = m.PackDialog(app, source=FF, fmt="ffpfsc"); root.update()
-    ok("dialog.ffpfsc.copy-hint", "copied unchanged" in dlg5.src_hint.get().lower(), dlg5.src_hint.get())
-    ok("dialog.ffpfsc.copy-row-shown", dlg5.copy_row.winfo_manager() != "", f"manager={dlg5.copy_row.winfo_manager()!r}")
+    # 6b) a .ffpfsc to .ffpfsc with no change is a copy or move, the source removed by default
+    dlg5 = m.JobDialog(app, init_src=str(FF), init_to="ffpfsc"); root.update()
+    ok("dialog.ffpfsc.copy-hint", "Copy or move" in dlg5.summary_var.get(), dlg5.summary_var.get())
+    ok("dialog.ffpfsc.copy-row-shown", dlg5._keep_cb.winfo_manager() != "", f"manager={dlg5._keep_cb.winfo_manager()!r}")
     dlg5.out_var.set(str(OUT)); n3 = len(app.queue); dlg5._add(); root.update()
-    ok("dialog.ffpfsc.enqueued-as-copy",
-       len(app.queue) == n3 + 1 and app.queue[-1].operation == "copy",
-       f"op={getattr(app.queue[-1], 'operation', None) if app.queue else None} errors={errors[-1:]}")
+    ok("dialog.ffpfsc.enqueued-as-copy", len(app.queue) == n3 + 1 and app.queue[-1].chain_to == "ffpfsc"
+       and m.chain_summary(app.queue[-1]).startswith("Copy or move"), m.chain_summary(app.queue[-1]) if app.queue else "")
     ok("dialog.ffpfsc.copy.delete-source-default", getattr(app.queue[-1], "copy_delete_source", None) is True,
        f"delete_source={getattr(app.queue[-1], 'copy_delete_source', None)}")
     app.queue.pop()   # keep the fixture queue clean for later tests
-    # 7) ARCHIVE source with .pkg → queued as an fPKG placeholder; the payload copy after extraction keeps it fPKG
-    dlg6 = m.PackDialog(app, source=ZP, fmt="pkg"); root.update()
-    ok("dialog.archive.hint", "extracted" in dlg6.src_hint.get().lower(), dlg6.src_hint.get())
-    # identity typed for an archive (e.g. a homebrew zip without param.json) must ride along as the fallback
-    dlg6.cid_var.set("UP9000-PPSA99099_00-PROSPERO00000000"); dlg6.tid_var.set("PPSA99099")
-    dlg6.out_var.set(str(OUT)); n4 = len(app.queue); dlg6._add(); pump(lambda: len(app.queue) > n4)
+    # 7) ARCHIVE source with .pkg → an archive placeholder that keeps its job (target, identity) through extraction
+    dlg6 = m.JobDialog(app, init_src=str(ZP), init_to="pkg"); root.update()
+    ok("dialog.archive.hint", dlg6._kind == "archive" and "Archive" in dlg6.detect_var.get(), dlg6.detect_var.get())
+    dlg6.cid_var.set(CID); dlg6.tid_var.set("PPSA99099")
+    dlg6.out_var.set(str(OUT)); n4 = len(app.queue); dlg6._add(); root.update()
     arc = app.queue[-1]
-    ok("archive.queued-as-fpkg", len(app.queue) == n4 + 1 and arc.operation == "fpkg-build" and arc.archive_path == ZP
-       and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{getattr(arc, 'operation', None)} {getattr(arc, 'archive_path', None)} errors={errors}")
-    ok("archive.carries-typed-identity", arc.fpkg_content_id == "UP9000-PPSA99099_00-PROSPERO00000000" and arc.fpkg_title_id == "PPSA99099", f"{arc.fpkg_content_id!r}")
+    ok("archive.queued-as-pkg", len(app.queue) == n4 + 1 and arc.chain_to == "pkg" and arc.archive_path == ZP
+       and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{getattr(arc, 'chain_to', None)} {getattr(arc, 'archive_path', None)} errors={errors[-1:]}")
+    ok("archive.carries-typed-identity", arc.fpkg_content_id == CID and arc.fpkg_title_id == "PPSA99099", f"{arc.fpkg_content_id!r}")
     app._copy_item_payload(arc, m.GameItem(HBT))
-    ok("archive.payload-keeps-fpkg", arc.operation == "fpkg-build" and arc.path == HBT and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{arc.operation}")
+    ok("archive.payload-keeps-chain", arc.operation == "chain" and arc.chain_to == "pkg" and arc.path == HBT
+       and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{arc.operation}/{getattr(arc, 'chain_to', None)}")
+    # 7a) the other games of a multi-game archive get the same job; identity stays per game
+    extra = m.GameItem(HBT)
+    app._as_chain_job(extra, arc)
+    ok("archive.extra-game-same-job", extra.operation == "chain" and extra.chain_to == "pkg" and extra.output_path == arc.output_path
+       and extra.fpkg_inner_mode == arc.fpkg_inner_mode and extra.fpkg_content_id == "" and extra.patch_source is None,
+       f"{extra.operation}/{getattr(extra, 'chain_to', None)}/{getattr(extra, 'fpkg_content_id', None)!r}")
     # 7b) sibling jobs from one archive share COMPRESSION only — never the first game's identity
     tpl = app._fpkg_compression_of(arc)
     _build_opts = {"inner", "backend", "level", "dll", "retail_normalize", "hdr_flag", "regen_playgo", "fake_sign"}
@@ -225,53 +226,78 @@ try:
     # 8) remembered format drives a browsed / dropped .ffpfsc: .pkg → fPKG build, .ffpfsc → unpack
     app.output_format_var.set("pkg"); app.source_var.set(str(FF)); n5 = len(app.queue); app.add_source_to_queue(); root.update()
     ok("drop.ffpfsc.remembered-pkg", len(app.queue) == n5 + 1 and app.queue[-1].operation == "fpkg-build", getattr(app.queue[-1], "operation", None))
+    fb = app.queue[-1]
     app.output_format_var.set("ffpfsc"); app.source_var.set(str(FF)); n6 = len(app.queue); app.add_source_to_queue(); root.update()
     ok("drop.ffpfsc.remembered-ffpfsc", len(app.queue) == n6 + 1 and app.queue[-1].operation == "unpack", getattr(app.queue[-1], "operation", None))
     ok("format.legacy-bool-synced", app.output_compressed_var.get() is True, str(app.output_compressed_var.get()))
-    # 8b) edit IN PLACE keeps bundle tags and queue position across pack → pkg → pack
+    # 8b) editing keeps the queue position and the bundle tag across pack → .pkg → .ffpfs
     bi = m.GameItem(HBT); bi.bundle_subfolder = "Bundle X"; bi.output_compressed = True; app.queue.append(bi); app.update_queue_box()
     bidx = app.queue.index(bi)
-    e1 = m.PackDialog(app, item=bi); root.update(); e1.set_format("pkg"); root.update(); e1._add(); root.update()
-    ok("edit.inplace.pack-to-pkg", app.queue[bidx] is bi and bi.operation == "fpkg-build" and bi.bundle_subfolder == "Bundle X"
-       and bi.fpkg_content_id == "UP9000-PPSA99099_00-PROSPERO00000000", f"{bi.operation} errors={errors[-1:]}")
-    e2 = m.PackDialog(app, item=bi); root.update(); e2.set_format("ffpfs"); root.update(); e2._add(); root.update()
-    ok("edit.inplace.pkg-to-pack", app.queue[bidx] is bi and bi.operation == "pack" and bi.output_compressed is False
-       and "fpkg_level" not in vars(bi) and bi.bundle_subfolder == "Bundle X", f"{bi.operation} errors={errors[-1:]}")
+    e1 = m.JobDialog(app, item=bi); root.update()
+    ok("edit.pack-opens-as-ffpfsc", e1._to_key() == "ffpfsc", e1._to_key())
+    e1.to_var.set(L["pkg"]); root.update(); e1._add(); root.update()
+    b1 = app.queue[bidx]
+    ok("edit.inplace.pack-to-pkg", b1.chain_to == "pkg" and b1.bundle_subfolder == "Bundle X" and b1.fpkg_content_id == CID,
+       f"{getattr(b1, 'chain_to', None)} errors={errors[-1:]}")
+    e2 = m.JobDialog(app, item=b1); root.update(); e2.to_var.set(L["ffpfs"]); root.update(); e2._add(); root.update()
+    b2 = app.queue[bidx]
+    ok("edit.inplace.pkg-to-pack", b2.chain_to == "ffpfs" and b2.output_compressed is False and "fpkg_level" not in vars(b2)
+       and b2.bundle_subfolder == "Bundle X", f"{getattr(b2, 'chain_to', None)} errors={errors[-1:]}")
     # 8c) a pending identity never lingers past a failed add; fPKG extract bypasses the pack space gate
     app._pending_fpkg_identity = (HBT, {"content_id": "X"}); app.source_var.set(str(S / "does-not-exist")); app.add_source_to_queue(); root.update()
     ok("pending-identity.cleared-on-error", app._pending_fpkg_identity is None, str(app._pending_fpkg_identity))
     if pkg:
         ok("space-gate.fpkg-extract-proceeds", app._space_gate(ie, OUT) == "proceed", "")
-    # 9) mini edit dialog for fpkg-extract
+    # 9) every older kind of job opens in the editor with its format, and saving keeps its place
+    olds = {"fpkg-build": fb}
     if pkg:
-        app.queue.append(ie); mini = m.JobEditMiniDialog(app, ie); root.update()
-        mini.out_var.set(str(OUT / "ext2")); mini._save(); root.update()
-        ok("mini.edit.fpkg-extract", str(ie.output_path) == str(OUT / "ext2"), str(ie.output_path))
-    # 10) queue rendering with badges + details + tune-bar note
+        olds["fpkg-extract"] = m.GameItem.from_fpkg_extract(pkg, output_path=str(OUT / "ext"))
+    olds["unpack"] = m.GameItem.from_pfs_image(FF)
+    dec = m.GameItem.from_pfs_image(FF); dec.unwrap = False; olds["unpack-decompress"] = dec
+    olds["fake-sign"] = m.GameItem.from_fake_sign(HBT)
+    olds["patch"] = m.GameItem.from_patch(HBT, HBT, output_path=str(OUT))
+    want = {"fpkg-build": "pkg", "fpkg-extract": "folder", "unpack": "folder", "unpack-decompress": "ffpfs",
+            "fake-sign": "folder", "patch": "ffpfsc"}
+    for name, it in olds.items():
+        if it not in app.queue:
+            app.queue.append(it)
+        i = app.queue.index(it)
+        ed = m.JobDialog(app, item=it); root.update()
+        extra = ""
+        if name == "fake-sign":
+            extra = "" if ed.sign_var.get() else " sign not preset"
+        if name == "patch":
+            extra = "" if (ed.patch_on_var.get() and ed.patch_var.get() == str(HBT)) else " patch not preset"
+        ok(f"edit.opens.{name}", ed._to_key() == want[name] and not extra, f"to={ed._to_key()}{extra}")
+        ed.destroy()
+    if pkg:
+        it = olds["fpkg-extract"]; i = app.queue.index(it)
+        ed = m.JobDialog(app, item=it); root.update(); ed.out_var.set(str(OUT / "ext2")); ed._add(); root.update()
+        ok("edit.saves.fpkg-extract", app.queue[i].chain_to == "folder" and str(app.queue[i].output_path) == str(OUT / "ext2"),
+           f"{getattr(app.queue[i], 'chain_to', None)} {getattr(app.queue[i], 'output_path', None)}")
+    # 10) queue rendering with badges + details
+    if pkg:
+        app.queue.append(m.GameItem.from_fpkg_extract(pkg, output_path=str(OUT / "ext3")))
     app.update_queue_box(); root.update()
     rows = [app.queue_listbox.get(i) for i in range(app.queue_listbox.size())]
     ok("queue.badges", any("fPKG-BD" in r for r in rows) and (not pkg or any("fPKG-EX" in r for r in rows)), rows[:2])
-    app.update_game_details(q); ok("details.mode", "Build fPKG" in app.title_var.get(), app.title_var.get())
-    ok("details.tune-note", "fPKG build selected" in app.tune_note_var.get(), app.tune_note_var.get()[:60])
-    # 11) double-click dispatch opens the Pack dialog for fpkg-build (no exception)
-    app.queue_listbox.selection_clear(0, "end"); idx = app.queue.index(q); app.queue_listbox.selection_set(idx)
+    app.update_game_details(fb); ok("details.mode", "Build fPKG" in app.title_var.get(), app.title_var.get())
+    # 11) double-click opens the editor for an fPKG job (no exception)
+    app.queue_listbox.selection_clear(0, "end"); idx = app.queue.index(fb); app.queue_listbox.selection_set(idx)
     app._on_queue_double_click(None); root.update()
-    ok("doubleclick.dispatch", not any("Could not open editor" in str(x) for x in errors), "")
+    ok("doubleclick.dispatch", not any("Could not open" in str(x) for x in errors) and bool(app._panels.stack)
+       and isinstance(app._panels.stack[-1], m.JobDialog), "")
     close_toplevels()
-    # 12) one door: the separate Build-fPKG dialog is gone
-    ok("one-door.no-FpkgBuildDialog", not hasattr(m, "FpkgBuildDialog"), "")
-    # 13) dialog sizing: the window follows its content in every state (compact / Edit… / pack)
-    dlg7 = m.PackDialog(app, fmt="pkg"); root.update(); dlg7.update_idletasks()
-    req_c = dlg7.winfo_reqheight(); h_c = dlg7._height
-    ok("dialog.pkg.compact.fits", 0 < req_c <= h_c and h_c < 620, f"req={req_c} h={h_c}")
-    dlg7.set_advanced(True); root.update(); dlg7.update_idletasks()
-    req_a = dlg7.winfo_reqheight(); h_a = dlg7._height
-    ok("dialog.pkg.advanced.fits", 0 < req_a <= h_a and h_a > h_c and dlg7.irow.winfo_manager() == "pack" and dlg7.crow.winfo_manager() == "pack"
-       and "Hide" in dlg7._edit_btn.cget("text"), f"req={req_a} h={h_a}")
-    dlg7.set_advanced(False); root.update()
-    ok("dialog.pkg.hide-again", dlg7.irow.winfo_manager() == "" and dlg7._height == h_c, f"h={dlg7._height}")
-    dlg7.set_format("ffpfsc"); root.update(); dlg7.update_idletasks()
-    req_pack = dlg7.winfo_reqheight(); ok("dialog.pack.fits", 0 < req_pack <= dlg7._height <= 460, f"req={req_pack} h={dlg7._height}")
+    # 12) one door: the separate dialogs are gone
+    ok("one-door.old-dialogs-gone", not any(hasattr(m, n) for n in ("FpkgBuildDialog", "PackDialog", "PatchDialog",
+                                                                   "ConverterDialog", "JobEditMiniDialog")), "")
+    # 13) "More options…" folds the identity and codec rows in and out
+    dlg7 = m.JobDialog(app, init_src=str(HBT), init_to="pkg"); root.update()
+    dlg7._pkg_more_btn.invoke(); root.update()
+    ok("dialog.pkg.more-options", dlg7._pkg_more_box.winfo_manager() == "pack" and "Fewer" in dlg7._pkg_more_btn.cget("text"),
+       dlg7._pkg_more_btn.cget("text"))
+    dlg7._pkg_more_btn.invoke(); root.update()
+    ok("dialog.pkg.fewer-again", dlg7._pkg_more_box.winfo_manager() == "" and "More" in dlg7._pkg_more_btn.cget("text"), "")
     dlg7.destroy()
     # 14) settings var present
     ok("settings.pubtools_var", hasattr(app, "pubtools_dll_var"), "")
@@ -301,15 +327,15 @@ try:
     cmdg, _, outg, _ = app.build_command(gi)
     exp_dir = OUT / "LibProsperoPKG [PPSA99099] [v01.000.000]"
     outfile = Path(cmdg[cmdg.index(str(HBT)) + 1])
-    ok("organize.pack.folder+file", outg == exp_dir and outfile.parent == exp_dir and outfile.name == "LibProsperoPKG [PPSA99099] [v01.000].ffpfsc", f"{outg} | {outfile.name}")
+    ok("organize.pack.folder+file", outg == exp_dir and outfile.parent == exp_dir and outfile.name == "LibProsperoPKG [PPSA99099] [v01.000] [fw2.00].ffpfsc", f"{outg} | {outfile.name}")
     idf = app._game_identity(m.GameItem.from_exfat(FF))
     ok("organize.identity.from-ffpfsc", bool(idf) and idf.get("title_id") == "PPSA99099" and str(idf.get("version", "")).startswith("01.000") and idf.get("title") == "LibProsperoPKG", str(idf))
     fi2 = app._fpkg_item_for(FF, dict(app.fpkg_defaults), output_path=str(OUT)); fi2.auto_organize = True
     cmdf2, _, outf2, _ = app.build_command(fi2)
-    ok("organize.fpkg.folder+name", outf2 == exp_dir and getattr(fi2, "_organized_pkg_name", None) == "LibProsperoPKG [PPSA99099] [v01.000].pkg", f"{outf2} | {getattr(fi2, '_organized_pkg_name', None)}")
+    ok("organize.fpkg.folder+name", outf2 == exp_dir and getattr(fi2, "_organized_pkg_name", None) == "LibProsperoPKG [PPSA99099] [v01.000] [fw2.00].pkg", f"{outf2} | {getattr(fi2, '_organized_pkg_name', None)}")
     exp_dir.mkdir(parents=True, exist_ok=True); dummy = exp_dir / "UP9000-PPSA99099_00-PROSPERO00000000-A0100-V0100.pkg"; dummy.write_bytes(b"x")
     renamed = app._finalize_pkg_name(fi2, dummy)
-    ok("organize.fpkg.renamed", renamed.name == "LibProsperoPKG [PPSA99099] [v01.000].pkg" and renamed.exists() and not dummy.exists(), str(renamed.name))
+    ok("organize.fpkg.renamed", renamed.name == "LibProsperoPKG [PPSA99099] [v01.000] [fw2.00].pkg" and renamed.exists() and not dummy.exists(), str(renamed.name))
     # the real worker path: the backend's "[OK] fPKG complete: <path>" marker pre-sets output_path
     # and _find_output returns from that branch — the rename must happen there (1.1.4 missed it)
     fi3 = app._fpkg_item_for(FF, dict(app.fpkg_defaults), output_path=str(OUT)); fi3.auto_organize = True
@@ -320,8 +346,30 @@ try:
     found = w._find_output()
     # the organized name already exists from the step above: the rename must keep BOTH files
     # (never replace an earlier build) and give the new one a " (2)" suffix
-    ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000] (2).pkg"
+    ok("organize.worker.marker-rename", found and Path(w.output_path).name == "LibProsperoPKG [PPSA99099] [v01.000] [fw2.00] (2).pkg"
        and Path(w.output_path).exists() and not dummy2.exists() and renamed.exists(), f"{found} {w.output_path}")
+    ok("organize.fw-tag", m.organized_names({"title": "Example Quest", "title_id": "PPSA99098", "version": "01.200.007",
+                                             "fw": "10.00"}, ".pkg")[1] == "Example Quest [PPSA99098] [v01.200] [fw10.00].pkg",
+       str(m.organized_names({"title": "Example Quest", "title_id": "PPSA99098", "version": "01.200.007", "fw": "10.00"}, ".pkg")))
+    class _Job: pass
+    _j = _Job(); _j.patch_source = None; _j.backport_target = "7.61"
+    _k = _Job(); _k.patch_source = None; _k.backport_target = None
+    ok("organize.fw-after-backport", app._job_fw(_j, "10.00") == "7.61" and app._job_fw(_j, "6.00") == "6.00"
+       and app._job_fw(_k, "10.00") == "10.00" and app._job_fw(_j, "") == "",
+       f"{app._job_fw(_j, '10.00')} {app._job_fw(_j, '6.00')} {app._job_fw(_k, '10.00')}")
+    import test_backport as _tbk
+    _pd = S / "patch_with_eboot"; _pd.mkdir(exist_ok=True)
+    (_pd / "eboot.bin").write_bytes(_tbk._elf_with_param(0x61000001, 0x4942524F, 0x12590001, 0x11000043))
+    _pz = S / "patch_with_eboot.zip"
+    with zipfile.ZipFile(_pz, "w") as _z:
+        _z.write(_pd / "eboot.bin", "Game/eboot.bin")
+    _np = S / "patch_without_eboot"; _np.mkdir(exist_ok=True); (_np / "data.bin").write_bytes(b"x")
+    _k.patch_source = str(_pd)
+    _fw_folder = app._job_fw(_k, "10.00")
+    _k.patch_source = str(_pz); _fw_zip = app._job_fw(_k, "10.00")
+    _k.patch_source = str(_np); _fw_none = app._job_fw(_k, "10.00")
+    ok("organize.fw-from-patch", (_fw_folder, _fw_zip, _fw_none) == ("11.00", "11.00", "10.00"),
+       str((_fw_folder, _fw_zip, _fw_none)))
     ok("organize.title-cleanup", m.canonical_game_title("a large retail title™") == "a large retail title"
        and m.organized_names({"title": "Example Quest Deluxe Edition", "title_id": "PPSA99098", "version": "01.200.007"}, ".ffpfsc")
        == ("Example Quest Deluxe Edition [PPSA99098] [v01.200.007]", "Example Quest Deluxe Edition [PPSA99098] [v01.200].ffpfsc"),
@@ -353,8 +401,9 @@ try:
     _, _, outb3, _ = app.build_command(bi3)
     ok("mirror.elsewhere-kept", outb3 == OUT / "lib" / "convert", str(outb3))
     # dialog: checkbox present, remembered default, out label reflects it
-    dlg9 = m.PackDialog(app, source=HBT, fmt="ffpfsc"); root.update()
-    ok("dialog.organize.checkbox", hasattr(dlg9, "organize_var") and dlg9.organize_var.get() is True and "auto-organize" in dlg9.out_label.get(), dlg9.out_label.get()[:60])
+    dlg9 = m.JobDialog(app, init_src=str(HBT), init_to="ffpfsc"); root.update()
+    ok("dialog.organize.checkbox", dlg9.organize_var.get() is True and "Auto-organize" in dlg9._organize_cb.cget("text"),
+       dlg9._organize_cb.cget("text")[:60])
     dlg9.destroy()
     # snapshot: a fresh pack item gets the remembered flag
     app.auto_organize_var.set(False); si = m.GameItem(HBT); app.queue.append(si); app.update_queue_box()
@@ -490,6 +539,119 @@ try:
     ok("job.queue-row", "→ .ffpfsc" in row and "sign" in row, row)
     app._on_queue_select(); root.update()
     ok("job.details.mode-sentence", "Sign, then build .ffpfsc" in app.title_var.get(), app.title_var.get())
+    # J6b) compression per job: one row under the format, its own control per format
+    jc = m.JobDialog(app, init_src=str(HBT)); root.update()
+    jc.backport_on_var.set(False); jc.patch_on_var.set(False); jc.sign_var.set(False)
+    jc.to_var.set(".ffpfsc"); root.update()
+    ok("job.compression.ffpfsc-level", jc._comp_row.winfo_manager() == "pack" and jc._comp_ffpfsc.winfo_manager() == "pack"
+       and jc._comp_pkg.winfo_manager() == "", f"{jc._comp_row.winfo_manager()!r} {jc._comp_ffpfsc.winfo_manager()!r}")
+    jc.to_var.set(".pkg"); root.update()
+    ok("job.compression.pkg-speed", jc._comp_pkg.winfo_manager() == "pack" and jc._comp_ffpfsc.winfo_manager() == "",
+       f"{jc._comp_pkg.winfo_manager()!r} {jc._comp_ffpfsc.winfo_manager()!r}")
+    jc.to_var.set(".ffpfs"); root.update()
+    ok("job.compression.none-uncompressed", jc._comp_row.winfo_manager() == "", repr(jc._comp_row.winfo_manager()))
+    _lvl0 = app.compression_level_var.get()
+    jc.to_var.set(".ffpfsc"); jc.level_var.set(3); jc.out_var.set(str(OUT / "job")); root.update()
+    ok("job.compression.label", jc._level_lbl.cget("text") == "level 3", jc._level_lbl.cget("text"))
+    n0 = len(app.queue); jc._add(); root.update(); jl = app.queue[-1]
+    jlcmd, *_ = app.build_command(jl)
+    ok("job.compression.per-job-level", len(app.queue) == n0 + 1 and jl.compression_level == 3
+       and jlcmd[jlcmd.index("--compression-level") + 1] == "3", " ".join(jlcmd[-12:]))
+    ok("job.compression.remembered", app.compression_level_var.get() == 3, str(app.compression_level_var.get()))
+    app.compression_level_var.set(9)                     # the default moves; the queued job keeps its own
+    jlcmd, *_ = app.build_command(jl)
+    ok("job.compression.job-keeps-its-level", jlcmd[jlcmd.index("--compression-level") + 1] == "3", " ".join(jlcmd[-12:]))
+    je = m.JobDialog(app, item=jl); root.update()
+    ok("job.compression.edit-prefill", je.level_var.get() == 3, str(je.level_var.get()))
+    je.destroy()
+    ok("job.compression.details-chip", app._job_recipe(jl, detail=True)[-1] == ".ffpfsc, level 3"
+       and app._job_recipe(jl)[-1] == ".ffpfsc", str(app._job_recipe(jl, detail=True)))
+    app.queue.remove(jl); app.compression_level_var.set(_lvl0)
+    # J6c) the help line keeps one height whatever option the pointer is over
+    jh = m.JobDialog(app, init_src=str(HBT)); root.update()
+    for _w in (600, 860):                # a narrow and a wide editor; hidden windows report no width
+        jh._help_wrap(width=_w); root.update_idletasks()
+        _heights = set()
+        for _txt in [jh._HELP_IDLE, *jh._HELP.values()]:
+            jh.help_var.set(_txt); root.update_idletasks(); _heights.add(jh._foot.winfo_reqheight())
+        ok(f"job.help.buttons-stay-{_w}", len(_heights) == 1, str(sorted(_heights)))
+    jh.destroy()
+    # J6d) the details pane: facts about the job, a log that fills the height, a failure reason
+    jc2 = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job"))
+    jc2.compression_level = 5
+    app.queue.append(jc2); app.update_queue_box(select_item=jc2); root.update()
+    app.update_game_details(jc2); root.update()
+    _ci = {k: v[0].get() for k, v in app._card_info_rows.items()}
+    ok("card.info.rows", _ci.get("Source") == str(HBT) and "zlib level 5" in _ci.get("Compression", "")
+       and _ci.get("Status") == "Queued" and _ci.get("Changes") == "None", str(_ci))
+    app._retire_failed(jc2, "Failed", "Permission denied: '/Volumes/Out'"); app.update_game_details(jc2)
+    ok("card.info.failure-reason", app._card_info_rows["Status"][0].get() == "Failed: Permission denied: '/Volumes/Out'",
+       app._card_info_rows["Status"][0].get())
+    ok("card.log.takes-the-height", int(app._card_body.grid_rowconfigure(5)["weight"]) == 1
+       and app.log_box.mirror_lines >= 100, f"{app._card_body.grid_rowconfigure(5)} {app.log_box.mirror_lines}")
+    app.log_box.set_mirror_visible(12)
+    for _i in range(30):
+        app.log("INFO", f"card tail line {_i}")
+    pump(lambda: app._log_tail.get("1.0", "end-1c").rstrip().endswith("card tail line 29"), timeout=5.0)
+    _tail = app._log_tail.get("1.0", "end-1c").rstrip().splitlines()
+    ok("card.log.keeps-more-than-four", len(_tail) >= 30 and _tail[-1].endswith("card tail line 29"), str(len(_tail)))
+    app.queue.remove(jc2); app.update_queue_box(); root.update()
+    # J7) backport targets come from the firmware libraries folder, one subfolder per firmware
+    import test_backport as _tb
+    _saved_defaults = json.loads(json.dumps(m.load_settings().get("job_dialog_defaults", {}) or {}))
+    fwr = S / "fwroot"
+    _tb._fw_lib(fwr / "9.60", 0x11590001, 0x09600004)
+    _tb._fw_lib(fwr / "10.01", 0x12090001, 0x10010000)
+    _tb._fw_lib(fwr / "5.02", 0x09690001, 0x05100023)          # holds newer (5.10) files
+    _st = m._firmware_folder_status(str(fwr))
+    ok("settings.fw-status", _st == "3 firmware folder(s) found: 5.02 … 10.01.", _st)
+    app.fw_libs_var.set(str(fwr))
+    jd7 = m.JobDialog(app, init_src=str(HBT)); root.update()
+    _vals = list(jd7._target_menu.cget("values"))
+    ok("job.backport.targets-from-fw-root", _vals == ["5.02", "6.02", "7.61", "9.60", "10.xx", "10.01"], str(_vals))
+    jd7.backport_on_var.set(True); jd7.backport_target_var.set("9.60"); root.update()
+    ok("job.backport.hint-derived", "SDK values from your 9.60 libraries" in jd7.backport_hint_var.get(),
+       jd7.backport_hint_var.get())
+    jd7.backport_target_var.set("5.02"); root.update()
+    ok("job.backport.hint-problem", "cannot be used" in jd7.backport_hint_var.get()
+       and "5.10" in jd7.backport_hint_var.get(), jd7.backport_hint_var.get())
+    jd7.to_var.set(".ffpfsc"); jd7.out_var.set(str(OUT / "job")); root.update()
+    n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
+    ok("job.backport.add-refuses-unusable-target", len(app.queue) == n0 and any("5.10" in x for x in errors),
+       str(errors))
+    jd7.backport_target_var.set("9.60"); jd7.backport_libs_var.set(str(fwr)); root.update()
+    n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
+    ok("job.backport.refuses-firmware-folder-as-patched", len(app.queue) == n0
+       and any("original libraries" in x for x in errors), str(errors))
+    jd7.backport_libs_var.set(""); jd7.backport_target_var.set("5.02"); root.update()
+    jd7._check_compat()
+    pump(lambda: jd7.check_var.get() not in ("", "Checking…"), timeout=60.0)
+    ok("job.check.shows-verdict", jd7.check_var.get().startswith(("Not checked", "The game uses", "Firmware",
+                                                                  "Every function")), jd7.check_var.get())
+    jd7.backport_target_var.set("9.60"); root.update(); errors.clear(); jd7._add(); root.update()
+    j7 = app.queue[-1]
+    jcmd7, *_ = app.build_command(j7)
+    ok("job.backport.cmd-derived-target", len(app.queue) == n0 + 1 and j7.backport_target == "9.60"
+       and jcmd7[jcmd7.index("--backport-target") + 1] == "9.60"
+       and jcmd7[jcmd7.index("--fw-libs-root") + 1] == str(fwr), " ".join(jcmd7[-14:]) + f" errors={errors}")
+    app.queue.remove(j7)
+    app.fw_libs_var.set("")
+    jd8 = m.JobDialog(app, init_src=str(HBT)); root.update()
+    jd8._check_compat(); root.update()
+    ok("job.check.needs-fw-root", "Set the firmware libraries folder" in jd8.check_var.get(), jd8.check_var.get())
+    jd8.destroy()
+    # J8) the detection line reads the SDK of a fake-signed eboot too
+    sg = S / "signed_game"; (sg / "sce_sys").mkdir(parents=True)
+    (sg / "sce_sys" / "param.json").write_text(json.dumps({
+        "titleId": "PPSA00002", "contentId": "UP0000-PPSA00002_00-EXAMPLE000000000",
+        "contentVersion": "01.000.000", "localizedParameters": {"defaultLanguage": "en-US",
+                                                                "en-US": {"titleName": "Signed"}}}),
+        encoding="utf-8")
+    (sg / "eboot.bin").write_bytes(_tb._fself(_tb._signable_elf(0x11590001, 0x09600004), ps5=True))
+    jd9 = m.JobDialog(app, init_src=str(sg)); root.update()
+    ok("job.detect.sdk-of-signed-eboot", "SDK 9.60" in jd9.detect_var.get(), jd9.detect_var.get())
+    jd9.destroy()
+    m.save_settings({"job_dialog_defaults": _saved_defaults})   # J7 remembered a 9.60 backport for folders
     # J7) a parent folder makes one job per game
     parent = S / "parent"; parent.mkdir(exist_ok=True)
     for nme in ("A", "B"):
@@ -522,8 +684,248 @@ try:
     ok("message.prompts-own-window", all(issubclass(c, m.MessageWindow) for c in
        (m.SpaceDiagnosticsDialog, m.ArchivePasswordPrompt)), "")
     ok("work-surface.panels", all(issubclass(c, m.EmbeddedDialog) for c in
-       (m.JobDialog, m.PfsBrowserDialog, m.JobEditMiniDialog, m.FirstRunWizard)), "")
+       (m.JobDialog, m.PfsBrowserDialog, m.FirstRunWizard)), "")
     sd.destroy(); ed.destroy(); root.update()
+
+    # W) main-window wiring: every sidebar entry, header button, card action, menu entry and
+    #    shortcut reaches its handler. Buttons that would start a real job, delete files or
+    #    open Finder are checked by the handler they are bound to instead of being clicked.
+    close_toplevels(); root.update()
+    _fd_calls = []
+    _fd_saved = (m.filedialog.askdirectory, m.filedialog.askopenfilename)
+    m.filedialog.askdirectory = lambda *a, **k: (_fd_calls.append(("dir", k.get("title", ""))), "")[1]
+    m.filedialog.askopenfilename = lambda *a, **k: (_fd_calls.append(("file", k.get("title", ""))), "")[1]
+    _popup_saved = m.tk.Menu.tk_popup
+    _menus = []
+    m.tk.Menu.tk_popup = lambda self, *a, **k: _menus.append(self)   # a real popup is modal
+
+    def _buttons(w):
+        found, todo = {}, [w]
+        while todo:
+            x = todo.pop()
+            if isinstance(x, m.IconButton):
+                found.setdefault(x._text, x)
+            todo.extend(x.winfo_children())
+        return found
+
+    def _fire(widget, seq):
+        """Run the handler Tk has bound to *seq*: a withdrawn window gets no key events."""
+        mm = re.search(r"\[(\S+)((?: %\S)+)\]", widget.bind(seq))
+        return widget.tk.call(mm.group(1), *(["0"] * len(mm.group(2).split())))
+
+    def _top():
+        return type(app._panels.stack[-1]).__name__ if app._panels.stack else None
+
+    def _select(i):
+        app.queue_listbox.selection_clear(0, "end"); app.queue_listbox.selection_set(i)
+        app._on_queue_select(None); root.update()
+
+    class _Ev:
+        x_root = y_root = 0
+
+    try:
+        # sidebar views, and every Settings page builds and shows
+        for key in ("history", "log", "queue", "settings"):
+            app._nav[key].invoke(); root.update()
+            ok(f"wire.nav.{key}", app._view == key and app._nav[key]._selected, f"view={app._view}")
+        sv, bad = app._settings_view, []
+        for key, *_ in sv.PAGES:
+            try:
+                sv._nav[key].invoke(); root.update()
+                if not (sv._nav[key]._selected and key in sv._page_frames):
+                    bad.append(key)
+            except Exception as e:
+                bad.append(f"{key}: {e!r}")
+        ok("wire.settings.every-page", not bad, str(bad))
+        app._nav["queue"].invoke(); root.update()
+
+        # tools
+        tools = {b._text: b for b in app._nav_all}
+        ok("wire.tool.clean-temp", tools["Clean temp"]._command == app.clear_temp_files, "")
+        tools["Organize"].invoke(); root.update()
+        ok("wire.tool.organize", any(k == "dir" and "Organize" in t for k, t in _fd_calls), str(_fd_calls))
+        tools["Look inside"].invoke(); root.update()
+        ok("wire.tool.look-inside", _top() == "PfsBrowserDialog", str(_top()))
+        ok("wire.panel.sidebar-paused", all(b._state == "disabled" for b in app._nav_all), "")
+        app._panels._on_key("<Escape>", None); root.update()
+        ok("wire.panel.escape-closes", _top() is None and all(b._state == "normal" for b in app._nav_all), str(_top()))
+
+        # header; Return in Add job adds the job through the panel host
+        ok("wire.header.start", app.start_btn._command == app.start, "")
+        app._add_btn.invoke(); root.update()
+        ok("wire.header.add-job", _top() == "JobDialog", str(_top()))
+        close_toplevels(); root.update()
+        app.open_job_dialog(str(HBT)); root.update()
+        jd = app._panels.stack[-1]
+        pump(lambda: getattr(jd, "_kind", "") not in ("", None), timeout=15)
+        jd.to_var.set(".ffpfsc"); jd.out_var.set(str(OUT / "wire")); root.update()
+        n0 = len(app.queue)
+        app._panels._on_key("<Return>", None); root.update()
+        ok("wire.panel.return-adds-job", len(app.queue) == n0 + 1, f"+{len(app.queue) - n0}, kind={getattr(jd, '_kind', '?')}")
+        close_toplevels(); root.update()
+
+        # compression is a job setting now: no compression line under the queue
+        ok("wire.queue.no-compression-line", "Change" not in _buttons(app._paned_q)
+           and not hasattr(app, "_open_tuning"), str(sorted(_buttons(app._paned_q))))
+
+        # primary action: Add job while the queue is empty, Start once it has jobs
+        items = [m.GameItem(HBT) for _ in range(3)]
+        app.queue[:] = []; app.update_queue_box(); root.update()
+        ok("wire.primary.empty-queue", app._add_btn.variant == "primary" and app.start_btn._state == "disabled",
+           f"add={app._add_btn.variant} start={app.start_btn._state}")
+        app.queue[:] = items; app.update_queue_box(); root.update()
+        ok("wire.primary.with-jobs", app.start_btn.variant == "primary" and app.start_btn._state == "normal"
+           and app._add_btn.variant == "secondary", f"start={app.start_btn.variant}/{app.start_btn._state}")
+
+        # the details pane: closed at first, a click on a job opens it, the header button
+        # and the View menu's shortcut toggle it, and an empty queue closes it
+        ok("wire.details.closed-at-start", not app._inspector_open and str(app._card_pane) not in [str(x) for x in app._paned_q.panes()], "")
+        app.queue_listbox.selection_clear(0, "end"); app.queue_listbox.selection_set(1)
+        app._on_queue_clicked(); root.update()
+        ok("wire.details.opens-on-click", app._inspector_open and str(app._card_pane) in [str(x) for x in app._paned_q.panes()], "")
+        app._details_btn.invoke(); root.update()
+        ok("wire.details.header-button", not app._inspector_open and str(app._card_pane) not in [str(x) for x in app._paned_q.panes()], "")
+        _fire(root, m.DETAILS_SEQ); root.update()
+        ok("wire.details.shortcut", app._inspector_open, "")
+        ok("wire.details.menu-label", app._view_menu.entrycget(app._details_menu_index, "label") == "Hide Details",
+           app._view_menu.entrycget(app._details_menu_index, "label"))
+
+        # Start becomes Stop while the queue runs
+        app._batch_running = True; app._sync_run_ui(); root.update()
+        ok("wire.header.stop-while-running", app.stop_btn.winfo_manager() == "grid" and app.start_btn.winfo_manager() == ""
+           and app.stop_btn._command == app.cancel and app.stop_btn._state == "normal",
+           f"stop={app.stop_btn.winfo_manager()!r} start={app.start_btn.winfo_manager()!r}")
+        app._batch_running = False; app._sync_run_ui(); root.update()
+        ok("wire.header.start-when-idle", app.start_btn.winfo_manager() == "grid" and app.stop_btn.winfo_manager() == "", "")
+
+        # the job card and its actions
+        _select(1)
+        acts = _buttons(app._card_body)
+        ok("wire.card.shows-selected", app._card_body.winfo_manager() == "grid" and bool(app.card_title_var.get()),
+           app.card_title_var.get())
+        acts["Full log"].invoke(); root.update()
+        ok("wire.card.full-log", app._view == "log", f"view={app._view}")
+        app._nav["queue"].invoke(); root.update()
+        acts["Command"].invoke(); root.update()
+        ok("wire.card.command", app._cmd_frame.winfo_manager() != "", repr(app._cmd_frame.winfo_manager()))
+        acts["Edit"].invoke(); root.update()
+        ok("wire.card.edit", _top() == "JobDialog", str(_top()))
+        close_toplevels(); root.update()
+        _select(1)
+        acts["Remove"].invoke(); root.update()
+        ok("wire.card.remove", len(app.queue) == 2 and all(x is not items[1] for x in app.queue), f"{len(app.queue)} left")
+        ok("wire.card.cancel", app.cancel_btn._command == app.cancel, "")
+
+        # the row's context menu
+        app.queue[:] = items; app.update_queue_box(); root.update()
+        _select(0)
+
+        def _menu_do(label, row):
+            app._queue_context_menu(_Ev(), row)
+            mn = _menus[-1]
+            labels = {mn.entrycget(i, "label"): i for i in range(mn.index("end") + 1) if mn.type(i) == "command"}
+            mn.invoke(labels[label]); root.update()
+        _menu_do("Move down", 0)
+        ok("wire.menu.move-down", app.queue[1] is items[0], "")
+        _menu_do("Move up", 1)
+        ok("wire.menu.move-up", app.queue[0] is items[0], "")
+        _menu_do("Edit job…", 0)
+        ok("wire.menu.edit", _top() == "JobDialog", str(_top()))
+        close_toplevels(); root.update()
+        _select(0)
+        _menu_do("Remove", 0)
+        ok("wire.menu.remove", len(app.queue) == 2 and all(x is not items[0] for x in app.queue), f"{len(app.queue)} left")
+
+        # shortcuts, run through the handlers Tk has bound on the window
+        for seq, view in (("<Command-Key-2>", "history"), ("<Command-Key-3>", "log"),
+                          ("<Command-Key-1>", "queue"), ("<Command-comma>", "settings")):
+            _fire(root, seq); root.update()
+            ok(f"wire.shortcut.{view}", app._view == view, f"{seq} -> view={app._view}")
+        app._nav["queue"].invoke(); root.update()
+        _fire(root, "<Command-n>"); root.update()
+        ok("wire.shortcut.add-job", _top() == "JobDialog", str(_top()))
+        _fire(root, "<Command-Key-2>"); root.update()
+        ok("wire.shortcut.ignored-while-panel-open", app._view == "queue", f"view={app._view}")
+        close_toplevels(); root.update()
+
+        # History and Log view buttons
+        app._nav["history"].invoke(); root.update()
+        hv = _buttons(app._views["history"])
+        ok("wire.history.buttons", hv["Copy last result"]._command == app.copy_last_result
+           and hv["Open output folder"]._command == app.open_output_folder, str(sorted(hv)))
+        app._nav["log"].invoke(); root.update()
+        lv = _buttons(app._views["log"])
+        ok("wire.log.buttons", lv["Clear"]._command == app.clear_logs and lv["Raw log"]._command == app.open_raw_log
+           and lv["Diagnostics"]._command == app.export_diagnostics, str(sorted(lv)))
+        app.log("INFO", "wiring probe")
+        arrived = pump(lambda: "wiring probe" in app.log_box.get("1.0", "end"), timeout=5)
+        lv["Clear"].invoke(); root.update()
+        ok("wire.log.clear", arrived and "wiring probe" not in app.log_box.get("1.0", "end"),
+           f"arrived={arrived}, left={app.log_box.get('1.0', 'end-1c')[:60]!r}")
+        app._nav["queue"].invoke(); root.update()
+
+        # the menu bar: every entry that opens something reaches its handler
+        mb = root.nametowidget(root["menu"])
+        menus = {mb.entrycget(i, "label"): root.nametowidget(mb.entrycget(i, "menu"))
+                 for i in range(mb.index("end") + 1) if mb.type(i) == "cascade" and mb.entrycget(i, "label")}
+        ok("wire.menu.bar", {"File", "Edit", "View", "Help"} <= set(menus), str(sorted(menus)))
+
+        def _entry(menu, label):
+            return next(i for i in range(menu.index("end") + 1)
+                        if menu.type(i) not in ("separator", "tearoff") and menu.entrycget(i, "label") == label)
+        app.queue[:] = items[:1]; app.update_queue_box(); root.update()
+        for label, view in (("History", "history"), ("Log", "log"), ("Queue", "queue")):
+            menus["View"].invoke(_entry(menus["View"], label)); root.update()
+            ok(f"wire.menubar.view-{view}", app._view == view, f"view={app._view}")
+        menus["File"].invoke(_entry(menus["File"], "Add Job…")); root.update()
+        ok("wire.menubar.add-job", _top() == "JobDialog", str(_top()))
+        menus["View"].invoke(_entry(menus["View"], "History")); root.update()
+        ok("wire.menubar.ignored-behind-panel", app._view == "queue", f"view={app._view}")
+        close_toplevels(); root.update()
+        menus["File"].invoke(_entry(menus["File"], "Look Inside…")); root.update()
+        ok("wire.menubar.look-inside", _top() == "PfsBrowserDialog", str(_top()))
+        close_toplevels(); root.update()
+        n_fd = len(_fd_calls)
+        menus["File"].invoke(_entry(menus["File"], "Organize…")); root.update()
+        ok("wire.menubar.organize", len(_fd_calls) == n_fd + 1, str(_fd_calls[n_fd:]))
+        was = app._inspector_open
+        menus["View"].invoke(_entry(menus["View"], "Hide Details" if was else "Show Details")); root.update()
+        ok("wire.menubar.details", app._inspector_open != was, f"{was} -> {app._inspector_open}")
+        ok("wire.menubar.stop-safe-when-idle", (menus["File"].invoke(_entry(menus["File"], "Stop Queue")), not app.cancel_requested)[1], "")
+        if m.IS_MAC:
+            ok("wire.menubar.mac-settings", bool(root.tk.call("info", "commands", "::tk::mac::ShowPreferences")), "")
+            root.tk.call("::tk::mac::ShowPreferences"); root.update()
+            ok("wire.menubar.mac-settings-opens", app._view == "settings", f"view={app._view}")
+            app._nav["queue"].invoke(); root.update()
+
+        # the options' scrollbar decides from heights alone, so showing or hiding it can
+        # never change the decision (the bar blinked twice a second when it decided from
+        # the canvas's scroll fractions)
+        sfd = m.JobDialog(app, init_src=str(HBT)); root.update()
+        body = sfd.body
+        steady = True
+        for req, view, want in ((400, 500, False), (820, 500, True), (820, 900, False), (500, 499, False), (520, 499, True)):
+            body.winfo_reqheight = lambda r=req: r
+            body._parent_canvas.winfo_height = lambda v=view: v
+            seen = []
+            for _ in range(4):
+                body._sb_check(); root.update(); seen.append((body._sb_shown, body._scrollbar.winfo_manager()))
+            steady = steady and all(s == (want, "grid" if want else "") for s in seen)
+        ok("wire.scrollbar.no-blink", steady, str(seen))
+        sfd.destroy(); root.update()
+
+        # theme switch
+        app._set_theme("light"); root.update()
+        ok("wire.theme.light", app.kit.mode == "light" and m.ctk.get_appearance_mode().lower() == "light"
+           and app._appearance_var.get() == "light", app.kit.mode)
+        app._set_theme("dark"); root.update()
+        ok("wire.theme.dark", app.kit.mode == "dark", app.kit.mode)
+    finally:
+        m.filedialog.askdirectory, m.filedialog.askopenfilename = _fd_saved
+        m.tk.Menu.tk_popup = _popup_saved
+        close_toplevels()
+        app.queue[:] = []
+        app.update_queue_box()
 except Exception:
     traceback.print_exc()   # the summary keeps one line; the full trace goes to stderr
     res.append(("driver", False, traceback.format_exc()))

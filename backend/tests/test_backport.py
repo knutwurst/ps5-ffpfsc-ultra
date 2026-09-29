@@ -375,5 +375,291 @@ class AnalyseBackport(unittest.TestCase):
             self.assertEqual(by["libSceCustom"].fakelib_covers, {"AAAAAAAAAAA"})
 
 
+# ── fake-signed sources (SELF) ────────────────────────────────────────────
+MODULE_MAGIC = 0x3C13F4BF
+
+
+def _signable_elf(sdk_ps4: int = 0x12090001, sdk_ps5: int = 0x10000040,
+                  symbols_elf: bytes | None = None) -> bytes:
+    """A small ELF the vendored make_fself accepts (x86-64, SCE dynamic type) with a
+    module param struct and, optionally, the dynamic tables of *symbols_elf*
+    (from _elf_with_imports / _elf_with_exports). As in real files the param
+    struct and PT_DYNAMIC lie inside a PT_LOAD, so a fake-signed copy keeps them."""
+    param = bytearray(40)
+    struct.pack_into("<Q", param, 0x00, 40)
+    struct.pack_into("<I", param, 0x08, MODULE_MAGIC)
+    struct.pack_into("<I", param, 0x0C, 1)
+    struct.pack_into("<I", param, 0x10, sdk_ps4)
+    struct.pack_into("<I", param, 0x14, sdk_ps5)
+    struct.pack_into("<I", param, 0x18, 0xdeadbeef)
+    dyn = dynlib = b""
+    if symbols_elf:
+        for p_type, off, size in bp._iter_phdrs(symbols_elf):
+            if p_type == bp.PT_DYNAMIC:
+                dyn = symbols_elf[off:off + size]
+            elif p_type == bp.PT_SCE_DYNLIBDATA:
+                dynlib = symbols_elf[off:off + size]
+    load_off = 0x200
+    load = bytes(param) + b"\xAA" * 8 + dyn + b"\x55" * 24
+    dyn_off = load_off + len(param) + 8
+    dynlib_off = load_off + len(load)
+    version = b"1.00\x00\x00\x00\x00"
+    version_off = dynlib_off + len(dynlib)
+    phdrs = [(bp.PT_LOAD, 6, load_off, 0, 0, len(load), len(load), 0x4000),
+             (bp.PT_SCE_MODULE_PARAM, 4, load_off, 0, 0, len(param), len(param), 8)]
+    if dyn:
+        phdrs += [(bp.PT_DYNAMIC, 6, dyn_off, 48, 48, len(dyn), len(dyn), 8),
+                  (bp.PT_SCE_DYNLIBDATA, 4, dynlib_off, 0, 0, len(dynlib), 0, 16)]
+    phdrs.append((0x6FFFFF01, 4, version_off, 0, 0, len(version), 0, 16))     # PT_SCE_VERSION
+    ehdr = bytearray(64)
+    ehdr[0:4] = b"\x7fELF"; ehdr[4] = 2; ehdr[5] = 1; ehdr[6] = 1; ehdr[7] = 9
+    struct.pack_into("<2HI3QI6H", ehdr, 16, 0xFE18, 0x3E, 1, 0, 64, 0, 0, 64, 56, len(phdrs), 0, 0, 0)
+    head = bytes(ehdr) + b"".join(struct.pack("<2I6Q", *ph) for ph in phdrs)
+    return head.ljust(load_off, b"\0") + load + dynlib + version
+
+
+def _fself(elf: bytes, ps5: bool = False) -> bytes:
+    """Fake-sign *elf* with the vendored make_fself, as the app's Sign step does."""
+    import contextlib, io
+    from backend import make_fself
+    f = make_fself.ElfFile(ignore_shdrs=True)
+    out = io.BytesIO()
+    with contextlib.redirect_stdout(io.StringIO()):
+        f.load(io.BytesIO(elf))
+        make_fself.SignedElfFile(f).save(out)
+    data = out.getvalue()
+    return (b"\x54\x14\xF5\xEE" + data[4:]) if ps5 else data
+
+
+def _encrypt_flag(signed: bytes) -> bytes:
+    """Mark every data entry of a SELF as encrypted, like a retail file."""
+    buf = bytearray(signed)
+    count = struct.unpack_from("<H", buf, 0x18)[0]
+    for i in range(count):
+        props = struct.unpack_from("<Q", buf, 0x20 + i * 32)[0]
+        if props & (1 << 11):
+            struct.pack_into("<Q", buf, 0x20 + i * 32, props | (1 << 1))
+    return bytes(buf)
+
+
+def _param_words(elf: bytes) -> tuple[int, int]:
+    """(ps4, ps5) SDK words of an ELF image."""
+    _kind, off = bp._find_param_segment(elf)
+    return struct.unpack_from("<2I", elf, off + 0x10)
+
+
+class SignedSources(unittest.TestCase):
+    def test_the_elf_image_of_a_fake_signed_file_is_the_original(self):
+        from backend import self_file
+        elf = _signable_elf()
+        for ps5 in (False, True):
+            signed = _fself(elf, ps5=ps5)
+            img = self_file.parse_self(signed)
+            self.assertIsNotNone(img)
+            self.assertTrue(img.readable)
+            self.assertEqual(img.flavour, "ps5" if ps5 else "ps4")
+            self.assertEqual(self_file.elf_image(signed, img), elf)
+
+    def test_lowering_a_signed_file_changes_only_the_sdk_words(self):
+        from backend import self_file
+        elf = _signable_elf(0x12090001, 0x10000040)
+        signed = _fself(elf, ps5=True)
+        out, changes = bp.lower_sdk_version(signed, "7.61")
+        self.assertEqual([(c.field, c.after) for c in changes if not c.unchanged()],
+                         [("ps4", 0x10590001), ("ps5", 0x07000038)])
+        self.assertEqual(len(out), len(signed))
+        diff = [i for i in range(len(out)) if out[i] != signed[i]]
+        self.assertTrue(diff and len(diff) <= 8, diff)
+        self.assertTrue(max(diff) - min(diff) < 8, "only the two adjacent words change")
+        image = self_file.elf_image(out)
+        self.assertEqual(_param_words(image), (0x10590001, 0x07000038))
+        self.assertEqual(struct.unpack_from("<I", image, 0x200 + 0x18)[0], 0xdeadbeef)
+
+    def test_symbols_are_read_through_the_signature(self):
+        raw = _elf_with_imports([("AAAAAAAAAAA", 0, "libSceX", 0, "libSceX"),
+                                 ("BBBBBBBBBBB", 1, "libSceY", 0, "libSceX")])
+        signed = _fself(_signable_elf(symbols_elf=raw))
+        self.assertEqual([(i.nid, i.library) for i in bp.read_imported_nids(signed)],
+                         [(i.nid, i.library) for i in bp.read_imported_nids(raw)])
+
+    def test_an_encrypted_file_is_refused_not_skipped_silently(self):
+        locked = _encrypt_flag(_fself(_signable_elf(), ps5=True))
+        with self.assertRaises(ValueError):
+            bp.lower_sdk_version(locked, "7.61")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "eboot.bin").write_bytes(locked)
+            (root / "libSceOk.sprx").write_bytes(_fself(_signable_elf()))
+            self.assertEqual([p.name for p in bp.encrypted_selfs(root)], ["eboot.bin"])
+            report = bp.lower_sdk_in_folder(root, "7.61")
+            self.assertEqual([p.name for p in report.encrypted], ["eboot.bin"])
+            self.assertEqual([p.name for p in report.self_patched], ["libSceOk.sprx"])
+            self.assertEqual((root / "eboot.bin").read_bytes(), locked)
+            self.assertEqual(bp.analyse_backport(root, "7.61").unreadable, ["eboot.bin"])
+
+    def test_a_signed_file_in_a_folder_is_lowered_in_place(self):
+        from backend import self_file
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "eboot.bin").write_bytes(_fself(_signable_elf(0x12090001, 0x10000040), ps5=True))
+            report = bp.lower_sdk_in_folder(root, "6.02")
+            self.assertEqual([p.name for p in report.self_patched], ["eboot.bin"])
+            self.assertIn("fake-signed", report.summary())
+            image = self_file.elf_image((root / "eboot.bin").read_bytes())
+            self.assertEqual(_param_words(image), (0x10090001, 0x06000038))
+
+
+class SdkWordsOfFile(unittest.TestCase):
+    def test_raw_signed_and_encrypted_executables(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw.bin").write_bytes(_elf_with_param(bp.PT_SCE_PROCPARAM, 0x4942524F, 0x12090001, 0x10000040))
+            (root / "signed.bin").write_bytes(_fself(_signable_elf(0x11590001, 0x09600004), ps5=True))
+            (root / "locked.bin").write_bytes(_encrypt_flag(_fself(_signable_elf(), ps5=True)))
+            self.assertEqual(bp.sdk_words_of_file(root / "raw.bin"), (0x10000040, 0x12090001))
+            self.assertEqual(bp.sdk_words_of_file(root / "signed.bin", head_size=0x200), (0x09600004, 0x11590001))
+            self.assertIsNone(bp.sdk_words_of_file(root / "locked.bin"))
+            self.assertIsNone(bp.sdk_words_of_file(root / "missing.bin"))
+
+
+# ── one folder per firmware ───────────────────────────────────────────────
+def _fw_lib(folder: Path, ps4: int, ps5: int, name: str = "libSceKernel.sprx", sub: str = "system/common/lib"):
+    d = folder / sub
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_bytes(_elf_with_param(bp.PT_SCE_MODULE_PARAM, MODULE_MAGIC, ps4, ps5))
+
+
+class FirmwareFolders(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name) / "firmware"
+        _fw_lib(self.root / "6.02", 0x10090001, 0x06020004)
+        _fw_lib(self.root / "9.60", 0x11590001, 0x09600004)
+        _fw_lib(self.root / "10.01", 0x12090001, 0x10010000)
+        _fw_lib(self.root / "10.20", 0x12090001, 0x10200006)
+        _fw_lib(self.root / "5.02", 0x09690001, 0x05100023)                # holds 5.10 files
+        (self.root / "notes").mkdir()
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_targets_are_the_public_ones_plus_every_firmware_folder(self):
+        self.assertEqual(bp.available_targets(self.root),
+                         ["5.02", "6.02", "7.61", "9.60", "10.xx", "10.01", "10.20"])
+        self.assertEqual(bp.available_targets(None), ["6.02", "7.61", "10.xx"])
+
+    def test_each_target_reads_its_own_folder(self):
+        self.assertEqual(bp.firmware_folder(self.root, "9.60"), self.root / "9.60")
+        self.assertEqual(bp.firmware_folder(self.root, "10.xx"), self.root / "10.01")
+        self.assertIsNone(bp.firmware_folder(self.root, "8.60"))
+
+    def test_sdk_words_come_from_the_firmware_libraries(self):
+        self.assertEqual(bp.target_words("9.60", self.root), (0x09600004, 0x11590001))
+        self.assertEqual(bp.target_words("7.61", self.root), bp.SDK_TARGETS["7.61"])
+        with self.assertRaises(ValueError):
+            bp.target_words("8.60", self.root)
+        with self.assertRaises(ValueError):
+            bp.target_words("9.60")                     # no firmware folder at all
+
+    def test_a_folder_with_newer_libraries_is_refused(self):
+        self.assertIn("from firmware 5.10", bp.firmware_problem(self.root / "5.02", "5.02"))
+        with self.assertRaises(ValueError):
+            bp.target_words("5.02", self.root)
+        self.assertEqual(bp.firmware_problem(self.root / "9.60", "9.60"), "")
+
+    def test_encrypted_firmware_libraries_are_named(self):
+        d = self.root / "7.00" / "system" / "common" / "lib"
+        d.mkdir(parents=True)
+        (d / "libSceKernel.sprx").write_bytes(_encrypt_flag(_fself(_signable_elf(), ps5=True)))
+        self.assertIn("encrypted", bp.firmware_problem(self.root / "7.00", "7.00"))
+        with self.assertRaises(ValueError):
+            bp.target_words("7.00", self.root)
+
+    def test_the_setting_may_point_at_one_firmware(self):
+        one = self.root / "9.60"
+        self.assertEqual(bp.firmware_folders(one), {"9.60": one})
+        self.assertEqual(bp.firmware_folder(one, "9.60"), one)
+        self.assertIsNone(bp.firmware_folder(one, "6.02"), "never check 6.02 against 9.60 files")
+        plain = Path(self._td.name) / "fw"
+        _fw_lib(plain, 0x10790001, 0x07610000, sub=".")
+        self.assertEqual(bp.firmware_folder(plain, "7.61"), plain)
+
+    def test_sdk_word_names_its_firmware(self):
+        self.assertEqual(bp.sdk_firmware(0x07610000), "7.61")
+        self.assertEqual(bp.sdk_firmware(0x10010000), "10.01")
+        self.assertEqual(bp.sdk_firmware(0x05100023), "5.10")
+
+    def test_patched_libraries_are_picked_per_target(self):
+        libs = Path(self._td.name) / "patched"
+        (libs / "7.61").mkdir(parents=True); (libs / "6.02").mkdir()
+        self.assertEqual(bp.patched_libs_folder(libs, "7.61"), libs / "7.61")
+        self.assertIsNone(bp.patched_libs_folder(libs, "9.60"))
+        self.assertEqual(bp.patched_libs_folder(libs / "7.61", "7.61"), libs / "7.61")
+        self.assertIsNone(bp.patched_libs_folder(libs / "7.61", "6.02"))
+        mine = Path(self._td.name) / "mine"; mine.mkdir()
+        self.assertEqual(bp.patched_libs_folder(mine, "9.60"), mine)
+
+    def test_the_firmware_folder_is_never_the_patched_libraries(self):
+        self.assertIn("original libraries", bp.patched_libs_problem(self.root, self.root))
+        self.assertIn("original libraries", bp.patched_libs_problem(self.root / "9.60", self.root))
+        self.assertEqual(bp.patched_libs_problem(Path(self._td.name) / "patched", self.root), "")
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td)
+            (src / "eboot.bin").write_bytes(_elf_with_imports([("AAAAAAAAAAA", 0, "libSceKernel", 0, "libSceKernel")]))
+            (self.root / "9.60" / "system" / "common" / "lib" / "libSceKernel.sprx").write_bytes(
+                _elf_with_exports([("AAAAAAAAAAA", 0, "libSceKernel", 0, "libSceKernel")]))
+            r = bp.analyse_backport(src, "6.02", fw_libs_root=self.root, backport_libs_root=self.root)
+            self.assertFalse(any(l.fakelib_covers for l in r.per_library), "originals never count as patched")
+
+    def test_lowering_with_words_from_a_firmware_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            game = Path(td)
+            (game / "eboot.bin").write_bytes(
+                _elf_with_param(bp.PT_SCE_PROCPARAM, 0x4942524F, 0x12090001, 0x10000040))
+            words = bp.target_words("9.60", self.root)
+            report = bp.lower_sdk_in_folder(game, "9.60", words)
+            self.assertEqual(len(report.written), 1)
+            self.assertEqual(_param_words((game / "eboot.bin").read_bytes()), (0x11590001, 0x09600004))
+
+
+class AnalyseWithFirmwareFolders(unittest.TestCase):
+    def test_the_target_folder_decides_and_subfolders_are_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"; src.mkdir()
+            fw = Path(td) / "firmware"
+            (src / "eboot.bin").write_bytes(_elf_with_imports([
+                ("AAAAAAAAAAA", 0, "libSceX", 0, "libSceX"),
+                ("BBBBBBBBBBB", 0, "libSceX", 0, "libSceX"),
+            ]))
+            for name, nids in (("7.61", ["AAAAAAAAAAA"]), ("10.01", ["AAAAAAAAAAA", "BBBBBBBBBBB"])):
+                d = fw / name / "system" / "common" / "lib"; d.mkdir(parents=True)
+                (d / "libSceX.sprx").write_bytes(_elf_with_exports([(n, 0, "libSceX", 0, "libSceX") for n in nids]))
+            old = bp.analyse_backport(src, "7.61", fw_libs_root=fw)
+            self.assertTrue(old.firmware_checked)
+            self.assertEqual(old.unresolved_count(), 1)
+            self.assertEqual(old.unresolved_libraries(), ["libSceX"])
+            new = bp.analyse_backport(src, "10.01", fw_libs_root=fw)
+            self.assertEqual(new.unresolved_count(), 0)
+            none = bp.analyse_backport(src, "9.60", fw_libs_root=fw)
+            self.assertFalse(none.firmware_checked)
+            self.assertIn("no 9.60 folder", none.firmware_note)
+
+    def test_functions_the_game_exports_itself_count_as_covered(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"; (src / "sce_module").mkdir(parents=True)
+            fw = Path(td) / "fw"; fw.mkdir()
+            (src / "eboot.bin").write_bytes(_elf_with_imports([
+                ("CCCCCCCCCCC", 0, "libGameHelper", 0, "libGameHelper"),
+            ]))
+            (src / "sce_module" / "libGameHelper.prx").write_bytes(_elf_with_exports([
+                ("CCCCCCCCCCC", 0, "libGameHelper", 0, "libGameHelper"),
+            ]))
+            report = bp.analyse_backport(src, "7.61", fw_libs_root=fw)
+            lib = {r.library: r for r in report.per_library}["libGameHelper"]
+            self.assertEqual(lib.status, "ok")
+            self.assertEqual(lib.game_covers, {"CCCCCCCCCCC"})
+            self.assertEqual(report.unresolved_count(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

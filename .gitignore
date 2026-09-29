@@ -49,3 +49,6 @@ backend/native/src/ffpfsc-pkg-tool/publish.log
 
 # BPS patch fetched by the BPS reference test; regenerated on demand
 backend/tests/_backpork_*.bps
+
+# Firmware system libraries the user keeps locally for backports: never publish
+/backports/

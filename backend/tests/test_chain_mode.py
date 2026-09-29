@@ -11,6 +11,9 @@ paths are exercised for real:
     .ffpfsc → .ffpfsc + backport → the user's case: unpack, lower, repack; source untouched
     .ffpfsc → .ffpfsc no changes → copy job
 
+Plus the backport rules on a folder: SDK words from a firmware folder, the function
+check that makes patched libraries mandatory, encrypted and fake-signed executables.
+
     python3 -m unittest backend.tests.test_chain_mode
 """
 from __future__ import annotations
@@ -26,7 +29,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 CLI = REPO / "backend" / "cli.py"
 sys.path.insert(0, str(REPO / "backend" / "tests"))
-from test_backport import _elf_with_param   # noqa: E402
+from test_backport import (_elf_with_param, _elf_with_imports, _elf_with_exports,   # noqa: E402
+                           _signable_elf, _fself, _encrypt_flag, _param_words, _fw_lib)
 from backend import backport as bp         # noqa: E402
 
 SDK_HIGH_PS5, SDK_HIGH_PS4 = 0x08000041, 0x11090001
@@ -137,6 +141,19 @@ class ChainMode(unittest.TestCase):
         self.assertIn("move", log.lower())
         self.assertFalse(src.is_file(), "same-drive: the source is renamed into the output")
 
+    def test_7_sdk_of_reads_the_firmware_through_the_image(self):
+        """The firmware a game needs, read from eboot.bin inside a packed image (headers
+        only) and from a folder: the organized file name carries it as [fwN.NN]."""
+        src = getattr(type(self), "ffpfsc", None)
+        if not (src and src.is_file()):                   # test 6 moved it into its output
+            src = self._pack_once()
+        for target in (src, self.game):
+            rc, log = run("--sdk-of", str(target))
+            self.assertEqual(rc, 0, log[-800:])
+            info = json.loads(next(l for l in log.splitlines() if l.startswith("SDK_JSON: "))[len("SDK_JSON: "):])
+            self.assertEqual(info["fw"], "8.00")                # SDK_HIGH_PS5 = 0x08000041
+            self.assertEqual((info["ps5"], info["ps4"]), (SDK_HIGH_PS5, SDK_HIGH_PS4))
+
     def _pack_once(self) -> Path:
         out = self.root / "o3"; out.mkdir(exist_ok=True)
         rc, log = run(str(self.game), str(out), "--to", "ffpfsc", "--temp-dir", str(self.temp))
@@ -144,6 +161,110 @@ class ChainMode(unittest.TestCase):
         img = next(out.glob("*.ffpfsc"))
         type(self).ffpfsc = img
         return img
+
+
+class BackportRules(unittest.TestCase):
+    """folder → folder + backport, the cheapest chain: every rule of the backport pass
+    through the real CLI, without a container round trip."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name)
+        self.fw = self.root / "firmware"
+        # 7.61 lacks one of the two functions the game uses; 9.60 has both.
+        for name, words, nids in (("7.61", (0x10790001, 0x07610000), ["AAAAAAAAAAA"]),
+                                  ("9.60", (0x11590001, 0x09600004), ["AAAAAAAAAAA", "BBBBBBBBBBB"])):
+            _fw_lib(self.fw / name, *words)
+            lib = self.fw / name / "system" / "common" / "lib" / "libSceX.sprx"
+            lib.write_bytes(_elf_with_exports([(n, 0, "libSceX", 0, "libSceX") for n in nids]))
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def game(self, name: str = "g") -> Path:
+        g = make_game(self.root / name)
+        (g / "sce_module").mkdir()
+        (g / "sce_module" / "libGame.prx").write_bytes(_elf_with_imports([
+            ("AAAAAAAAAAA", 0, "libSceX", 0, "libSceX"),
+            ("BBBBBBBBBBB", 0, "libSceX", 0, "libSceX"),
+        ]))
+        return g
+
+    def backport(self, game: Path, target: str, *extra: str) -> tuple[int, str]:
+        return run(str(game), str(self.root / "out"), "--to", "folder", "--backport-target", target, *extra)
+
+    def test_a_firmware_folder_is_a_target_with_its_own_sdk_words(self):
+        g = self.game()
+        # A 10.xx game: 9.60 is lower than its SDK (the 8.00 default game would stay as it is).
+        (g / "eboot.bin").write_bytes(_elf_with_param(bp.PT_SCE_PROCPARAM, 0x4942524F, 0x12090001, 0x10000040))
+        rc, log = self.backport(g, "9.60", "--fw-libs-root", str(self.fw))
+        self.assertEqual(rc, 0, log[-1500:])
+        self.assertIn("Lowering the SDK is enough", log)
+        self.assertEqual(sdk_of(g / "eboot.bin"), (0x09600004, 0x11590001))
+
+    def test_missing_functions_make_patched_libraries_mandatory(self):
+        g = self.game()
+        before = (g / "eboot.bin").read_bytes()
+        rc, log = self.backport(g, "7.61", "--fw-libs-root", str(self.fw))
+        self.assertNotEqual(rc, 0, log[-1500:])
+        self.assertIn("patched libraries for 7.61", log)
+        self.assertEqual((g / "eboot.bin").read_bytes(), before, "refused before anything changed")
+
+        libs = self.root / "patched" / "7.61"; libs.mkdir(parents=True)
+        (libs / "libSceX.sprx").write_bytes(_elf_with_exports([("BBBBBBBBBBB", 0, "libSceX", 0, "libSceX")]))
+        rc, log = self.backport(g, "7.61", "--fw-libs-root", str(self.fw),
+                                "--backport-libs", str(self.root / "patched"))
+        self.assertEqual(rc, 0, log[-1500:])
+        self.assertIn("with your patched libraries", log)
+        self.assertTrue((g / "fakelib" / "libSceX.sprx").is_file(), "the 7.61 set lands in fakelib/")
+        self.assertEqual(sdk_of(g / "eboot.bin"), (SDK_761_PS5, SDK_761_PS4))
+
+    def test_the_firmware_folder_as_patched_libraries_is_refused(self):
+        g = self.game()
+        before = (g / "eboot.bin").read_bytes()
+        rc, log = self.backport(g, "9.60", "--fw-libs-root", str(self.fw), "--backport-libs", str(self.fw))
+        self.assertNotEqual(rc, 0, log[-1500:])
+        self.assertIn("original libraries", log)
+        self.assertEqual((g / "eboot.bin").read_bytes(), before)
+        self.assertFalse((g / "fakelib").exists())
+
+    def test_without_firmware_files_the_check_is_skipped_with_a_warning(self):
+        g = self.game()
+        rc, log = self.backport(g, "7.61")
+        self.assertEqual(rc, 0, log[-1500:])
+        self.assertIn("were not checked", log)
+
+    def test_an_encrypted_executable_stops_the_job(self):
+        g = self.game()
+        locked = _encrypt_flag(_fself(_signable_elf(), ps5=True))
+        (g / "eboot.bin").write_bytes(locked)
+        rc, log = self.backport(g, "7.61")
+        self.assertNotEqual(rc, 0, log[-1500:])
+        self.assertIn("encrypted", log)
+        self.assertEqual((g / "eboot.bin").read_bytes(), locked)
+
+    def test_a_fake_signed_executable_is_lowered_in_place(self):
+        from backend import self_file
+        g = self.game()
+        (g / "eboot.bin").write_bytes(_fself(_signable_elf(0x12090001, 0x10000040), ps5=True))
+        rc, log = self.backport(g, "7.61")
+        self.assertEqual(rc, 0, log[-1500:])
+        self.assertIn("fake-signed, changed in place", log)
+        image = self_file.elf_image((g / "eboot.bin").read_bytes())
+        self.assertEqual(_param_words(image), (SDK_761_PS4, SDK_761_PS5))
+
+    def test_a_bad_target_is_rejected_by_the_parser(self):
+        rc, log = self.backport(self.game(), "8.6")
+        self.assertEqual(rc, 2, log[-800:])
+
+    def test_analyse_prints_one_verdict_and_exits_by_it(self):
+        g = self.game()
+        rc, log = run("--backport-analyze", str(g), "--backport-target", "7.61", "--fw-libs-root", str(self.fw))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("[verdict] The game uses 1 function(s) that 7.61 lacks (libSceX)", log)
+        rc, log = run("--backport-analyze", str(g), "--backport-target", "9.60", "--fw-libs-root", str(self.fw))
+        self.assertEqual(rc, 0, log)
+        self.assertIn("[verdict] Firmware 9.60 has every function", log)
 
 
 if __name__ == "__main__":

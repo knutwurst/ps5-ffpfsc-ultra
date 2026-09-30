@@ -66,8 +66,9 @@ def is_available() -> bool:
         return False
 
 
-def _run(argv: list[str], *, on_line=None) -> int:
-    """Run the CLI, streaming its combined output through *on_line* (or stdout)."""
+def _run(argv: list[str], *, on_line=None, on_start=None) -> int:
+    """Run the CLI, streaming its combined output through *on_line* (or stdout).
+    *on_start(proc)* gets the running process (a progress meter reads its I/O)."""
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -80,6 +81,8 @@ def _run(argv: list[str], *, on_line=None) -> int:
         errors="replace",
     )
     assert proc.stdout is not None
+    if on_start is not None:
+        on_start(proc)
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -89,6 +92,7 @@ def _run(argv: list[str], *, on_line=None) -> int:
                 print(line, flush=True)
     finally:
         proc.wait()
+        proc.stdout.close()
     return proc.returncode
 
 
@@ -111,7 +115,8 @@ def inspect(pkg: Path, *, json_out: bool = False) -> int:
 def extract(pkg: Path, out_dir: Path,
             *, passcode: str = "0" * 32,
             outer: bool = False,
-            on_line=None) -> int:
+            on_line=None,
+            on_start=None) -> int:
     """
     Extract a finalized fPKG (\\x7FFIH) or metadata CNT (\\x7FCNT).
 
@@ -121,7 +126,7 @@ def extract(pkg: Path, out_dir: Path,
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     cmd = "extract-outer" if outer else "extract-inner"
     argv = [str(tool_path()), cmd, str(pkg), str(out_dir), "--passcode", passcode]
-    return _run(argv, on_line=on_line)
+    return _run(argv, on_line=on_line, on_start=on_start)
 
 
 def list_inner(pkg: Path, *, passcode: str = "0" * 32) -> dict:

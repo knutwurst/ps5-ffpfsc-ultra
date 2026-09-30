@@ -387,5 +387,58 @@ class PasswordErrorRecognition(unittest.TestCase):
         self.assertFalse(AE._is_password_error(PermissionError("denied")))
 
 
+class HeaderProbe(unittest.TestCase):
+    """probe_header separates two answers: did a password open the header, and is the
+    size in it worth trusting. Only the first may lead to a password prompt."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name)
+        self.payload = self.root / "src"
+        self.payload.mkdir()
+        (self.payload / "game.pkg").write_bytes(os.urandom(300_000))
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _7z(self, name: str, password: str, header_encryption: bool) -> Path:
+        out = self.root / name
+        with py7zr.SevenZipFile(out, "w", password=password, header_encryption=header_encryption) as z:
+            z.write(self.payload / "game.pkg", "Title/game.pkg")
+        return out
+
+    @unittest.skipIf(py7zr is None, "py7zr not installed")
+    def test_the_right_password_among_wrong_ones_opens_an_encrypted_header(self):
+        arc = self._7z("locked.7z", "the-right-one", header_encryption=True)
+        self.assertEqual(AE.probe_header(arc, ["wrong-a", "wrong-b", "the-right-one"]), (True, 300_000))
+        self.assertEqual(AE.probe_header(arc, ["wrong-a", "wrong-b"]), (False, 0))
+
+    @unittest.skipIf(py7zr is None, "py7zr not installed")
+    def test_a_readable_header_opens_whatever_the_passwords(self):
+        arc = self._7z("clear.7z", "the-right-one", header_encryption=False)
+        self.assertEqual(AE.probe_header(arc, ["wrong-a"]), (True, 300_000))
+        self.assertEqual(AE.probe_header(arc, []), (True, 300_000))
+
+    def test_an_odd_size_is_not_trusted_but_is_no_password_problem(self):
+        self.assertEqual(AE.plausible_extracted_size(10, 1000), 0)
+        self.assertEqual(AE.plausible_extracted_size(500, 1000), 500)
+        self.assertEqual(AE.plausible_extracted_size(990, 1000), 990)      # stored ~1:1 archives count
+
+    @unittest.skipIf(py7zr is None, "py7zr not installed")
+    def test_a_new_archive_job_knows_whether_its_header_is_locked(self):
+        arc = self._7z("job.7z", "the-right-one", header_encryption=True)
+        m.save_settings({"archive_passwords": ["wrong-a", " the-right-one "]})
+        try:
+            item = m.GameItem.from_archive(arc)
+            self.assertFalse(item.header_locked)
+            self.assertEqual(item.extracted_size, 300_000)
+            m.save_settings({"archive_passwords": ["wrong-a"]})
+            item = m.GameItem.from_archive(arc)
+            self.assertTrue(item.header_locked)
+            self.assertEqual(item.extracted_size, 0)
+        finally:
+            m.save_settings({"archive_passwords": []})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

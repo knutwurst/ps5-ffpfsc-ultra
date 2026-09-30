@@ -397,5 +397,174 @@ class MkpfsResolverTests(unittest.TestCase):
         self.assertIn("the installation is incomplete", out.getvalue())
 
 
+class SilentStepProgress(unittest.TestCase):
+    """A full .pkg extract prints nothing until it is done; the backend measures the files
+    already on disk and prints mkpfs-style bars the GUI reads (stage, %, speed, ETA)."""
+
+    PROGRESS = __import__("re").compile(r"\[(?P<bar>[#\-]{4,})\]\s*(?P<pct>\d{1,3})%\s*(?P<label>.*)")
+
+    def test_bars_follow_the_bytes_on_disk(self):
+        import time
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            chunk = b"x" * 400_000
+
+            def work():
+                for i in range(5):
+                    (folder / f"part{i}.bin").write_bytes(chunk)
+                    time.sleep(0.25)
+                return 0
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli._run_with_folder_progress(work, folder, 5 * len(chunk), "extract", interval=0.2)
+            self.assertEqual(rc, 0)
+            bars = [self.PROGRESS.search(l) for l in out.getvalue().splitlines()]
+            bars = [b for b in bars if b]
+            self.assertGreaterEqual(len(bars), 3, out.getvalue())
+            pcts = [int(b.group("pct")) for b in bars]
+            self.assertEqual(pcts, sorted(pcts))
+            self.assertEqual(pcts[-1], 100)
+            self.assertTrue(all(b.group("label").startswith("extract") for b in bars))
+            self.assertTrue(any("MB/s" in b.group("label") and "ETA" in b.group("label") for b in bars[:-1]),
+                            out.getvalue())
+
+    def test_a_failing_step_still_raises(self):
+        def work():
+            raise RuntimeError("tool crashed")
+        with tempfile.TemporaryDirectory() as td, redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                cli._run_with_folder_progress(work, Path(td), 100, "extract", interval=0.05)
+
+    def test_the_label_says_where_and_how_much(self):
+        line = cli._progress_line(5 * 1024 ** 3, 20 * 1024 ** 3, 10,
+                                  "extract the .pkg to SAMSUNG: {done} of {total} GB")
+        m = self.PROGRESS.search(line)
+        self.assertEqual(int(m.group("pct")), 25)
+        self.assertTrue(m.group("label").startswith("extract the .pkg to SAMSUNG: 5.0 of 20.0 GB @ "), line)
+        self.assertEqual(cli._drive_label(Path("/Volumes/SAMSUNG/_ffpfsc_temp")), "SAMSUNG")
+        self.assertEqual(cli._drive_label(Path("/tmp")), "the system drive")
+
+    def test_the_label_names_the_extract_step(self):
+        # the package tool's temp files tell the step: outer temp, inner temp being
+        # written under a second name, then the finished inner image
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            self.assertEqual(cli._pkg_extract_step(folder), 0)
+            (folder / ".libprospero-outer-ab.tmp").write_bytes(b"x")
+            self.assertEqual(cli._pkg_extract_step(folder), 1)
+            (folder / "..libprospero-inner-cd.tmp.ef.tmp").write_bytes(b"x")
+            self.assertEqual(cli._pkg_extract_step(folder), 2)
+            (folder / "..libprospero-inner-cd.tmp.ef.tmp").rename(folder / ".libprospero-inner-cd.tmp")
+            (folder / ".libprospero-outer-ab.tmp").unlink()
+            self.assertEqual(cli._pkg_extract_step(folder), 3)
+            line = cli._progress_line(150 * 1024 ** 3, 200 * 1024 ** 3, 60,
+                                      lambda: cli._pkg_extract_label(folder))
+            m = self.PROGRESS.search(line)
+            self.assertIn("step 3 of 3: write the game files (150.0 of 200.0 GB written)", m.group("label"))
+            self.assertTrue(m.group("label").startswith("extract the .pkg on "), line)
+            self.assertNotIn("compress", m.group("label"))   # the GUI would read it as Compressing
+            pkg = folder / "t.pkg"; pkg.write_bytes(b"\0" * 1000)
+            self.assertEqual(cli._pkg_extract_plan(pkg, 5000), 11000)
+            self.assertEqual(cli._pkg_extract_plan(pkg, 0), 0)
+
+    def test_the_writers_counter_wins_over_file_sizes(self):
+        # the .pkg tool creates each file at its full size first, then fills it: the size
+        # on disk says 100 % while the data is still coming. The tool's own write counter
+        # is the truth; the folder size is only the fallback.
+        import time
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            with open(folder / "presized.bin", "wb") as f:
+                f.truncate(1_000_000)                 # "done" by size from the start
+            counter = iter([100_000, 300_000, 500_000, 700_000, 900_000] + [900_000] * 50)
+
+            def work():
+                time.sleep(1.0)
+                return 0
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cli._run_with_folder_progress(work, folder, 1_000_000, "extract", interval=0.15,
+                                              measure=lambda: next(counter))
+            pcts = [int(b.group("pct")) for b in map(self.PROGRESS.search, out.getvalue().splitlines()) if b]
+            self.assertTrue(pcts and pcts[0] <= 30, pcts)
+            self.assertEqual(pcts, sorted(pcts))
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cli._run_with_folder_progress(work, folder, 2_000_000, "extract", interval=0.15,
+                                              measure=lambda: None)
+            pcts = [int(b.group("pct")) for b in map(self.PROGRESS.search, out.getvalue().splitlines()) if b]
+            self.assertTrue(pcts and pcts[0] == 50, pcts)   # no counter: the size on disk
+
+    @unittest.skipUnless(sys.platform == "darwin" or __import__("importlib").util.find_spec("psutil"),
+                         "needs proc_pid_rusage or psutil")
+    def test_the_write_counter_reads_a_running_process(self):
+        import subprocess, time
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "w.bin"
+            code = ("import os,sys,time\nf=open(sys.argv[1],'wb')\n"
+                    "for i in range(8):\n f.write(os.urandom(1<<20)); f.flush(); os.fsync(f.fileno()); time.sleep(0.1)\n"
+                    "time.sleep(0.5)")
+            proc = subprocess.Popen([sys.executable, "-c", code, str(target)])
+            seen = []
+            while proc.poll() is None:
+                seen.append(cli._proc_bytes_written(proc.pid)); time.sleep(0.1)
+            vals = [v for v in seen if v is not None]
+            self.assertTrue(vals, seen)
+            self.assertEqual(vals, sorted(vals))
+            self.assertGreaterEqual(max(vals), 8 << 20)
+        self.assertIsNone(cli._proc_bytes_written(2 ** 22 + 12345))
+
+    @unittest.skipUnless(sys.platform == "darwin" or __import__("importlib").util.find_spec("psutil"),
+                         "needs proc_pid_rusage or psutil")
+    def test_a_coarse_tool_bar_gets_a_byte_meter(self):
+        # MkPFS pass 1 counts whole files; the meter counts the bytes the process wrote,
+        # and stays quiet until 1 % is written (the tool's scan/read bars come first)
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "img.bin"
+            code = ("import os,sys,time\ntime.sleep(1.2)\nf=open(sys.argv[1],'wb')\n"
+                    "for i in range(6):\n f.write(os.urandom(1<<20)); f.flush(); os.fsync(f.fileno()); time.sleep(0.3)")
+            proc = subprocess.Popen([sys.executable, "-c", code, str(target)])
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cli._meter_process(proc, 6 << 20, "write the PFS image on TEST: {done} of {total} GB", interval=0.2)
+            self.assertIsNotNone(proc.poll())
+            bars = [b for b in map(self.PROGRESS.search, out.getvalue().splitlines()) if b]
+            self.assertTrue(bars, out.getvalue())
+            pcts = [int(b.group("pct")) for b in bars]
+            self.assertEqual(pcts, sorted(pcts))
+            self.assertGreaterEqual(pcts[0], 1)
+            self.assertTrue(all(b.group("label").startswith("write the PFS image on TEST") for b in bars))
+            # no counter: no bars, the tool keeps its own
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.6)"])
+            saved = cli._proc_bytes_written
+            cli._proc_bytes_written = lambda _pid: None
+            try:
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    cli._meter_process(proc, 100, "x", interval=0.1)
+            finally:
+                cli._proc_bytes_written = saved
+                proc.wait()
+            self.assertEqual(out.getvalue(), "")
+
+    def test_the_tool_process_reaches_the_meter(self):
+        import fpkg
+        got = []
+        rc = fpkg._run([sys.executable, "-c", "print('hi')"], on_line=lambda l: None,
+                       on_start=lambda proc: got.append(proc.pid))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(got), 1)
+
+    def test_eta_and_rate_use_mkpfs_units(self):
+        self.assertEqual(cli._fmt_eta(57), "57s")
+        self.assertEqual(cli._fmt_eta(5052), "84.2m")
+        self.assertEqual(cli._fmt_rate(812.4 * 1024 * 1024), "812.40 MB/s")
+        self.assertEqual(cli._fmt_rate(1.5 * 1024 ** 3), "1.50 GB/s")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -76,7 +76,7 @@ How far packages run depends on the jailbreak on the console, not on this builde
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="images/add-job-backport.jpg" width="400" alt="Add job with Backport to 7.61 and .pkg as the output"><br><sub><b>In Add job</b> &nbsp;·&nbsp; target firmware, your patched libraries, and Check</sub></td>
+    <td align="center" width="50%"><img src="images/add-job-backport.jpg" width="400" alt="Add job with Backport to 7.61 and .pkg as the output"><br><sub><b>In Add job</b> &nbsp;·&nbsp; target firmware and Check</sub></td>
     <td align="center" width="50%"><img src="images/settings-backport.jpg" width="400" alt="Settings, Backport and libraries, with a firmware folder holding four firmwares"><br><sub><b>Settings › Backport & libraries</b> &nbsp;·&nbsp; your firmware folder, patched libraries, Prepare in one click</sub></td>
   </tr>
 </table>

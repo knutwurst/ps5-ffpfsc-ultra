@@ -216,6 +216,12 @@ def space_safety_factor() -> float:
 ARCHIVE_PEAK_FACTOR = 2.2
 INPLACE_PEAK_FACTOR = 1.2
 PATCH_PEAK_FACTOR   = 3.0
+# A chain that unpacks a .pkg: the package tool writes the decoded inner image and then the
+# files beside it, so the drive holds twice the game at the end of the unpack (measured: an
+# 80.9 GB game, 80.9 GB decoded image next to it); pass 1 then holds the files plus the
+# uncompressed image (~1.03x). Valid only on the game's real size (pkg_content_size), which
+# is larger than the package: its data is compressed.
+PKG_UNPACK_PEAK_FACTOR = 2.2
 
 # Free-space multiple for JUST the inner uncompressed PFS image (pass 1) on the temp/SSD
 # drive — used by the split path (image on the SSD, source on the output drive). 1.2x covers
@@ -336,6 +342,8 @@ def _peak_factor_for(item) -> float:
     # A chain that must unpack its container into scratch before repacking holds the
     # unpacked game AND the inner image at once — the same shape as a patch job.
     if getattr(item, "operation", "pack") == "chain" and chain_needs_unpack(item):
+        if chain_source_kind(item) == "pkg" and getattr(item, "pkg_content_size", 0):
+            return PKG_UNPACK_PEAK_FACTOR
         return PATCH_PEAK_FACTOR
     return INPLACE_PEAK_FACTOR if getattr(item, "source_kind", "archive") == "inplace" else ARCHIVE_PEAK_FACTOR
 
@@ -875,6 +883,60 @@ def find_game_folders(root: Path, max_depth: int = 3) -> list[Path]:
             pass
 
     _scan(root, 0)
+    return found
+
+
+JOB_CONTAINER_SUFFIXES = {".ffpfs", ".ffpfsc", ".pkg", ".exfat", ".ffpkg"}
+# The app's own scratch folders: never sources, even when a temp folder sits in the tree.
+_JOB_SCAN_SKIP_DIRS = {"_ffpfsc_temp", "_extracted", "_ffpfsc_extract", "_ffpfsc_inner", "__MACOSX"}
+
+
+def is_archive_file(path: Path) -> bool:
+    """A .zip / .rar / .7z, or any volume of a multi-part RAR set (.partN.rar, .rNN)."""
+    suf = path.suffix.lower()
+    return suf in (".zip", ".rar", ".7z") or bool(re.match(r"^\.r\d{2,}$", suf))
+
+
+def find_job_sources(root: Path, max_depth: int = 6) -> list[Path]:
+    """Every source a job can start from under *root*, one entry each: game folders (not
+    entered), containers (.ffpfs/.ffpfsc/.pkg/.exfat/.ffpkg) and archives (.zip/.rar/.7z;
+    a multi-part RAR set once, as its first volume). Other files (notes, checksums),
+    filesystem junk and the app's own scratch folders are skipped. Sorted by path."""
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def _scan(path: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            children = sorted(path.iterdir(), key=lambda q: q.name.lower())
+        except OSError:
+            return
+        for child in children:
+            name = child.name
+            if name.startswith(".") or is_fs_junk_name(name):
+                continue
+            try:
+                if child.is_dir():
+                    if name in _JOB_SCAN_SKIP_DIRS:
+                        continue
+                    if is_game_folder(child):
+                        found.append(child)
+                    else:
+                        _scan(child, depth + 1)
+                elif child.is_file():
+                    if child.suffix.lower() in JOB_CONTAINER_SUFFIXES:
+                        found.append(child)
+                    elif is_archive_file(child):
+                        first = ArchiveExtractor._first_volume(child)
+                        key = str(first).lower()
+                        if key not in seen:
+                            seen.add(key)
+                            found.append(first)
+            except OSError:
+                continue
+
+    _scan(Path(root), 0)
     return found
 
 
@@ -1637,18 +1699,29 @@ class ArchiveExtractor:
 
     @staticmethod
     def uncompressed_size(archive: Path, passwords=None) -> int:
-        """Total UNCOMPRESSED size of the archive's members, read from headers WITHOUT
-        extracting (milliseconds). Resolves a multi-part set to its FIRST volume first,
-        so a directly-dropped later part still reports the whole game (not one 5 GB
-        part). Returns 0 when the size cannot be read (encrypted/solid/odd) so callers
-        fall back to an estimate. This is the honest input to the space pre-check —
-        third-party archives are often compressed ~2:1, so the on-disk size badly undershoots."""
+        """Total UNCOMPRESSED size of the archive's members (probe_header's size); 0
+        when it cannot be read, so callers fall back to an estimate."""
+        return ArchiveExtractor.probe_header(archive, passwords)[1]
+
+    @staticmethod
+    def probe_header(archive: Path, passwords=None) -> tuple[bool, int]:
+        """(opened, size): whether the archive's header could be read with one of
+        *passwords* (or none), and the total UNCOMPRESSED size of its members, read from
+        the headers WITHOUT extracting (milliseconds). A multi-part set is read from its
+        FIRST volume, so a later part still reports the whole game. The two answers are
+        separate on purpose: a header that opens can still hold a size too odd to trust
+        (plausible_extracted_size decides that), and that is no reason to ask for a
+        password. The size is the honest input to the space pre-check — third-party
+        archives are often compressed ~2:1, so the on-disk size badly undershoots."""
         suffix = archive.suffix.lower()
+        if re.match(r"^\.r\d{2,}$", suffix):
+            archive = ArchiveExtractor._first_volume(archive)
+            suffix = archive.suffix.lower()
         cands = [p for p in (passwords or []) if p] + [""]
         try:
             if suffix == ".zip":
                 with zipfile.ZipFile(archive, "r") as zf:
-                    return sum(int(getattr(zi, "file_size", 0) or 0) for zi in zf.infolist())
+                    return True, sum(int(getattr(zi, "file_size", 0) or 0) for zi in zf.infolist())
             if suffix == ".rar":
                 resolved = ArchiveExtractor._first_volume(archive)
                 backend_dir = backend_base_dir()
@@ -1658,10 +1731,10 @@ class ArchiveExtractor:
                 for pwd in cands:
                     try:
                         with _br.RarFile(str(resolved), pwd=pwd or None) as rf:
-                            return sum(int(getattr(ri, "file_size", 0) or 0) for ri in rf.infolist())
+                            return True, sum(int(getattr(ri, "file_size", 0) or 0) for ri in rf.infolist())
                     except Exception:
                         continue
-                return 0
+                return False, 0
             if suffix == ".7z":
                 import py7zr  # type: ignore
                 for pwd in cands:
@@ -1671,13 +1744,22 @@ class ArchiveExtractor:
                             total = sum(int(getattr(f, "uncompressed", 0) or 0) for f in sz.list())
                             if total <= 0:
                                 total = int(getattr(sz.archiveinfo(), "uncompressed", 0) or 0)
-                            return total
+                            return True, total
                     except Exception:
                         continue
-                return 0
+                return False, 0
         except Exception:
-            return 0
-        return 0
+            return False, 0
+        return True, 0
+
+    @staticmethod
+    def plausible_extracted_size(size: int, ondisk: int) -> int:
+        """*size* when it is a sane reading of the whole set, else 0 (the gate then
+        estimates). A successful read is trusted even when it is NOT larger than the
+        on-disk set: a stored archive is ~1:1, and RAR container overhead can make the
+        volume set slightly LARGER than the game (measured: a 148.9 GiB game vs 150.2 GiB
+        on disk). Only a floor of half the on-disk size rejects a bogus partial read."""
+        return size if (size and size >= ondisk * 0.5) else 0
 
     @staticmethod
     def names_look_like_game(names) -> bool:
@@ -2505,6 +2587,11 @@ class GameItem:
     backport_libs_root = None  # str: folder of user-supplied patched sprx dropped into fakelib/
     chain_to = None         # chain job: "folder" | "ffpfs" | "ffpfsc" | "pkg"
     chain_sign = False      # chain job: fake-sign executables (after patch and backport)
+    header_locked = False   # archive: no saved password opened its header when it was added
+    pkg_content_size = 0    # .pkg source: bytes of its files, from the package's directory (0 = not read)
+    origin_archive = None   # str: the archive this job's source was extracted from (retry restarts there)
+    origin_extracted_size = 0  # that archive's extracted size, read from its headers
+    kept_extract = False    # cancelled after its archive was extracted: that copy stays until the job is removed
     compression_level = None  # .ffpfsc job: zlib level 1-9 chosen in the job editor; None → the default
     status_note = ""        # why the job failed or was skipped (shown in the details pane)
 
@@ -2541,20 +2628,17 @@ class GameItem:
         obj.status       = "Pending Extract"
         obj.password     = None          # optional per-archive password override
         obj.source_kind  = "archive"     # unpacks a SECOND copy onto the build drive
-        # Honest extracted size read from the archive headers (no extraction). Trust a
-        # successful read even when it is NOT larger than the on-disk set: a "High-Speed"/
-        # stored third-party archive is ~1:1, and RAR container overhead can make the on-disk volume
-        # set slightly LARGER than the game it holds (measured: a 148.9 GiB game
-        # vs 150.2 GiB on disk -> the old `hdr > size` guard wrongly discarded a valid read
-        # and forced an estimate + HDD split). Require only a sane floor (>= half the on-disk
-        # size) to reject a bogus partial read; otherwise leave 0 so the gate estimates.
-        # Pass saved passwords for header-encrypted sets.
+        # Honest extracted size read from the archive headers (no extraction), with the
+        # saved passwords for header-encrypted sets. header_locked says whether any of
+        # them opened the header: only then is a password prompt worth showing. A header
+        # that opens but holds an odd size keeps extracted_size 0 (the gate estimates).
         try:
-            pw = load_settings().get("archive_passwords") or []
+            pw = [p.strip() for p in (load_settings().get("archive_passwords") or []) if str(p).strip()]
         except Exception:
             pw = []
-        hdr = ArchiveExtractor.uncompressed_size(first, pw)
-        obj.extracted_size = hdr if (hdr and hdr >= obj.size * 0.5) else 0
+        opened, hdr = ArchiveExtractor.probe_header(first, pw)
+        obj.header_locked  = not opened
+        obj.extracted_size = ArchiveExtractor.plausible_extracted_size(hdr, obj.size)
         return obj
 
     @classmethod
@@ -2795,6 +2879,7 @@ __all__ = [
     "ARCHIVE_PEAK_FACTOR",
     "INPLACE_PEAK_FACTOR",
     "PATCH_PEAK_FACTOR",
+    "PKG_UNPACK_PEAK_FACTOR",
     "IMAGE_PEAK_FACTOR",
     "archive_set_ondisk_size",
     "_item_is_single_pass",
@@ -2828,6 +2913,9 @@ __all__ = [
     "get_filesystem_type",
     "is_game_folder",
     "find_game_folders",
+    "find_job_sources",
+    "is_archive_file",
+    "JOB_CONTAINER_SUFFIXES",
     "find_files_by_suffix",
     "has_any_files",
     "validate_game_structure",

@@ -70,6 +70,21 @@ class FromChain(unittest.TestCase):
         self.assertEqual(uc.chain_summary(it), "Unpack to folder")
         self.assertTrue(uc.chain_needs_unpack(it))
 
+    def test_pkg_space_uses_the_game_size(self):
+        # a .pkg holds compressed data: until its directory is read, the file size is only a
+        # floor and the conservative factor applies; with the real size, the measured one
+        pkg = self.root / "UP0000-PPSA00004_00-EXAMPLE000000000-A0100-V0100.pkg"
+        pkg.write_bytes(b"\0" * 1000)
+        it = uc.GameItem.from_chain(pkg, to="ffpfsc")
+        self.assertEqual(uc._peak_factor_for(it), uc.PATCH_PEAK_FACTOR)
+        self.assertEqual(uc._build_size_of(it), 1000)
+        it.pkg_content_size = 1800
+        it.extracted_size = 1800
+        self.assertEqual(uc._peak_factor_for(it), uc.PKG_UNPACK_PEAK_FACTOR)
+        self.assertEqual(uc._build_size_of(it), 1800)
+        need = uc._space_requirements(it, self.root, self.root / "elsewhere")[0][2]
+        self.assertGreaterEqual(need, 2 * 1800, "the decoded image and the files sit side by side")
+
     def test_pass_through_needs_no_unpack(self):
         ff = self.root / "a.ffpfs"; ff.write_bytes(b"\0" * 64)
         it = uc.GameItem.from_chain(ff, to="ffpfsc")
@@ -98,6 +113,64 @@ class FromChain(unittest.TestCase):
         self.assertEqual(uc.chain_source_kind(it), "archive")
         self.assertEqual(it.status, "Pending Extract")
         self.assertIsNotNone(it.archive_path)
+
+
+def make_source_tree(root: Path) -> Path:
+    """A parent folder like a real download folder: a multi-part RAR set in a subfolder, a
+    loose .pkg, a .7z next to a checksum file, an old-style .rar/.r00 set, a game folder
+    (with a .pkg inside that must not count), and the traps: AppleDouble twins, a hidden
+    file and the app's own scratch folder."""
+    conv = root / "Convert"
+    rars = conv / "Set A"
+    rars.mkdir(parents=True)
+    for n in (1, 2, 3):
+        (rars / f"Set A.part{n}.rar").write_bytes(b"Rar!")
+    (rars / "._Set A.part1.rar").write_bytes(b"x")
+    (conv / "Title [PPSA00001] [v01.000.000].pkg").write_bytes(b"\x7fCNT")
+    misc = conv / "Misc"
+    misc.mkdir()
+    (misc / "PPSA00002-Compressed.7z").write_bytes(b"7z")
+    (misc / "SHA-256.txt").write_text("abc", encoding="utf-8")
+    old = conv / "Old"
+    old.mkdir()
+    (old / "game.rar").write_bytes(b"Rar!")
+    (old / "game.r00").write_bytes(b"Rar!")
+    (old / "game.r01").write_bytes(b"Rar!")
+    game = conv / "Game [PPSA00003]"
+    (game / "sce_sys").mkdir(parents=True)
+    (game / "eboot.bin").write_bytes(b"\x7fELF")
+    (game / "dlc.pkg").write_bytes(b"\x7fCNT")
+    (conv / ".hidden.ffpfsc").write_bytes(b"x")
+    scratch = conv / "_ffpfsc_temp"
+    scratch.mkdir()
+    (scratch / "leftover.ffpfsc").write_bytes(b"x")
+    return conv
+
+
+class FindJobSources(unittest.TestCase):
+    def test_one_entry_per_source_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            conv = make_source_tree(Path(td))
+            found = [str(s.relative_to(conv)) for s in uc.find_job_sources(conv)]
+            self.assertEqual(found, [
+                "Game [PPSA00003]",
+                "Misc/PPSA00002-Compressed.7z",
+                "Old/game.rar",
+                "Set A/Set A.part1.rar",
+                "Title [PPSA00001] [v01.000.000].pkg",
+            ])
+
+    def test_every_source_becomes_a_chain_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            conv = make_source_tree(Path(td))
+            items = [uc.GameItem.from_chain(s, to="ffpfsc", backport_target="10.xx")
+                     for s in uc.find_job_sources(conv)]
+            self.assertTrue(all(i.operation == "chain" and i.chain_to == "ffpfsc"
+                                and i.backport_target == "10.xx" for i in items))
+            kinds = [uc.chain_source_kind(i) for i in items]
+            self.assertEqual(kinds, ["folder", "archive", "archive", "archive", "pkg"])
+            self.assertEqual([i.status for i in items],
+                             ["Queued", "Pending Extract", "Pending Extract", "Pending Extract", "Queued"])
 
 
 if __name__ == "__main__":

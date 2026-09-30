@@ -3,7 +3,104 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v2.0.0  (current)
+  v2.0.1  (current)
+────────────────────────────────────────────────────────────────────────
+
+ARCHIVE PASSWORDS
+
+  - The password prompt fits its content. It had a fixed height, so the
+    OK and Skip buttons sat below the bottom of the window.
+  - The prompt only comes up when none of your saved passwords opens
+    the archive. Adding an archive used to ask as well when a saved
+    password did open it but the size in its header looked too small
+    to trust; the prompt then claimed that no saved password worked,
+    and typing the same password in was accepted. An untrusted size
+    now falls back to the estimate without asking, and a password you
+    type is checked on its own.
+  - Saved passwords are trimmed before they are tried, and a password
+    added in Settings after the job was queued is tried before the
+    prompt comes up.
+
+A CANCELLED JOB KEEPS WHAT IT ALREADY UNPACKED
+
+  - Cancel a job after its archive was extracted, and the extracted
+    copy stays. Start runs the job from it again, without unpacking the
+    archive a second time; removing the job from the queue deletes it,
+    and a successful run cleans it up as before. A job cancelled while
+    its archive is still extracting drops the half-done copy, and the
+    startup cleanup never offers a copy a queued job still keeps.
+  - A job whose extracted copy is gone (after a failed run, a clean-up
+    or a restart) starts again at its archive. It used to point at the
+    deleted copy and fail, or was parked as "source missing".
+
+PROGRESS YOU CAN SEE WHILE A .PKG IS UNPACKED
+
+  - Unpacking a .pkg (to change it, to build a .ffpfsc from it, or as
+    an extract job) shows its progress, speed and time left. The
+    helper that unpacks it prints nothing until it is done, so the
+    window sat at "Extracting 0 %" for minutes. The helper works in
+    three steps, all on the temp drive: it decrypts the package into a
+    temp file, unpacks the game image from it into a second temp file
+    (as large as the game) and then writes the game files. The backend
+    reads the package's file list first and, every second, asks the
+    system how many bytes the helper has written in all three steps.
+    Counting the folder size instead reached 99 % after the second step
+    and then stood still for the whole third one.
+  - The progress line says where and which step: "extract the .pkg on
+    SAMSUNG, step 3 of 3: write the game files (150.2 of 204.5 GB
+    written) @ 170 MB/s ETA 5m".
+  - "Temp PFS" moves while MkPFS writes the uncompressed image. MkPFS
+    counts whole files, so a game with one 57 GB file showed "0 %
+    write" for ten minutes, and the window only said "Large games may
+    look frozen here". The backend counts the bytes MkPFS has written
+    and shows "write the PFS image on SAMSUNG: 34.0 of 80.9 GB".
+  - The space check reads the size of the game out of the package. The
+    data in a .pkg is compressed, so a 46 GB package can hold an 81 GB
+    game, and unpacking it needs twice the game on the temp drive for a
+    moment (the unpacked image and the files side by side). The check
+    used the package size and asked for far too little; the Space line
+    showed "Temp image ~55 GB" for a job that needed about 170 GB.
+  - The log names the folder and the drive a job unpacks to, with the
+    free space there, and the details pane has a Drives line: where the
+    job works and where it writes.
+  - A job that unpacks first (a .pkg or image changed and rebuilt) no
+    longer reports 94 % when only the unpack is done. Its bar follows
+    the order the job runs in: unpack, changes, build, compress.
+  - The job's bar in the queue no longer jumps. The 30-second "still
+    working" update and the progress lines computed the percentage in
+    two ways, 20 points apart; adding a folder while a job ran set the
+    bar to 0 % for a moment. One value feeds the bar now, it never
+    moves backward, and messages about other jobs go to the footer.
+
+BACKPORT WITHOUT A LIBRARIES FIELD
+
+  - Add job no longer asks for patched libraries. A backport lowers the
+    SDK, and when Check finds functions the target lacks, the job takes
+    the set for its target from the patched libraries folder in
+    Settings. The field kept coming back after you cleared it, because
+    the editor refilled it from Settings and only ever saved a value
+    that was not empty.
+  - A patched libraries setting that points at the firmware libraries
+    folder is cleared at start, with a line in the log: that folder
+    holds the original libraries, which never go into fakelib/.
+
+PARENT FOLDERS: EVERY SOURCE IN THEM, ONE JOB EACH
+
+  - Add job takes a folder of sources again. It searches the folder and
+    its subfolders for game folders, archives (.zip, .rar, .7z; a
+    multi-part RAR set once) and containers (.ffpfs, .ffpfsc, .pkg,
+    .exfat, .ffpkg), and queues one job per source with the changes
+    and the output you chose. Notes and checksum files, hidden files
+    and the app's own temp folders are skipped. In 2.0.0 only unpacked
+    game folders counted, so a folder of archives or packages was
+    refused as "not a PS5 game folder".
+  - In such a batch, a game folder to a folder with nothing to change
+    is left out, and Check reads the first game folder.
+  - An archive that holds a .pkg is unpacked and converted like any
+    other package; it used to stop with "no supported payload".
+
+────────────────────────────────────────────────────────────────────────
+  v2.0.0
 ────────────────────────────────────────────────────────────────────────
 
 A NEW MAIN WINDOW

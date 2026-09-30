@@ -576,6 +576,234 @@ try:
             jh.help_var.set(_txt); root.update_idletasks(); _heights.add(jh._foot.winfo_reqheight())
         ok(f"job.help.buttons-stay-{_w}", len(_heights) == 1, str(sorted(_heights)))
     jh.destroy()
+    # J6e) a parent folder: every game folder, archive set and container in it is one job
+    from test_chain_items import make_source_tree
+    _conv = make_source_tree(S / "parent_tree")
+    _defs_before = json.loads(json.dumps(m.load_settings().get("job_dialog_defaults", {}) or {}))
+    jp = m.JobDialog(app, init_src=str(_conv)); root.update()
+    ok("job.parent.detects-every-source", jp._kind == "parent" and len(jp._games) == 5
+       and "5 sources: 1 game folder, 3 archives, 1 .pkg" in jp.detect_var.get(), jp.detect_var.get())
+    jp.patch_on_var.set(False); jp.sign_var.set(False)
+    jp.backport_on_var.set(True); jp.backport_target_var.set("10.xx")
+    jp.to_var.set(".ffpfsc"); jp.out_var.set(str(OUT / "parent")); root.update()
+    ok("job.parent.summary", jp.summary_var.get() == "Backport to 10.xx, then build .ffpfsc  × 5 jobs"
+       and str(jp._add_btn.cget("state")) == "normal", jp.summary_var.get())
+    ok("job.parent.check-reads-its-game-folder", jp._check_folder() == _conv / "Game [PPSA00003]"
+       and str(jp._check_btn.cget("state")) == "normal", str(jp._check_folder()))
+    jp.to_var.set("Folder"); root.update()
+    ok("job.parent.folder-output-not-in-place", not jp._in_place("folder")
+       and str(jp._out_entry.cget("state")) == "normal", str(jp._out_entry.cget("state")))
+    jp.to_var.set(".ffpfsc"); root.update()
+    # The tree's archives are stand-ins whose headers cannot be read, which would open the
+    # (modal) password prompt; this step checks the jobs, not the password flow.
+    _real_pw = app._resolve_archive_password
+    app._resolve_archive_password = lambda _it: None
+    try:
+        n0 = len(app.queue); errors.clear(); jp._add(); root.update()
+    finally:
+        app._resolve_archive_password = _real_pw
+    _new = app.queue[n0:]
+    ok("job.parent.one-job-each", len(_new) == 5 and all(i.operation == "chain" and i.chain_to == "ffpfsc"
+       and i.backport_target == "10.xx" for i in _new)
+       and [m.chain_source_kind(i) for i in _new] == ["folder", "archive", "archive", "archive", "pkg"],
+       f"{len(_new)} {[m.chain_source_kind(i) for i in _new]} errors={errors}")
+    for _i in _new:
+        app.queue.remove(_i)
+    app.update_queue_box(); root.update()
+    m.save_settings({"job_dialog_defaults": _defs_before})
+    # an archive that holds a .pkg is unpacked as a package, not refused
+    _pk = S / "extracted_pkg_archive" / "inner"; _pk.mkdir(parents=True, exist_ok=True)
+    (_pk / "Title [PPSA00004].pkg").write_bytes(b"\x7fCNT")
+    _kind, _paths = app._classify_extracted_payload(S / "extracted_pkg_archive", "x.7z")
+    _pi = app._item_from_payload_path(_kind, _paths[0])
+    ok("archive.payload.pkg", _kind == "pkg" and _paths[0].name == "Title [PPSA00004].pkg"
+       and _pi.path == _paths[0] and m.chain_source_kind(_pi) == "pkg", f"{_kind} {_paths}")
+    # J6f) the archive password prompt: sized to its content, and shown only when no
+    # saved password opens the header (an odd size is no password problem)
+    _dlg = m.ArchivePasswordPrompt(app, "Example.part1.rar"); root.update_idletasks()
+    ok("password.prompt.fits-its-content", _dlg._size is None and _dlg.winfo_reqheight() > 230,
+       f"size={_dlg._size} req={_dlg.winfo_reqheight()}")
+    _dlg.destroy()
+    _asked = []
+    class _FakePrompt:
+        def __init__(self, _app, name): _asked.append(name); self.password = ""
+    _real_prompt, _real_probe = m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header
+    m.ArchivePasswordPrompt = _FakePrompt
+    try:
+        _ai = m.GameItem.__new__(m.GameItem)
+        _ai.source_kind, _ai.extracted_size, _ai.size = "archive", 0, 1000
+        _ai.archive_path, _ai.header_locked, _ai.password = S / "Example.part1.rar", False, None
+        app._resolve_archive_password(_ai)
+        _no_prompt_when_open = not _asked
+        _ai.header_locked = True
+        _saved_list = list(app.archive_passwords); app.archive_passwords = ["saved-pass"]
+        m.ArchiveExtractor.probe_header = staticmethod(lambda _a, _p=None: (True, 800))
+        app._resolve_archive_password(_ai)
+        app.archive_passwords = _saved_list
+        _no_prompt_when_saved_opens = not _asked and _ai.header_locked is False and _ai.extracted_size == 800
+        _ai.header_locked, _ai.extracted_size = True, 0
+        m.ArchiveExtractor.probe_header = staticmethod(lambda _a, _p=None: (False, 0))
+        app._resolve_archive_password(_ai)
+    finally:
+        m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header = _real_prompt, _real_probe
+    ok("password.prompt.only-when-locked", _no_prompt_when_open and _no_prompt_when_saved_opens
+       and _asked == ["Example.part1.rar"], f"{_no_prompt_when_open} {_no_prompt_when_saved_opens} {_asked}")
+    # J6g) a silent step reports progress: the backend's bars move the stage, % and speed
+    _pj = m.GameItem.from_chain(HBT, to="ffpfsc")
+    _pc, _pcwd, _pout, _ptmp = app.build_command(_pj)
+    _pw = m.CLIWorker(app, _pj, _pc, _pcwd, _pout, _ptmp)
+    _pw._handle_line("[PHASE] Extracting")
+    _pw._handle_line("[#############-------------------]  42% extract @ 812.40 MB/s ETA 57s")
+    ok("progress.silent-step-bars", _pw.phase == "Extracting" and _pw.speed == "812.40 MB/s",
+       f"phase={_pw.phase} speed={_pw.speed}")
+    # J6g2) a chain that unpacks a .pkg first: extract-first bands, forward only, one value
+    _cpk = S / "chain_src" / "Title.pkg"; _cpk.parent.mkdir(exist_ok=True); _cpk.write_bytes(b"\x7fCNT")
+    _cji = m.GameItem.from_chain(_cpk, to="ffpfsc")
+    _ccmd = ["py", "cli.py", str(_cpk), str(OUT), "--to", "ffpfsc", "--backport-target", "10.01"]
+    _cw = m.CLIWorker(app, _cji, _ccmd, _pcwd, _pout, _ptmp); _cw.start_time = time.time()
+    ok("progress.chain-extract-first-bands", _cw._weights is m.CLIWorker.CHAIN_WEIGHTS
+       and _cw._stage_order is m.CLIWorker._EXTRACT_FIRST_ORDER, str(_cw._weights))
+    _sent = []
+    _real_su = app.status_update
+    app.status_update = lambda *a, **k: _sent.append((a, k))
+    try:
+        _cw._handle_line("[PHASE] Extracting")
+        _cw._handle_line("[################################] 100% extract the .pkg to SAMSUNG: 45.8 of 45.8 GB")
+        _after_extract = _cw._overall()
+        _cji._from_archive = True
+        _queue_after_extract = _cw._job_overall()
+        _cw._handle_line("[PHASE] Reading Game")
+        _cw._handle_line("[PHASE] Scanning Files")          # the fPKG builder's own marker: backward
+        _stays = _cw.phase
+        _cw._handle_line("[########------------------------]  25% write @ 900.00 MB/s ETA 60s")
+        _temp_ok = _cw.phase == "Creating Temp PFS"
+        _last_sent = _sent[-1][0][4] if _sent else None
+        _hb = _cw._job_overall()
+    finally:
+        app.status_update = _real_su
+    ok("progress.pkg-extract-is-not-94pct", _after_extract == 30 and abs(_queue_after_extract - 47.5) < 0.01,
+       f"{_after_extract} {_queue_after_extract}")
+    ok("progress.no-backward-phase", _stays == "Reading Game" and _temp_ok, f"{_stays} {_cw.phase}")
+    ok("progress.heartbeat-equals-lines", _last_sent is not None and abs(_hb - _last_sent) < 0.01
+       and all(k.get("job") is _cji for _a, k in _sent), f"{_hb} {_last_sent}")
+    # MkPFS's per-file "0% write" lines must not override the byte meter's bar
+    _mw = m.CLIWorker(app, _pj, _pc, _pcwd, _pout, _ptmp); _mw.start_time = time.time()
+    _msent = []
+    app.status_update = lambda *a, **k: _msent.append(a)
+    try:
+        _mw._handle_line("[#############-------------------]  42% write the PFS image on SAMSUNG: 34.0 of 80.9 GB @ 137.00 MB/s ETA 5m")
+        _mw._handle_line("[--------------------------------]   0% write @ 457.08 MB/s ETA 181s")
+        _lag_dropped = _mw.speed == "137.00 MB/s" and _msent and "34.0 of 80.9" in _msent[-1][1]
+        _mw._lead_line = (_mw._lead_line[0], time.time() - 10)   # the meter went quiet
+        _mw._handle_line("[--------------------------------]   0% write @ 300.00 MB/s ETA 60s")
+        _later_passes = _mw.speed == "300.00 MB/s" and _mw.stage_progress[_mw.phase] == 42
+    finally:
+        app.status_update = _real_su
+    ok("progress.lagging-bar-dropped", bool(_lag_dropped) and _later_passes,
+       f"{_mw.phase} {_mw.speed} {_msent[-1][1] if _msent else ''}")
+    # a folder source skips the unpack band instead of jumping over it
+    _fw = m.CLIWorker(app, _pj, ["py", "cli.py", str(HBT), str(OUT), "--to", "ffpfsc", "--sign"],
+                      _pcwd, _pout, _ptmp)
+    ok("progress.folder-chain-without-extract-band", "Extracting" not in _fw._weights
+       and _fw._weights["Reading Game"][0] < 5 and _fw._weights["Cleaning Up"][1] == 100, str(_fw._weights))
+    # a chain to .pkg locks bars to the fPKG phases and skips the ShadowMount check
+    _kw = m.CLIWorker(app, _cji, ["py", "cli.py", str(_cpk), str(OUT), "--to", "pkg"], _pcwd, _pout, _ptmp)
+    ok("progress.chain-to-pkg-is-fpkg", _kw._is_fpkg and _kw._weights is m.CLIWorker.FPKG_BUILD_WEIGHTS, "")
+    # J6g3) the queue bar: a side message cannot reset the running job, and it never goes back
+    _qi = m.GameItem.from_chain(_cpk, to="ffpfsc"); _qi.status = "Running"
+    app.queue.insert(0, _qi); app.update_queue_box(); app._batch_running = True
+    app._begin_job_progress(_qi)
+    app.status_update("Extracting", "x", "Extracting", 50, 60, "—", "—", "—", job=_qi)
+    pump(lambda: app._cur_job_pct == 60, timeout=5.0)
+    app.status_update("Ready", "3 games added to queue.", "Ready", 0, 0, "00:00", "—", "—", side=True)
+    pump(lambda: "3 games added" in app.footer_var.get(), timeout=5.0)
+    ok("queue-bar.side-message-in-footer", app._cur_job_pct == 60 and "3 games added" in app.footer_var.get()
+       and app.big_status_var.get() != "Ready", f"{app._cur_job_pct} {app.big_status_var.get()}")
+    app.status_update("Still Working", "y", "Extracting", 50, 41, "—", "—", "—", job=_qi)
+    pump(lambda: "Still Working" in app.footer_var.get(), timeout=5.0)
+    ok("queue-bar.never-backward", app._cur_job_pct == 60, f"{app._cur_job_pct}")
+    app._batch_running = False; app.queue.remove(_qi); app.update_queue_box()
+    # J6g4) the space check reads the game size out of a .pkg (the file is compressed)
+    _real_li = None
+    try:
+        import fpkg as _fp
+        _real_li = _fp.list_inner
+        _fp.list_inner = lambda _p, **_k: {"entries": [{"type": "file", "size": 900}, {"type": "dir"},
+                                                        {"type": "file", "size": 1100}]}
+        _si = m.GameItem.from_chain(_cpk, to="ffpfsc")
+        _got = app._probe_pkg_content(_si)
+    finally:
+        if _real_li is not None:
+            _fp.list_inner = _real_li
+    ok("space.pkg-game-size", _got == 2000 and _si.pkg_content_size == 2000 and _si.extracted_size == 2000
+       and m._peak_factor_for(_si) == m.PKG_UNPACK_PEAK_FACTOR, f"{_got} {_si.extracted_size}")
+    app._active_item = None
+    _ci = app._card_info_text(_pj)
+    ok("card.info.drives", "writes to" in _ci.get("Drives", "") and "works on" in _ci.get("Drives", ""),
+       _ci.get("Drives", ""))
+    # J6h) a cancel keeps a finished extraction until the job leaves the queue
+    _kt = S / "keep_temp"; (_kt / "_extracted" / "Arc__1" / "inner").mkdir(parents=True, exist_ok=True)
+    _kpkg = _kt / "_extracted" / "Arc__1" / "inner" / "Title.pkg"; _kpkg.write_bytes(b"\x7fCNT")
+    _korg = S / "Arc.7z"; _korg.write_bytes(b"7z")
+    _old_temp = app.temp_var.get(); app.temp_var.set(str(_kt))
+    _ki = m.GameItem.from_chain(_kpkg, to="ffpfsc")
+    _ki.origin_archive, _ki.status = str(_korg), "Cancelled"
+    ok("cancel.extract-complete", app._extract_is_complete(_ki)
+       and app._extract_dir_for_item(_ki) == (_kt / "_extracted" / "Arc__1").resolve(), "")
+    _ki.kept_extract = True
+    ok("cancel.retry-uses-kept-copy", app._rearm_from_archive(_ki) is False and _ki.path == _kpkg
+       and _ki.archive_path is None, f"{_ki.path} {_ki.archive_path}")
+    _ki.kept_extract = False
+    ok("cancel.retry-without-copy-starts-at-archive", app._rearm_from_archive(_ki) is True
+       and _ki.archive_path == _korg and _ki.path is None, f"{_ki.path} {_ki.archive_path}")
+    # removing a job deletes the copy it kept
+    _kj = m.GameItem.from_chain(_kpkg, to="ffpfsc"); _kj.kept_extract = True; _kj.status = "Cancelled"
+    app.queue.append(_kj); app.update_queue_box(select_item=_kj); root.update()
+    app.queue_listbox.selection_clear(0, "end"); app.queue_listbox.selection_set(app.queue.index(_kj))
+    app.queue_remove_selected()
+    pump(lambda: not (_kt / "_extracted" / "Arc__1").exists(), timeout=10.0)
+    ok("cancel.remove-deletes-kept-copy", _kj not in app.queue and not (_kt / "_extracted" / "Arc__1").exists(), "")
+    # the startup sweep offers everything but a kept copy
+    (_kt / "_extracted" / "Keep__2").mkdir(parents=True, exist_ok=True)
+    (_kt / "_extracted" / "Keep__2" / "Title.pkg").write_bytes(b"\x7fCNT")
+    (_kt / "_extracted" / "Other__3").mkdir(parents=True, exist_ok=True)
+    with open(_kt / "_extracted" / "Other__3" / "big.bin", "wb") as _f:
+        _f.truncate(70 * 1024 * 1024)
+    _kk = m.GameItem.from_chain(_kt / "_extracted" / "Keep__2" / "Title.pkg", to="ffpfsc")
+    _kk.kept_extract = True; _kk.status = "Cancelled"; app.queue.append(_kk)
+    _offered = []
+    _real_prompt_sweep = app._prompt_startup_sweep
+    app._prompt_startup_sweep = lambda targets, total: _offered.append([str(x) for x in targets])
+    _old_out = app.output_var.get(); app.output_var.set(str(_kt))
+    class _NowThread:                  # run the scan on this thread: no Tk mainloop in the driver
+        def __init__(self, target=None, daemon=None, **_kw): self._t = target
+        def start(self): self._t()
+    _real_thread = m.threading.Thread; m.threading.Thread = _NowThread
+    try:
+        app._offer_startup_sweep()
+        pump(lambda: bool(_offered), timeout=10.0)
+    finally:
+        m.threading.Thread = _real_thread
+        app._prompt_startup_sweep = _real_prompt_sweep
+        app.output_var.set(_old_out)
+    _off = _offered[0] if _offered else []
+    ok("sweep.spares-kept-copy", any(x.endswith("Other__3") for x in _off)
+       and not any(x.endswith("Keep__2") or x.endswith("_extracted") for x in _off), str(_off))
+    app.queue.remove(_kk); app.temp_var.set(_old_temp); app.update_queue_box(); root.update()
+    # after a restart, a saved job whose extracted copy is gone starts again at its archive
+    _saved_q, _live_q = m.load_settings().get("queue"), list(app.queue)
+    _src_item = m.GameItem.from_chain(_korg, to="ffpfsc")          # a real job, saved as the app saves it
+    _entry = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(_src_item).items()
+              if not k.startswith("_") and k != "artwork" and (v is None or isinstance(v, (str, int, float, bool, Path)))}
+    _entry.update({"status": "Cancelled", "path": str(S / "gone" / "Title.pkg"), "archive_path": None,
+                   "source_kind": "inplace", "origin_archive": str(_korg), "origin_extracted_size": 1234})
+    m.save_settings({"queue": [_entry]})
+    app.queue.clear(); app._restore_queue()
+    _rq = app.queue[0] if app.queue else None
+    ok("restore.gone-copy-starts-at-archive", _rq is not None and _rq.archive_path == _korg and _rq.path is None
+       and _rq.status == "Pending Extract" and _rq.extracted_size == 1234,
+       f"{getattr(_rq, 'archive_path', None)} {getattr(_rq, 'status', None)}")
+    app.queue[:] = _live_q; m.save_settings({"queue": _saved_q or []}); app.update_queue_box(); root.update()
     # J6d) the details pane: facts about the job, a log that fills the height, a failure reason
     jc2 = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job"))
     jc2.compression_level = 5
@@ -619,11 +847,23 @@ try:
     n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
     ok("job.backport.add-refuses-unusable-target", len(app.queue) == n0 and any("5.10" in x for x in errors),
        str(errors))
-    jd7.backport_target_var.set("9.60"); jd7.backport_libs_var.set(str(fwr)); root.update()
+    ok("job.backport.no-libraries-field", not hasattr(jd7, "backport_libs_var"), "")
+    jd7.backport_target_var.set("9.60"); app.backport_libs_var.set(str(fwr)); root.update()
     n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
     ok("job.backport.refuses-firmware-folder-as-patched", len(app.queue) == n0
-       and any("original libraries" in x for x in errors), str(errors))
-    jd7.backport_libs_var.set(""); jd7.backport_target_var.set("5.02"); root.update()
+       and any("original libraries" in x and "Settings" in x for x in errors), str(errors))
+    app.backport_libs_var.set("")
+    ok("settings.patched-libs-cleaned", m._sane_patched_libs(str(fwr), str(fwr)) == ""
+       and m._sane_patched_libs(str(fwr / "9.60"), str(fwr)) == ""
+       and m._sane_patched_libs(str(OUT), str(fwr)) == str(OUT) and m._sane_patched_libs("", str(fwr)) == "", "")
+    _pl = S / "patched_sets"; (_pl / "9.60").mkdir(parents=True, exist_ok=True)
+    app.backport_libs_var.set(str(_pl))
+    _bj = m.GameItem.from_chain(HBT, to="ffpfsc", backport_target="9.60")
+    _ba = app._backport_args(_bj)
+    ok("job.backport.takes-settings-libraries", _bj.backport_libs_root is None
+       and _ba[_ba.index("--backport-libs") + 1] == str(_pl), str(_ba))
+    app.backport_libs_var.set("")
+    jd7.backport_target_var.set("5.02"); root.update()
     jd7._check_compat()
     pump(lambda: jd7.check_var.get() not in ("", "Checking…"), timeout=60.0)
     ok("job.check.shows-verdict", jd7.check_var.get().startswith(("Not checked", "The game uses", "Firmware",

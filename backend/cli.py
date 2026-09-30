@@ -952,6 +952,214 @@ def _fully_unwrap(out_dir: Path, mkpfs_cmd_base, mkpfs_cwd) -> None:
         return   # nothing single to unwrap (empty / multiple images)
 
 
+def _fmt_rate(bytes_per_s: float) -> str:
+    """'812.40 MB/s' / '1.02 GB/s', the way mkpfs writes its bars (the GUI reads them)."""
+    mb = bytes_per_s / (1024 * 1024)
+    return f"{mb / 1024:.2f} GB/s" if mb >= 1024 else f"{mb:.2f} MB/s"
+
+
+def _fmt_eta(seconds: float) -> str:
+    """mkpfs's ETA: whole seconds under an hour, decimal minutes from there ('84.2m')."""
+    return f"{int(seconds)}s" if seconds < 3600 else f"{seconds / 60:.1f}m"
+
+
+def _tree_bytes(folder: Path) -> int:
+    """Bytes in the files under *folder* so far (files still being written count too)."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(folder):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _progress_line(done: int, total: int, elapsed: float, label: str) -> str:
+    """One mkpfs-style bar line: '[####----]  42% extract … @ 812.40 MB/s ETA 57s'. The
+    label names what happens; '{done}' and '{total}' in it become gigabytes."""
+    pct = min(99, int(done * 100 / total)) if total else 0
+    width = 32
+    fill = min(width, int(width * pct / 100))
+    label = label() if callable(label) else label
+    text = label.replace("{done}", f"{min(done, total or done) / 1024 ** 3:.1f}").replace(
+        "{total}", f"{total / 1024 ** 3:.1f}")
+    line = f"[{'#' * fill}{'-' * (width - fill)}] {pct:3d}% {text}"
+    if elapsed > 0.5 and done > 0:
+        rate = done / elapsed
+        line += f" @ {_fmt_rate(rate)}"
+        if total > done:
+            line += f" ETA {_fmt_eta((total - done) / rate)}"
+    return line
+
+
+class _RUsageV4(__import__("ctypes").Structure):
+    """rusage_info_v4 from <sys/resource.h>, as far as the write counter."""
+    _fields_ = [("ri_uuid", __import__("ctypes").c_uint8 * 16)] + [(n, __import__("ctypes").c_uint64) for n in (
+        "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups", "ri_interrupt_wkups", "ri_pageins",
+        "ri_wired_size", "ri_resident_size", "ri_phys_footprint", "ri_proc_start_abstime",
+        "ri_proc_exit_abstime", "ri_child_user_time", "ri_child_system_time", "ri_child_pkg_idle_wkups",
+        "ri_child_interrupt_wkups", "ri_child_pageins", "ri_child_elapsed_abstime", "ri_diskio_bytesread",
+        "ri_diskio_byteswritten", "ri_cpu_time_qos_default", "ri_cpu_time_qos_maintenance",
+        "ri_cpu_time_qos_background", "ri_cpu_time_qos_utility", "ri_cpu_time_qos_legacy",
+        "ri_cpu_time_qos_user_initiated", "ri_cpu_time_qos_user_interactive", "ri_billed_system_time",
+        "ri_serviced_system_time", "ri_logical_writes", "ri_lifetime_max_phys_footprint",
+        "ri_instructions", "ri_cycles", "ri_billed_energy", "ri_serviced_energy",
+        "ri_interval_max_phys_footprint", "ri_runnable_time")]
+
+
+def _proc_bytes_written(pid: int) -> int | None:
+    """Bytes process *pid* has written, from the kernel (macOS proc_pid_rusage; psutil
+    elsewhere). None when the system does not tell. Unlike the size of the files it
+    writes, this also moves while a tool fills a file it created at full size first,
+    which is what the .pkg extractor does (measured on exFAT/FSKit and APFS)."""
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+            info = _RUsageV4()
+            if lib.proc_pid_rusage(int(pid), 4, ctypes.byref(info)) == 0:
+                return int(info.ri_diskio_byteswritten)
+        except Exception:
+            return None
+        return None
+    try:
+        import psutil
+        return int(psutil.Process(int(pid)).io_counters().write_bytes)
+    except Exception:
+        return None
+
+
+def _meter_process(proc, total: int, label, interval: float = 1.0) -> None:
+    """Print progress bars for the running *proc* from its write counter until it exits.
+    For a tool whose own bar is too coarse: MkPFS pass 1 counts whole files, so a game
+    with one 57 GB file sits at "0 % write" for ten minutes while the data flows. Nothing
+    is printed before 1 % is written, so the tool's earlier steps (scan, read) keep their
+    own bars; nothing at all when the system does not tell."""
+    import time as _time
+    started = _time.monotonic()
+    while True:
+        try:
+            proc.wait(timeout=interval)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        done = _proc_bytes_written(proc.pid)
+        if done is None or not total:
+            return
+        if done * 100 >= total:
+            # The tool writes its own bars to stderr as "\r<bar>" without a newline; the
+            # leading "\r" ends that partial line, or a reader that splits on \r and \n
+            # (the GUI) would see "0% write[####] 42% write ..." and take the 0 %.
+            print("\r" + _progress_line(done, total, _time.monotonic() - started, label), flush=True)
+
+
+def _run_with_folder_progress(work, folder: Path, total: int, label: str, interval: float = 1.0,
+                              measure=None):
+    """Run *work()* (which fills *folder*) and print a progress bar line every *interval*
+    seconds, compared with the expected *total*. *measure()* returns the bytes done (the
+    writing tool's own write counter); without it, or when it cannot tell, the bytes
+    already on disk count. For steps whose tool prints nothing until it is done (a full
+    .pkg extract): without this the window sits at 0 % for minutes. Returns what *work*
+    returns."""
+    import threading
+    import time as _time
+    result, error = {}, {}
+
+    def _target():
+        try:
+            result["value"] = work()
+        except BaseException as exc:          # re-raised in the caller's thread
+            error["exc"] = exc
+
+    runner = threading.Thread(target=_target, daemon=True)
+    started = _time.monotonic()
+    runner.start()
+    while runner.is_alive():
+        runner.join(interval)
+        if runner.is_alive() and total:
+            done = measure() if measure is not None else None
+            if done is None:
+                done = _tree_bytes(folder)
+            print(_progress_line(done, total, _time.monotonic() - started, label), flush=True)
+    if "exc" in error:
+        raise error["exc"]
+    if total:
+        width = 32
+        print(f"[{'#' * width}] 100% {label}", flush=True)
+    return result.get("value")
+
+
+def _pkg_content_size(pkg: Path) -> int:
+    """Bytes of the files a full extract of *pkg* writes (its inner /app0 tree and the
+    sce_sys files of the CNT), read from the package's directory, not by decoding it.
+    0 when the listing fails; the extract then runs without a bar."""
+    try:
+        import fpkg as _fpkg
+        doc = _fpkg.list_inner(pkg)
+        return sum(int(e.get("size") or 0) for e in doc.get("entries", []) if e.get("type") == "file")
+    except Exception:
+        return 0
+
+
+def _pkg_extract_plan(pkg: Path, content: int) -> int:
+    """Bytes a full .pkg extract writes, all on the drive it unpacks to. The package tool
+    (LibProsperoPkg ExtractInnerFiles) works in three steps: it decrypts the outer image
+    into a temp file (about the package size), decodes the inner image from it into a
+    second temp file (about the size of the game files) and then writes the files. The
+    decoded image and the files sit side by side at the end, so the drive needs about
+    twice the game's size for a moment."""
+    try:
+        size = Path(pkg).stat().st_size
+    except OSError:
+        size = 0
+    return size + 2 * content if content else 0
+
+
+def _pkg_extract_step(folder: Path) -> int:
+    """Which of the package tool's three extract steps runs, from its temp files in
+    *folder*: 1 decrypt (outer temp only), 2 decode (the inner image is being written
+    under a second temp name), 3 write the files (the finished inner image)."""
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(".")]
+    except OSError:
+        return 0
+    if any(n.startswith("..libprospero-inner-") for n in names):
+        return 2
+    if any(n.startswith(".libprospero-inner-") for n in names):
+        return 3
+    if any(n.startswith(".libprospero-outer-") for n in names):
+        return 1
+    return 0
+
+
+_PKG_EXTRACT_STEPS = {1: "decrypt the package", 2: "unpack the game image", 3: "write the game files"}
+
+
+def _pkg_extract_label(folder: Path) -> str:
+    """Progress label for a full .pkg extract: where it writes and which step runs."""
+    step = _pkg_extract_step(folder)
+    what = f", step {step} of 3: {_PKG_EXTRACT_STEPS[step]}" if step else ""
+    return f"extract the .pkg on {_drive_label(folder)}{what} ({{done}} of {{total}} GB written)"
+
+
+def _drive_label(path: Path) -> str:
+    """The drive's volume name ('SAMSUNG'), or 'the system drive'."""
+    parts = Path(path).resolve().parts
+    return parts[2] if len(parts) > 2 and parts[1] == "Volumes" else "the system drive"
+
+
+def _describe_drive(path: Path) -> str:
+    """'SAMSUNG, 225.30 GB free' for the drive that holds *path*."""
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        return str(path)
+    parts = Path(path).resolve().parts
+    name = parts[2] if len(parts) > 2 and parts[1] == "Volumes" else "the system drive"
+    return f"{name}, {free / 1024 ** 3:.2f} GB free"
+
+
 def _phase(name: str) -> None:
     """Emit a machine-readable phase marker the GUI maps directly to its stage
     tracker (with force=True, so multi-phase jobs like patch/convert — which
@@ -1218,8 +1426,16 @@ def pack_folder_uncompressed(
         cmd.append("--no-verify-structure")
     cmd += [str(game_folder), str(build_path)]
     print(f"[INFO] Running: {shlex.join(cmd)}", flush=True)
+    total = _tree_bytes(game_folder)
     try:
-        subprocess.run(cmd, cwd=mkpfs_cwd, check=True)
+        proc = subprocess.Popen(cmd, cwd=mkpfs_cwd)
+        try:
+            _meter_process(proc, total, f"write the PFS image on {_drive_label(build_path.parent)}: "
+                                        f"{{done}} of {{total}} GB")
+        finally:
+            rc = proc.wait()
+        if rc:
+            raise subprocess.CalledProcessError(rc, cmd)
     except subprocess.CalledProcessError as e:
         _discard_build_output(build_path, pfs_path)
         _mkpfs_error_hint(e, pfs_path)
@@ -1676,7 +1892,8 @@ def _chain_materialize(src: Path, scratch_root: Path, args) -> tuple[Path, Path 
     scratch = Path(tempfile.mkdtemp(prefix="chain-", dir=str(scratch_root)))
     kind = _chain_source_kind(src)
     _phase("Extracting")
-    print(f"[INFO] Unpacking {src.name} ({kind}) into scratch before applying changes...", flush=True)
+    print(f"[INFO] Unpacking {src.name} ({kind}) into {scratch} ({_describe_drive(scratch)}) before "
+          f"the next step...", flush=True)
     try:
         if kind in ("exfat", "ffpkg"):
             if not _extract_exfat_to(src, scratch):
@@ -1687,8 +1904,20 @@ def _chain_materialize(src: Path, scratch_root: Path, args) -> tuple[Path, Path 
             _fully_unwrap(scratch, cmd, cwd)
         elif kind == "pkg":
             import fpkg as _fpkg
-            rc = _fpkg.extract(src, scratch, passcode=args.fpkg_passcode,
-                               on_line=lambda l: print(l, flush=True))
+            content = _pkg_content_size(src)
+            total = _pkg_extract_plan(src, content)
+            if content:
+                print(f"[INFO] The package holds {content / 1024 ** 3:.2f} GB of files. Unpacking it writes "
+                      f"about {total / 1024 ** 3:.2f} GB on {_drive_label(scratch)} in three steps (decrypt, "
+                      f"unpack the game image, write the files) and needs about "
+                      f"{2 * content / 1024 ** 3:.2f} GB there at the end.", flush=True)
+            tool = {}
+            rc = _run_with_folder_progress(
+                lambda: _fpkg.extract(src, scratch, passcode=args.fpkg_passcode,
+                                      on_line=lambda l: print(l, flush=True),
+                                      on_start=lambda proc: tool.update(pid=proc.pid)),
+                scratch, total, lambda: _pkg_extract_label(scratch),
+                measure=lambda: _proc_bytes_written(tool["pid"]) if "pid" in tool else 0)
             if rc != 0:
                 raise RuntimeError(f"fPKG extract failed (rc={rc})")
         elif kind in ("zip", "rar"):
@@ -1709,6 +1938,8 @@ def _chain_transforms(root: Path, args, scratch_root: Path) -> list[str]:
     lowered too, and fake-signing turns raw ELFs into SELFs the backport pass skips.
     Returns the list of changes applied (for the log)."""
     done: list[str] = []
+    if args.patch or args.backport_target or getattr(args, "chain_sign", False):
+        _phase("Reading Game")
     if args.patch:
         patch_arg = Path(args.patch).resolve()
         if not patch_arg.exists():
@@ -2280,11 +2511,19 @@ def main() -> None:
             src = Path(args.fpkg_extract).resolve()
             if not src.is_file():
                 print(f"[ERROR] fPKG not found: {src}", flush=True); sys.exit(1)
-            print(f"[INFO] fPKG extract: {src.name} -> {out_dir}", flush=True)
+            print(f"[INFO] fPKG extract: {src.name} -> {out_dir} ({_describe_drive(out_dir.parent if not out_dir.exists() else out_dir)})",
+                  flush=True)
             _phase("Extracting")
             _bar(0, "extract inner PFS + CNT metadata")
-            rc = _fpkg.extract(src, out_dir, passcode=args.fpkg_passcode,
-                               on_line=lambda l: print(l, flush=True))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _total = _pkg_extract_plan(src, _pkg_content_size(src))
+            _tool = {}
+            rc = _run_with_folder_progress(
+                lambda: _fpkg.extract(src, out_dir, passcode=args.fpkg_passcode,
+                                      on_line=lambda l: print(l, flush=True),
+                                      on_start=lambda proc: _tool.update(pid=proc.pid)),
+                out_dir, _total, lambda: _pkg_extract_label(out_dir),
+                measure=lambda: _proc_bytes_written(_tool["pid"]) if "pid" in _tool else 0)
             if rc != 0:
                 print(f"\n[ERROR] fPKG extract failed (rc={rc}).", flush=True); sys.exit(1)
             _bar(100, "extract inner PFS + CNT metadata")

@@ -3,7 +3,39 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v2.0.2  (current)
+  v2.0.3  (current)
+────────────────────────────────────────────────────────────────────────
+
+THE QUEUE KEEPS ITS ORDER, AND YOU SET IT
+
+  - Jobs stay where you added them. A job that finished, failed or was
+    skipped used to move to the end of the list, and the next job was
+    pulled to the top; now each one only changes its mark. The queue
+    works through the jobs that have not run yet from the top down.
+  - Drag a job to another place in the list to change what runs when; a
+    line shows where it lands. Right-click › Run next moves a job above
+    the first one still waiting, and Move up / Move down stay there too.
+    The running job can be moved as well; it keeps running.
+  - Retry runs that job next without moving it.
+  - The queue bar counts by job, so it stays right when you reorder, and
+    a job added while the queue runs now counts in "Job n of N".
+
+PROGRESS AND TIME LEFT OVER ALL JOBS
+
+  - While the queue runs, the foot of the queue list shows how far the
+    whole run is and about how long it still takes: "All jobs 39 %" on
+    the left, "about 54 min left" on the right, with a thin grey bar, so
+    blue stays the colour of the running job. The status bar shows the
+    same next to "Job 2 of 5", in every view.
+  - The share counts each job by its size. The time left uses the pace
+    of the jobs this run has finished (seconds per GB) for the gigabytes
+    still to do; before the first one is finished it uses the running
+    job's pace. It appears after the first minute and a half, in whole
+    minutes, and in five-minute steps beyond an hour, because a single
+    job's pace changes between unpacking, building and compressing.
+
+────────────────────────────────────────────────────────────────────────
+  v2.0.2
 ────────────────────────────────────────────────────────────────────────
 
 AN OUTPUT THAT IS ALREADY THERE IS SKIPPED

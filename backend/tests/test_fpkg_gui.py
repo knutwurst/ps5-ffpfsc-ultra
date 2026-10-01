@@ -897,8 +897,9 @@ try:
     app.start = lambda rearm_failed=True: _starts.append(rearm_failed)
     _gi.status = "Failed"; app.queue.remove(_gi); app.queue.append(_gi)
     app._retry_job(_gi)
-    ok("retry.runs-this-job-only", app.queue[0] is _gi and _gi.status in ("Pending Extract", "Queued")
-       and _starts == [False], f"{_gi.status} {_starts}")
+    ok("retry.runs-this-job-only", app._run_next is _gi and app.queue[-1] is _gi
+       and _gi.status in ("Pending Extract", "Queued") and _starts == [False], f"{_gi.status} {_starts}")
+    app._run_next = None
     app.start = _real_start
     # the next job of a batch frees a failed job's copy when it needs the space
     _rel = _kt / "_extracted" / "Rel__5"; _rel.mkdir(parents=True, exist_ok=True); (_rel / "Title.pkg").write_bytes(b"x")
@@ -932,9 +933,9 @@ try:
     app.finish(True, "ok", "cmd")
     pump(lambda: _dj.status == "Done", timeout=10.0); root.update()
     _rows = list(app.queue_listbox.rows)
-    ok("queue.done-job-stays", _dj in app.queue and app.queue[-1] is _dj and _dj.status == "Done"
+    ok("queue.done-job-stays-in-place", app.queue[0] is _dj and _dj.status == "Done"
        and app._clear_btn._state == "normal", f"{_dj.status} {[i.status for i in app.queue]}")
-    ok("queue.done-row-is-green", bool(_rows) and _rows[-1].get("state") == "done", str([r.get("state") for r in _rows]))
+    ok("queue.done-row-is-green", bool(_rows) and _rows[0].get("state") == "done", str([r.get("state") for r in _rows]))
     # only the jobs that run count for "Game n/N"
     app._batch_running = False; app._ensure_batch_started()
     ok("queue.batch-counts-only-runnable", app._batch_total == 0 and not app._batch_running, str(app._batch_total))
@@ -964,7 +965,7 @@ try:
     app.auto_remove_done_var.set(False)
     # clear all keeps the running job
     _r1 = m.GameItem.from_chain(HBT, to="ffpfsc"); _r2 = m.GameItem.from_chain(HBT, to="ffpfsc"); _r2.status = "Done"
-    app.queue[:] = [_r1, _r2]; app._batch_running = True
+    app.queue[:] = [_r1, _r2]; app._batch_running = True; app._active_item = _r1
     m.messagebox.askyesno = lambda *a, **k: True
     try:
         app.clear_jobs("all")
@@ -983,6 +984,88 @@ try:
     ok("queue.restore-keeps-done-record", len(app.queue) == 1 and app.queue[0].status == "Done", str(len(app.queue)))
     m.save_settings({"queue": _saved_q2 or []})
     app.summary_popup_var.set(_real_sum); app.open_output_var.set(_real_open)
+    # J6o) progress and time left over all jobs of the run
+    ok("all.fmt-left", (app._fmt_left(30), app._fmt_left(600), app._fmt_left(7800), app._fmt_left(7320))
+       == ("about a minute left", "about 10 min left", "about 2 h 10 min left", "about 2 h left"),
+       str((app._fmt_left(30), app._fmt_left(600), app._fmt_left(7800), app._fmt_left(7320))))
+    _GB = 1024 ** 3
+    _cj2 = m.GameItem.from_chain(HBT, to="ffpfsc")
+    app._batch_t0 = time.time() - 30
+    ok("all.no-guess-in-the-first-90-s", app._estimate_left(10 * _GB, 10 * _GB, 50, _cj2) is None, "")
+    app._batch_t0 = time.time() - 200
+    app._batch_fin_secs, app._batch_fin_bytes = 0.0, 0
+    app._job_t0 = {id(_cj2): time.time() - 100}
+    _e1 = app._estimate_left(0, 100 * _GB, 10, _cj2)          # 10 GB in 100 s → 90 GB left ≈ 900 s
+    app._batch_fin_secs, app._batch_fin_bytes = 1000.0, 100 * _GB
+    _e2 = app._estimate_left(200 * _GB, 50 * _GB, 50, _cj2)   # 10 s/GB × 225 GB = 2250 s
+    ok("all.estimate-from-pace", _e1 is not None and abs(_e1 - 900) < 5 and _e2 is not None and abs(_e2 - 2250) < 5,
+       f"{_e1} {_e2}")
+    _sv = (app._batch_running, app._batch_total, app._batch_done, app._batch_failed)
+    app._batch_running, app._batch_total, app._batch_done, app._batch_failed = True, 5, 1, 0
+    app._all_frac, app._all_eta = 0.23, 7800
+    app._show_add_progress(); app._update_batch_counter(); root.update()
+    _line = f"{app._all_left_var.get()} | {app._all_right_var.get()}"
+    _vis, _top_free = app._all_box.winfo_manager(), app._add_box.winfo_manager() == ""
+    _foot = app.batch_counter_var.get()
+    _row = int(app._all_box.grid_info().get("row", -1)) if _vis else -1
+    app._batch_running = False
+    app._show_add_progress(); app._update_batch_counter(); root.update()
+    _hidden = app._all_box.winfo_manager() == ""
+    app._batch_running, app._batch_total, app._batch_done, app._batch_failed = _sv
+    app._all_frac = app._all_eta = None
+    ok("all.summary-at-the-foot-of-the-list", _vis == "grid" and _row == 3 and _top_free
+       and _line == "All jobs  23 % | about 2 h 10 min left" and _hidden and app._all_bar._fill == "muted",
+       f"{_line!r} {_vis!r} row={_row} top_free={_top_free} {_hidden}")
+    ok("all.status-bar", "Job 2 of 5" in _foot and "23 % of all" in _foot and "about 2 h 10 min left" in _foot, _foot)
+    # J6n) the list keeps the order the jobs were added in; the next job is the first waiting one
+    _o = [m.GameItem.from_chain(HBT, to="ffpfsc") for _ in range(4)]
+    for _k, _it in enumerate(_o):
+        _it.display_name = f"Job {_k}"; _it.status = "Queued"
+    app.queue[:] = list(_o); app._batch_running = False; app._active_item = None; app._run_next = None
+    app._retire_failed(_o[0], "Failed", "x"); app._retire_failed(_o[1], "Skipped", "y")
+    ok("order.finished-jobs-keep-their-place", app.queue == _o, str([i.display_name for i in app.queue]))
+    ok("order.next-is-first-waiting", app._next_pending() is _o[2], str(getattr(app._next_pending(), "display_name", None)))
+    app._run_next = _o[3]
+    ok("order.retry-runs-next-without-moving", app._next_pending() is _o[3] and app.queue == _o, "")
+    app._run_next = None
+    app.move_job(3, 2)                                  # drag the last job above the third
+    ok("order.drag-moves-job", app.queue == [_o[0], _o[1], _o[3], _o[2]], str([_o.index(i) for i in app.queue]))
+    app.queue[:] = list(_o); app.update_queue_box()
+    app.run_job_next(_o[3])
+    ok("order.run-next-moves-above-first-waiting", app.queue == [_o[0], _o[1], _o[3], _o[2]]
+       and app._next_pending() is _o[3], str([_o.index(i) for i in app.queue]))
+    # the list widget: press, drag past the threshold, release → on_move(src, dst)
+    _moves = []
+    _real_mv = app.queue_listbox.on_move
+    app.queue_listbox.on_move = lambda s, d: _moves.append((s, d))
+    app.queue[:] = list(_o); app.update_queue_box(); root.update()
+    _cv = app.queue_listbox.cv
+    _RH = app.queue_listbox.ROW_H
+    _cv.winfo_height = lambda: 400                      # the driver's window is withdrawn (no height)
+    _cv.yview_moveto(0); root.update()
+    class _E:
+        def __init__(self, y): self.y, self.x = y, 40
+    app.queue_listbox._click(_E(6 + 3 * _RH + 20))      # press on row 3
+    _pressed = app.queue_listbox._press
+    app.queue_listbox._drag(_E(6 + 3 * _RH + 17))       # under the threshold: still a click
+    _no_drag = app.queue_listbox._drop is None
+    app.queue_listbox._drag(_E(6 + 1 * _RH + 4))        # up to the line between rows 0 and 1
+    app.queue_listbox._release(_E(6 + 1 * _RH + 4))
+    app.queue_listbox.on_move = _real_mv
+    del _cv.winfo_height
+    ok("order.list-drag-and-drop", _no_drag and _moves == [(3, 1)],
+       f"{_moves} pressed={_pressed} rows={len(app.queue_listbox.rows)} no_drag={_no_drag}")
+    # a job added while the queue runs counts in "Job n of N"
+    app.queue[:] = list(_o[2:]); app._batch_running = False
+    for _it in app.queue:
+        _it.status = "Queued"
+    app._ensure_batch_started(); _tot0 = app._batch_total
+    app._add_jobs_async([HBT], lambda s: m.GameItem.from_chain(s, to="ffpfsc", output_path=str(OUT / "job")))
+    settle()
+    ok("order.mid-run-add-counts", _tot0 == 2 and app._batch_total == 3 and len(app._batch_items) == 3,
+       f"{_tot0} {app._batch_total}")
+    app._batch_running = False; app._update_batch_counter()
+    app.queue[:] = []; app._active_item = None; app.update_queue_box(); root.update()
     # J6k) an output that is already there is asked about at the start, before anything runs
     _xo = OUT / "exists_check"; shutil.rmtree(_xo, ignore_errors=True); _xo.mkdir(parents=True)
     _xj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(_xo)); _xj.auto_organize = True

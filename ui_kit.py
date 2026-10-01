@@ -784,12 +784,17 @@ class QueueList(tk.Frame):
 
     ROW_H = 50
 
+    DRAG_START = 6     # points the pointer moves before a press turns into a drag
+
     def __init__(self, parent, kit: Kit, on_select=None, on_activate=None, on_context=None,
-                 on_key_up=None, on_key_down=None, on_delete=None, bg="surface",
+                 on_key_up=None, on_key_down=None, on_delete=None, on_move=None, bg="surface",
                  empty_title="", empty_body=""):
         super().__init__(parent, bd=0, highlightthickness=0, bg=kit.c(bg))
         self.kit, self._bg = kit, bg
         self.on_select, self.on_activate, self.on_context = on_select, on_activate, on_context
+        self.on_move = on_move               # on_move(src, dst): drop row src before row dst
+        self._press = None                   # (row, y) of a left press that may become a drag
+        self._drop = None                    # insertion index (0..len) while dragging
         self.on_key_up, self.on_key_down, self.on_delete = on_key_up, on_key_down, on_delete
         self.empty_title, self.empty_body = empty_title, empty_body
         self.rows: list[dict] = []
@@ -808,6 +813,8 @@ class QueueList(tk.Frame):
         cv = self.cv
         on_resize(cv, self._schedule, settle_ms=70)
         cv.bind("<Button-1>", self._click)
+        cv.bind("<B1-Motion>", self._drag)
+        cv.bind("<ButtonRelease-1>", self._release)
         cv.bind("<Double-Button-1>", self._double)
         cv.bind("<Button-2>", self._context)          # right click on macOS
         cv.bind("<Control-Button-1>", self._context)
@@ -899,11 +906,43 @@ class QueueList(tk.Frame):
     def _click(self, e):
         self.cv.focus_set()
         i = self._index_at(e.y)
+        self._press = (i, e.y) if i is not None else None
+        self._drop = None
         if i is not None and i != self.sel:
             self.sel = i
             self._draw()
         if i is not None and self.on_select:
             self.on_select(i)
+
+    def _drag(self, e):
+        """Drag a row to another place: a line shows where it lands. Near the top or the
+        bottom edge the list scrolls along."""
+        if self._press is None or self.on_move is None or len(self.rows) < 2:
+            return
+        if self._drop is None and abs(e.y - self._press[1]) < self.DRAG_START:
+            return
+        H = max(1, self.cv.winfo_height())
+        if e.y < 12:
+            self.cv.yview_scroll(-1, "units")
+        elif e.y > H - 12:
+            self.cv.yview_scroll(1, "units")
+        cy = self.cv.canvasy(e.y)
+        drop = int(round((cy - 6) / self.ROW_H))
+        drop = max(0, min(len(self.rows), drop))
+        if drop != self._drop:
+            self._drop = drop
+            self.cv.configure(cursor="fleur")
+            self._draw()
+
+    def _release(self, e):
+        press, drop = self._press, self._drop
+        self._press, self._drop = None, None
+        if drop is None:
+            return
+        self.cv.configure(cursor="")
+        self._draw()
+        if press is not None and self.on_move is not None and drop not in (press[0], press[0] + 1):
+            self.on_move(press[0], drop)
 
     def _double(self, e):
         i = self._index_at(e.y)
@@ -1012,6 +1051,11 @@ class QueueList(tk.Frame):
                                fill=k.c("accent_fill"), outline="")
             if i != self.sel and i + 1 != self.sel and i < len(self.rows) - 1:
                 cv.create_line(tx, y0 + self.ROW_H, x1 - 8, y0 + self.ROW_H, fill=k.c("border"))
+        if self._drop is not None and self._press is not None:
+            # where the dragged row lands: an accent line between two rows
+            ly = 6 + self._drop * self.ROW_H
+            cv.create_line(16, ly, W - 16, ly, fill=k.c("accent"), width=2, capstyle="round")
+            cv.create_oval(10, ly - 4, 18, ly + 4, outline=k.c("accent"), width=2, fill=bg)
         total = 12 + len(self.rows) * self.ROW_H
         cv.configure(scrollregion=(0, 0, W, max(total, H)))
 

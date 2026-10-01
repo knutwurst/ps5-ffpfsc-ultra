@@ -96,7 +96,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 UltraPack"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -5018,6 +5018,7 @@ class App:
         head.bind("<Configure>", self._fit_queue_header, add="+")
         self.queue_listbox = QueueList(
             left, kit, on_select=lambda i: self._on_queue_clicked(), on_activate=self._on_queue_double_click,
+            on_move=self.move_job,
             on_context=self._queue_context_menu, on_key_up=self._lb_key_up, on_key_down=self._lb_key_down,
             on_delete=self.queue_remove_selected, empty_title="Your queue is empty",
             empty_body="Drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg into this window, "
@@ -5034,6 +5035,21 @@ class App:
         self._add_bar = ProgressBar(self._add_box, kit, height=4)
         self._add_bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self._add_box.grid_remove()
+        # While the queue runs: the whole run at the foot of the list, as a summary of it —
+        # its share left, the time left right, a thin neutral bar (blue stays the running
+        # job's colour), set off from the list by a hairline.
+        self._all_box = kit.frame(left)
+        self._all_box.grid(row=3, column=0, sticky="ew")
+        self._all_box.grid_columnconfigure(0, weight=1)
+        kit.rule(self._all_box).grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._all_left_var, self._all_right_var = tk.StringVar(value=""), tk.StringVar(value="")
+        kit.label(self._all_box, fg="text", font=kit.fonts.small, textvariable=self._all_left_var,
+                  anchor="w").grid(row=1, column=0, sticky="w", padx=(18, 8), pady=(10, 0))
+        kit.label(self._all_box, fg="muted", font=kit.fonts.small, textvariable=self._all_right_var,
+                  anchor="e").grid(row=1, column=1, sticky="e", padx=(8, 14), pady=(10, 0))
+        self._all_bar = ProgressBar(self._all_box, kit, height=3, fill="muted")
+        self._all_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(18, 14), pady=(6, 12))
+        self._all_box.grid_remove()
 
         # The job card keeps its width when the window is resized (only the list grows),
         # like an inspector. Re-laying out the whole card on every step of a window drag
@@ -5052,6 +5068,10 @@ class App:
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="Edit job…", command=lambda: self._on_queue_double_click(None))
         m.add_separator()
+        _it = self.queue[idx] if 0 <= idx < len(self.queue) else None
+        m.add_command(label="Run next", command=lambda it=_it: self.run_job_next(it),
+                      state="normal" if (_it is not None and getattr(_it, "status", "") not in self._TERMINAL_STATUSES
+                                         and _it is not self._running_item()) else "disabled")
         m.add_command(label="Move up", command=self.queue_move_up)
         m.add_command(label="Move down", command=self.queue_move_down)
         m.add_separator()
@@ -5093,7 +5113,7 @@ class App:
 
     def _clearable(self, which: str) -> list:
         """The jobs *which* (done | failed | all) removes; never the running one."""
-        running = self.queue[0] if (self._batch_running and self.queue) else None
+        running = self._running_item()
         if which == "all":
             return [it for it in self.queue if it is not running]
         want = self._CLEAR_KINDS.get(which, ())
@@ -7554,7 +7574,7 @@ class App:
     def _on_queue_double_click(self, event=None):
         """Double-click a queue row → open the matching submenu dialog pre-filled with
         this item's settings, so the user can change source / output / format etc. The
-        item that is currently RUNNING (queue[0] during a batch) and any TERMINAL item
+        item that is currently RUNNING and any TERMINAL item
         (Done/Failed/Skipped/Cancelled) are not edited — those just refresh details."""
         # Resolve which row was clicked. event.y gives the precise row (nearest()) even
         # if the listbox selection has not yet caught up to the click.
@@ -7577,8 +7597,8 @@ class App:
         if item not in self.queue:
             return
         idx = self.queue.index(item)
-        # Block edit on the running job (queue[0] during a batch) — its paths are in use.
-        if self._batch_running and idx == 0:
+        # Block edit on the running job — its paths are in use.
+        if item is self._running_item():
             self.log("WARN", "Cannot edit the currently running job.")
             return
         status = (getattr(item, "status", "") or "").lower()
@@ -8313,9 +8333,6 @@ class App:
         self._retire_failed(item, "Skipped", note)
         self.log("INFO", f"{getattr(item, 'display_name', None) or item.name}: skipped, {note[0].lower() + note[1:]}")
         if self._batch_running:
-            done = self._batch_done + self._batch_failed
-            if 0 <= done < len(getattr(self, "_batch_sizes", []) or []):
-                self._batch_sizes.pop(done)
             self._batch_total = max(0, self._batch_total - 1)
             self._update_batch_counter()
             self.update_queue_box()
@@ -8384,31 +8401,48 @@ class App:
         idx = self._queue_sel_idx()
         if idx is None or idx == 0:
             return
-        if self._batch_running and idx == 1:
-            return  # can't move above the active game
-        moved = self.queue[idx]                                   # capture before swap
-        self.queue[idx], self.queue[idx - 1] = self.queue[idx - 1], self.queue[idx]
-        self.update_queue_box(select_item=moved)                  # finds moved item at idx-1
+        self.move_job(idx, idx - 1)
 
     def queue_move_down(self):
         idx = self._queue_sel_idx()
         if idx is None or idx >= len(self.queue) - 1:
             return
-        if self._batch_running and idx == 0:
-            return  # can't move the active game
-        moved = self.queue[idx]                                   # capture before swap
-        self.queue[idx], self.queue[idx + 1] = self.queue[idx + 1], self.queue[idx]
-        self.update_queue_box(select_item=moved)                  # finds moved item at idx+1
+        self.move_job(idx, idx + 2)
+
+    def move_job(self, src: int, dst: int) -> None:
+        """Move the job at *src* so it stands before the job now at *dst* (len = to the end):
+        drag and drop, Move up / down, Run next. The list order is the order the jobs that
+        have not run yet are worked through; the running job may move too."""
+        if not (0 <= src < len(self.queue)):
+            return
+        dst = max(0, min(len(self.queue), dst))
+        if dst in (src, src + 1):
+            return
+        item = self.queue.pop(src)
+        self.queue.insert(dst - 1 if dst > src else dst, item)
+        self.update_queue_box(select_item=item)
+
+    def run_job_next(self, item) -> None:
+        """Run next: the job moves above the first job that is still waiting."""
+        if item not in self.queue or getattr(item, "status", "") in self._TERMINAL_STATUSES:
+            return
+        running = self._running_item()
+        first = next((i for i, it in enumerate(self.queue)
+                      if it is not running and it is not item
+                      and getattr(it, "status", "") not in self._TERMINAL_STATUSES), None)
+        if first is not None and first < self.queue.index(item):
+            self.move_job(self.queue.index(item), first)
+            self.log("INFO", f"{getattr(item, 'display_name', None) or item.name} runs next.")
 
     def queue_remove_selected(self):
         idx = self._queue_sel_idx()
         if idx is None or not self.queue or idx >= len(self.queue):
             return  # nothing selectable (e.g. the "Queue is empty" placeholder row)
         # Don't allow removing the currently running game
-        if self._batch_running and idx == 0:
+        if self.queue[idx] is self._running_item():
             messagebox.showwarning("In Progress",
-                                   "The first game in the queue is currently compressing.\n"
-                                   "Cancel the compression first to remove it.")
+                                   "This job is running.\n"
+                                   "Cancel it first to remove it.")
             return
         # Decide which item to show after removal (next item, or previous if at end)
         if len(self.queue) > 1:
@@ -8433,9 +8467,11 @@ class App:
                                       "(The current game will finish normally.)")
             if not ok:
                 return
-            for it in self.queue[1:]:
-                self._drop_kept_extract(it)
-            self.queue[1:] = []   # keep index-0 (running game), clear the rest
+            run = self._running_item()
+            for it in self.queue:
+                if it is not run:
+                    self._drop_kept_extract(it)
+            self.queue[:] = [run] if run is not None else []   # keep the running job, clear the rest
         else:
             for it in self.queue:
                 self._drop_kept_extract(it)
@@ -8620,6 +8656,7 @@ class App:
         except Exception:
             pass
         rows = []
+        _run_item = self._running_item()
         for i, item in enumerate(self.queue):
             # Capture a STABLE display name the first time we render this item — at add
             # time item.name is the friendly name (a bundle's folder, the archive's name).
@@ -8629,7 +8666,7 @@ class App:
             if not getattr(item, "display_name", None):
                 item.display_name = (getattr(item, "bundle_subfolder", None)
                                      or getattr(item, "name", "") or item.title_id)
-            prefix = "▶ " if (self._batch_running and i == 0) else f"{i + 1}. "
+            prefix = "▶ " if item is _run_item else f"{i + 1}. "
             opn = getattr(item, "operation", "pack")
             badge = {"unpack": "CONVERT", "patch": "PATCH ",
                      "fake-sign": "SIGN   ",
@@ -8665,7 +8702,7 @@ class App:
                           if shows_extracted_size(item) else format_size(item.size))
             disp = getattr(item, "display_name", None) or item.name
             line = f"{prefix}{badge}  {item.title_id}  {disp}  [{detail}]  {item.status}"
-            running = self._batch_running and i == 0
+            running = item is _run_item
             st = str(getattr(item, "status", "") or "")
             state = ("running" if running else "done" if st == "Done" else "failed" if st == "Failed"
                      else "skipped" if st in ("Skipped", "Cancelled")
@@ -8877,7 +8914,7 @@ class App:
     def _refresh_space_for_item(self, item=None):
         """Recalculate free-space vs what this game needs and update the stats label."""
         if item is None:
-            item = self.queue[0] if self.queue else None
+            item = self._shown_or_next()
         if item is None or getattr(item, "size", 0) == 0:
             self.temp_space_var.set("Temp Needed: —")
             return
@@ -8943,8 +8980,15 @@ class App:
                  + ("compressed .ffpfsc (smaller)" if self.output_compressed_var.get()
                     else "uncompressed .ffpfs (faster to build and mount; full size)."))
 
+    def _shown_or_next(self):
+        """The job the details pane shows, else the running or next job, else the first."""
+        it = getattr(self, "_details_item", None)
+        if it is not None and it in self.queue:
+            return it
+        return self._running_item() or self._next_pending() or (self.queue[0] if self.queue else None)
+
     def update_command_preview(self):
-        item = self.queue[0] if self.queue else None
+        item = self._shown_or_next()
         # Archive placeholders have no path yet — show a friendly message instead
         if item and getattr(item, "archive_path", None):
             self.command_label.configure(
@@ -9767,7 +9811,10 @@ class App:
         # extracted source: a pass-1 retry rebuilds from it, a pass-2 resume already freed it
         # (the keep is then a no-op). The inner image (_ffpfsc_inner) is preserved for resume.
         self._cleanup_after_failure(item, keep_source=True)
-        self.queue.insert(0, item)
+        if item not in self.queue:
+            self.queue.append(item)
+        self._run_next = item
+        self._active_item = item
         self.update_queue_box()
         self.log("WARN", f"Out of memory — retrying {item.name} with {new_cpu} CPU core(s) "
                          f"(attempt {tries + 1}/{MAX_RETRIES}).")
@@ -10048,7 +10095,12 @@ class App:
             return
         current = self._batch_done + self._batch_failed + 1
         extra = "".join(f"  ·  {n} {w}" for n, w in ((self._batch_done, "done"), (self._batch_failed, "failed")) if n)
-        self.batch_counter_var.set(f"Job {current} of {self._batch_total}{extra}")
+        frac, eta = getattr(self, "_all_frac", None), getattr(self, "_all_eta", None)
+        if frac is not None:
+            extra += f"  ·  {int(frac * 100)} % of all" + (f", {self._fmt_left(eta)}" if eta is not None else "")
+        line = f"Job {current} of {self._batch_total}{extra}"
+        if self.batch_counter_var.get() != line:
+            self.batch_counter_var.set(line)
 
     def _job_output_dir(self, item) -> Path | None:
         """The folder this job writes to: its own output_path when set (the per-job
@@ -10118,16 +10170,34 @@ class App:
         """True if any queued item still needs to run (not in a terminal status)."""
         return any(getattr(it, "status", "") not in self._TERMINAL_STATUSES for it in self.queue)
 
-    def _next_pending_to_front(self) -> bool:
-        """Move the first not-yet-run item to queue[0], so the queue[0]-based run/pop logic
-        always acts on a PENDING item while kept failed/skipped items sit behind it. Returns
-        False when nothing is left to run (queue empty or all items terminal)."""
-        for i, it in enumerate(self.queue):
-            if getattr(it, "status", "") not in self._TERMINAL_STATUSES:
-                if i:
-                    self.queue.insert(0, self.queue.pop(i))
-                return True
-        return False
+    def _running_item(self):
+        """The job the batch works on right now (extracting or running). It keeps its place
+        in the list: the queue is shown and kept in the order the jobs were added."""
+        it = getattr(self, "_active_item", None)
+        return it if (self._batch_running and it is not None and it in self.queue) else None
+
+    def _next_pending(self):
+        """The job to run next, without moving anything: the one the batch is already on (a
+        re-entry after its archive was unpacked), else the one Retry asked for, else the
+        first job from the top that has not run yet. Reorder the list to change it."""
+        act = getattr(self, "_active_item", None)
+        if (self._batch_running and act is not None and act in self.queue
+                and getattr(act, "status", "") not in self._TERMINAL_STATUSES):
+            return act
+        pref = getattr(self, "_run_next", None)
+        if pref is not None and pref in self.queue and getattr(pref, "status", "") not in self._TERMINAL_STATUSES:
+            return pref
+        return next((it for it in self.queue if getattr(it, "status", "") not in self._TERMINAL_STATUSES), None)
+
+    def _pick_next(self):
+        """_next_pending, made the active job."""
+        item = self._next_pending()
+        if item is not None:
+            self._active_item = item
+            if getattr(self, "_run_next", None) is item:
+                self._run_next = None
+            self.__dict__.setdefault("_job_t0", {}).setdefault(id(item), time.time())
+        return item
 
     def _extract_is_complete(self, item) -> bool:
         """True when *item* runs from a copy it extracted from an archive, and that copy is
@@ -10157,11 +10227,11 @@ class App:
         item.status_note = ""
         name = getattr(item, "display_name", None) or item.name
         if self._batch_running:
-            self.log("INFO", f"Retry: {name} runs after the jobs already waiting.")
+            self._run_next = item
+            self.log("INFO", f"Retry: {name} runs after the current job.")
             self.update_queue_box(select_item=item)
             return
-        self.queue.remove(item)
-        self.queue.insert(0, item)
+        self._run_next = item                  # runs next; the job keeps its place in the list
         self.update_queue_box(select_item=item)
         self.log("INFO", f"Retry: {name}.")
         self.start(rearm_failed=False)
@@ -10192,7 +10262,72 @@ class App:
         threading.Thread(target=work, daemon=True).start()
         self._show_add_progress()
 
+    def _estimate_left(self, left_bytes: int, cur_bytes: int, cur_pct: float, cur_item) -> float | None:
+        """Seconds the whole run still needs, roughly: the bytes still to do times the pace
+        (seconds per byte) of the jobs this run finished, or, before the first one is done,
+        of the running job so far. None while there is too little to go on (the first
+        ninety seconds, or under two percent of the running job)."""
+        now = time.time()
+        if now - getattr(self, "_batch_t0", now) < 90:
+            return None
+        rest = left_bytes + cur_bytes * max(0.0, 1.0 - cur_pct / 100.0)
+        fin_s, fin_b = getattr(self, "_batch_fin_secs", 0.0), getattr(self, "_batch_fin_bytes", 0)
+        if fin_b > 0 and fin_s > 0:
+            pace = fin_s / fin_b
+        else:
+            t0 = (getattr(self, "_job_t0", {}) or {}).get(id(cur_item)) if cur_item is not None else None
+            done = cur_bytes * cur_pct / 100.0
+            if not t0 or cur_pct < 2 or done <= 0:
+                return None
+            pace = (now - t0) / done
+        return max(0.0, rest * pace)
+
+    @staticmethod
+    def _fmt_left(secs: float) -> str:
+        """'about 2 h 10 min left', rounded so the number does not twitch on every update."""
+        if secs < 90:
+            return "about a minute left"
+        mins = int(round(secs / 60.0))
+        if mins < 60:
+            return f"about {mins} min left"
+        mins = int(round(mins / 5.0)) * 5                  # five-minute steps beyond an hour
+        h, m = divmod(mins, 60)
+        return f"about {h} h {m:02d} min left" if m else f"about {h} h left"
+
+    def _all_jobs_line(self) -> str:
+        frac = getattr(self, "_all_frac", None)
+        if frac is None:
+            return ""
+        eta = getattr(self, "_all_eta", None)
+        left = self._fmt_left(eta) if eta is not None else "estimating the time left…"
+        return f"All jobs  {int(frac * 100)} %   ·   {left}"
+
+    def _show_all_progress(self) -> None:
+        """The foot of the queue list while the queue runs: the share of the whole run that
+        is done (left), the time it still needs (right), and a neutral bar."""
+        try:
+            frac = getattr(self, "_all_frac", None)
+            if not self._batch_running or frac is None:
+                if self._all_box.winfo_manager():
+                    self._all_box.grid_remove()
+                return
+            eta = getattr(self, "_all_eta", None)
+            left = f"All jobs  {int(frac * 100)} %"
+            right = self._fmt_left(eta) if eta is not None else "estimating the time left…"
+            if self._all_left_var.get() != left:
+                self._all_left_var.set(left)
+            if self._all_right_var.get() != right:
+                self._all_right_var.set(right)
+            self._all_bar.set(frac)
+            if not self._all_box.winfo_manager():
+                self._all_box.grid()
+        except Exception:
+            pass
+
     def _show_add_progress(self) -> None:
+        """The line under the queue header while Add job builds jobs; the run's summary at
+        the foot of the list (_show_all_progress) is refreshed with it."""
+        self._show_all_progress()
         st = getattr(self, "_add_state", None)
         try:
             if not st or st["total"] == 0:
@@ -10212,6 +10347,7 @@ class App:
         q = getattr(self, "_add_q", None)
         st = getattr(self, "_add_state", None)
         if q is None or st is None:
+            self._show_add_progress()          # the all-jobs line while the queue runs
             return
         added = False
         while True:
@@ -10221,6 +10357,10 @@ class App:
                 break
             if kind == "item":
                 self.queue.append(it)
+                if self._batch_running:        # a job added while the queue runs is part of this run
+                    self.__dict__.setdefault("_batch_items", []).append(it)
+                    self._batch_total += 1
+                    self._update_batch_counter()
                 st["made"].append(it)
                 st["done"] += 1
                 added = True
@@ -10328,9 +10468,8 @@ class App:
         try:
             item.status = status
             item.status_note = " ".join(str(reason or "").split())[:300]
-            if item in self.queue:
-                self.queue.remove(item)
-            self.queue.append(item)
+            if item not in self.queue:          # popped by an older path: back at the end
+                self.queue.append(item)
         except Exception:
             pass
 
@@ -10361,9 +10500,9 @@ class App:
                 return
             self.log("WARN", "Cleanup still running past the wait cap — continuing; the space gate decides.")
         self._cleanup_wait_ticks = 0
-        # Bring the next NOT-yet-run item to the front (kept Failed/Skipped items are skipped).
+        # The next job that has not run, in list order (finished jobs keep their places).
         # When none remain, the batch is complete — failed/skipped items stay in the queue.
-        if not self._next_pending_to_front():
+        if self._next_pending() is None:
             self._batch_running = False
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
@@ -10372,7 +10511,7 @@ class App:
             if self._batch_total > 1:
                 self._show_batch_complete()
             return
-        item = self.queue[0]
+        item = self._pick_next()
         self.update_game_details(item)   # refreshes art + space stats for next game
         if self._release_failed_copies(item):
             self.root.after(500, self._batch_auto_start)   # waits for the reclaim, then gates again
@@ -10516,6 +10655,13 @@ class App:
                 self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in todo]
             except Exception:
                 self._batch_sizes = []
+            self._batch_items = list(todo)   # by job, not by place: the list can be reordered
+            # For the estimate over all jobs: when the run began, and what the jobs that
+            # finished took (seconds and bytes) — their pace is the best guess for the rest.
+            self._batch_t0 = time.time()
+            self._batch_fin_secs, self._batch_fin_bytes = 0.0, 0
+            self._job_t0 = {}
+            self._all_frac, self._all_eta = None, None
         self._update_batch_counter()
 
     # ── Start / Cancel ────────────────────────────────────────────────────────
@@ -10571,16 +10717,16 @@ class App:
             self.cancel_btn.configure(state="disabled")
             return
 
-        # Run the first NOT-yet-run item; kept Failed/Skipped items are left in place and
-        # skipped. If everything left is terminal, there's nothing to start.
-        if not self._next_pending_to_front():
+        # Run the first NOT-yet-run item from the top; finished, failed and skipped jobs keep
+        # their places. If everything left is terminal, there's nothing to start.
+        if self._next_pending() is None:
             self.log("INFO", "Nothing to start — every job in the queue has run. Clear completed removes "
                              "the finished ones; Retry runs a failed one again." if self.queue
                      else "Nothing to start — the queue is empty.")
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             return
-        item = self.queue[0]
+        item = self._pick_next()
 
         # ── Pre-flight space gate FIRST — place the run on a drive sized for its real
         #    footprint and decide go/skip/cancel BEFORE any extraction or packing, so a
@@ -11299,7 +11445,8 @@ class App:
                 # Lower bar = CURRENT STEP: the progress of the operation running right now
                 # (extract / read / temp-PFS / compress / write …) = stage_pct. The game name
                 # sits above as context; whole-game progress feeds the QUEUE bar below.
-                _gname = (self.queue[0].name if self.queue else "") or ""
+                _ri = self._running_item()
+                _gname = ((getattr(_ri, "display_name", None) or _ri.name) if _ri is not None else "") or ""
                 self.cur_game_var.set(f"CURRENT STEP  ·  {_gname}" if _gname else "CURRENT STEP")
                 self.stage_title_var.set(stage or title)
                 self.stage_detail_var.set(detail)
@@ -11311,14 +11458,32 @@ class App:
                 # just mirror the current game); falls back to equal-weight game count.
                 _total = max(1, getattr(self, "_batch_total", 1))
                 _done  = getattr(self, "_batch_done", 0) + getattr(self, "_batch_failed", 0)
-                _sizes = getattr(self, "_batch_sizes", []) or []
-                _tot_bytes = sum(_sizes)
-                if _tot_bytes > 0 and _done <= len(_sizes):
-                    _done_bytes = sum(_sizes[:_done])
-                    _cur_bytes  = _sizes[_done] if _done < len(_sizes) else 0
+                # By job, not by place in the list (it can be reordered): the jobs of this
+                # batch that have finished, plus the running one's share.
+                _items = getattr(self, "_batch_items", None) or []
+                def _sz(it):
+                    try:
+                        return max(0, int(display_size(it) or 0))
+                    except Exception:
+                        return 0
+                _tot_bytes = sum(_sz(it) for it in _items)
+                if _tot_bytes > 0:
+                    _done_bytes = sum(_sz(it) for it in _items if it is not _ri
+                                      and getattr(it, "status", "") in self._TERMINAL_STATUSES)
+                    _cur_bytes = _sz(_ri) if _ri in _items else 0
                     _qfrac = max(0.0, min(1.0, (_done_bytes + _cur_bytes * overall_pct / 100.0) / _tot_bytes))
                 else:
                     _qfrac = max(0.0, min(1.0, (_done + overall_pct / 100.0) / _total))
+                if self._batch_running:
+                    self._all_frac = _qfrac
+                    try:
+                        _left = sum(_sz(it) for it in _items if it is not _ri
+                                    and getattr(it, "status", "") not in self._TERMINAL_STATUSES)
+                        _cur = _sz(_ri) if _ri is not None else 0
+                        self._all_eta = self._estimate_left(_left, _cur, overall_pct, _ri)
+                    except Exception:
+                        self._all_eta = None
+                    self._update_batch_counter()
                 self.overall_pct_var.set(f"{int(_qfrac * 100)}%")
                 self.overall_bar.set(_qfrac)
                 self.overall_title_var.set(
@@ -11330,9 +11495,9 @@ class App:
                 self.footer_var.set(f"● {title}")
                 self.update_stages_display(stage, stage_pct)
                 self._cur_job_pct = overall_pct
-                if self._batch_running and self.queue:
+                if _ri is not None:
                     try:
-                        self.queue_listbox.update_row(0, progress=max(0.0, min(1.0, overall_pct / 100.0)),
+                        self.queue_listbox.update_row(self.queue.index(_ri), progress=max(0.0, min(1.0, overall_pct / 100.0)),
                                                       chip=f"{int(overall_pct)}%")
                     except Exception:
                         pass
@@ -11376,9 +11541,10 @@ class App:
             elif status == "cancelled":
                 # Cancel = STOP the batch (don't advance). Clean the partial extract of
                 # the item being unpacked (it stays in the queue, marked Cancelled).
-                if self.queue:
-                    self._cleanup_after_failure(self.queue[0])
-                    self.queue[0].status = "Cancelled"
+                _ci = self._active_item
+                if _ci is not None and _ci in self.queue:
+                    self._cleanup_after_failure(_ci)
+                    _ci.status = "Cancelled"
                 self._batch_running = False
                 self.pending_start = False
                 self.start_btn.configure(state="normal")
@@ -11390,7 +11556,7 @@ class App:
                 # Extraction failed — clean the partial tree, KEEP the item in the queue
                 # (marked Failed, moved to the end) so only successful items disappear, then
                 # continue or end the batch like a pack failure.
-                failed_item = self.queue[0] if self.queue else self._active_item
+                failed_item = self._active_item
                 if failed_item is not None:
                     self._cleanup_after_failure(failed_item)
                     self._retire_failed(failed_item, "Failed")
@@ -11420,14 +11586,20 @@ class App:
             # Mark current game done/failed and pop from queue. When the queue is already
             # empty (single-game / last-in-batch) fall back to the tracked active item so
             # a failure still cleans its scratch (otherwise a single-game failure strands).
-            if self.queue:
-                self.queue[0].status = "Done" if success else "Failed"
-                completed_item = self.queue.pop(0)
-            else:
-                completed_item = self._active_item
+            completed_item = self._active_item
+            if completed_item is not None and completed_item in self.queue:
+                completed_item.status = "Done" if success else "Failed"
 
             if success:
                 self._batch_done += 1
+                if completed_item is not None:      # its pace feeds the estimate for the rest
+                    _t0 = (getattr(self, "_job_t0", {}) or {}).pop(id(completed_item), None)
+                    if _t0:
+                        try:
+                            self._batch_fin_secs = getattr(self, "_batch_fin_secs", 0.0) + (time.time() - _t0)
+                            self._batch_fin_bytes = getattr(self, "_batch_fin_bytes", 0) + max(0, int(display_size(completed_item) or 0))
+                        except Exception:
+                            pass
                 self.status_update("Complete", msg, "Complete", 100, 100, "—", "—", "—")
                 self.log("SUCCESS", msg)
                 self.play_complete_sound(True)
@@ -11458,9 +11630,11 @@ class App:
                     self._cleanup_item_extract(completed_item)
                     self._cleanup_inner_image(completed_item)   # drop the pass-1 inner cache
                     self._ampr_cleanup(completed_item)   # restore a direct source folder
-                    if not self.auto_remove_done_var.get():
-                        # stays in the list, marked Done, after the jobs still to run
-                        self._retire_failed(completed_item, "Done")
+                    if self.auto_remove_done_var.get():
+                        if completed_item in self.queue:
+                            self.queue.remove(completed_item)
+                    else:
+                        self._retire_failed(completed_item, "Done")   # stays in its place, marked Done
 
                 # Feature 4: batch auto-advance (the next PENDING item; kept failed/skipped
                 # items don't count as work left to do).

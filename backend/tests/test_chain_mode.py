@@ -257,6 +257,36 @@ class BackportRules(unittest.TestCase):
         rc, log = self.backport(self.game(), "8.6")
         self.assertEqual(rc, 2, log[-800:])
 
+    def _image_of(self, g: Path) -> Path:
+        out = self.root / "img"
+        rc, log = run(str(g), str(out), "--to", "ffpfsc", "--temp-dir", str(self.root / "t"))
+        self.assertEqual(rc, 0, log[-1500:])
+        return next(out.glob("*.ffpfsc"))
+
+    def test_a_container_is_checked_before_it_is_unpacked(self):
+        # the check reads only the executables out of the image: a refusal comes before the
+        # whole game is unpacked, and nothing is left in the scratch
+        img = self._image_of(self.game())
+        rc, log = run(str(img), str(self.root / "out2"), "--to", "ffpfsc", "--backport-target", "7.61",
+                      "--fw-libs-root", str(self.fw), "--temp-dir", str(self.root / "t"))
+        self.assertNotEqual(rc, 0, log[-1500:])
+        self.assertIn("on the executables of", log)
+        self.assertIn("patched libraries for 7.61", log)
+        self.assertNotIn("before the next step", log, "refused before the unpack")
+        self.assertFalse(list((self.root / "t" / "_ffpfsc_temp").glob("chain-*")))
+        rc, log = run(str(img), str(self.root / "out3"), "--to", "folder", "--backport-target", "9.60",
+                      "--fw-libs-root", str(self.fw), "--temp-dir", str(self.root / "t"))
+        self.assertEqual(rc, 0, log[-1500:])
+        self.assertIn("Lowering the SDK is enough", log)
+
+    def test_analyse_reads_a_container(self):
+        img = self._image_of(self.game())
+        rc, log = run("--backport-analyze", str(img), "--backport-target", "7.61", "--fw-libs-root", str(self.fw))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("[verdict] The game uses 1 function(s) that 7.61 lacks (libSceX)", log)
+        rc, log = run("--backport-analyze", str(img), "--backport-target", "9.60", "--fw-libs-root", str(self.fw))
+        self.assertEqual(rc, 0, log)
+
     def test_analyse_prints_one_verdict_and_exits_by_it(self):
         g = self.game()
         rc, log = run("--backport-analyze", str(g), "--backport-target", "7.61", "--fw-libs-root", str(self.fw))

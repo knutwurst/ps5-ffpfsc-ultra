@@ -96,7 +96,7 @@ except Exception:
     _HAS_DND = False
 
 APP_NAME = "PS5 UltraPack"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 # For archive sources, the GUI extraction occupies the first slice of a game's overall
 # progress; the worker's pack progress is compressed into the remaining tail so the
 # whole-game percentage stays monotonic across extraction → pack (see CLIWorker._set_stage
@@ -772,8 +772,9 @@ class ErrorDialog(MessageWindow):
     }
 
     def __init__(self, parent, msg: str, last_cmd: str = "", log_lines: str = "",
-                 operation: str = "pack"):
+                 operation: str = "pack", on_edit=None, on_retry=None):
         super().__init__(parent)
+        self._on_edit, self._on_retry = on_edit, on_retry
         self._op = operation or "pack"
         self._heading = self._TITLES.get(self._op, "Job failed")
         self.title(self._heading)
@@ -818,6 +819,10 @@ class ErrorDialog(MessageWindow):
             return "The target folder is on a read-only volume. Choose a writable folder."
         if "wrong or missing password" in t or "rarwrongpassword" in t:
             return "The archive's password is wrong or missing. Set it in Settings → Archive passwords."
+        if "extraction failed" in t and ("is damaged" in t or "of the set is missing" in t
+                                         or "of the set are missing" in t or "cannot be opened" in t):
+            return ("The archive itself is broken: a part is damaged or missing. A password does not "
+                    "help here. Download the part the message names (or the whole set) again and retry.")
         if "operation cancelled" in t or "cancelled by user" in t:
             return "You cancelled this job. Nothing was written to the output."
         if "sigkill" in t or "killed" in t or "-9" in t:
@@ -826,6 +831,11 @@ class ErrorDialog(MessageWindow):
                     "from a Finder open.")
         if "no eboot" in t or "not a ps5 game" in t:
             return "The source has no eboot.bin — it is not a PS5 game folder."
+        if "function(s) that" in t and "lacks" in t:
+            return ("The game calls functions that this firmware does not have, so lowering the SDK alone "
+                    "would not start it. Edit job lets you pick another backport target (Check tells you "
+                    "which one works), or put patched libraries for this target into the folder set in "
+                    "Settings › Backport and Retry.")
         return None
 
     # ── layout ───────────────────────────────────────────────────────────────
@@ -843,6 +853,12 @@ class ErrorDialog(MessageWindow):
                        hover_color=BTN_HOVER, command=self._open_folder, border_width=1, border_color=BTN_BORDER).pack(side="right", padx=(0, 8))
         ctk.CTkButton(btns, text="Copy details", width=110, fg_color=BTN, text_color=WHITE,
                        hover_color=BTN_HOVER, command=self._copy, border_width=1, border_color=BTN_BORDER).pack(side="right", padx=(0, 8))
+        # The job stays in the queue: change it, or run it again, straight from here.
+        for text, cb, w in (("Edit job", self._on_edit, 90), ("Retry", self._on_retry, 76)):
+            if cb is not None:
+                ctk.CTkButton(btns, text=text, width=w, fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                              border_width=1, border_color=BTN_BORDER,
+                              command=lambda cb=cb: (self.destroy(), cb())).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(self, text=self._msg, text_color=WHITE, wraplength=560, justify="left",
                       font=ctk.CTkFont(size=13)).pack(anchor="w", padx=20, pady=(0, 8))
 
@@ -1284,6 +1300,7 @@ class SettingsView:
         ui.pack(fill="x", pady=(4, 12))
         for text, var in [
             ("Show the result when a job is done", self.app.summary_popup_var),
+            ("Remove a job from the queue when it is done (failed jobs stay)", self.app.auto_remove_done_var),
             ("Play sound on completion",     self.app.sound_complete_var),
             ("Play sound on errors",         self.app.sound_error_var),
             ("Open output folder when done", self.app.open_output_var),
@@ -1291,6 +1308,15 @@ class SettingsView:
         ]:
             ctk.CTkCheckBox(ui, text=text, variable=var, fg_color=ACCENT,
                              hover_color=ACCENT_HOVER, text_color=WHITE, checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=14, pady=6)
+        oe_row = ctk.CTkFrame(ui, fg_color=PANEL)
+        oe_row.pack(fill="x", padx=14, pady=(4, 4))
+        ctk.CTkLabel(oe_row, text="When the output is already there", text_color=WHITE).pack(side="left", padx=(0, 12))
+        _labels = self.app.OUTPUT_EXISTS_LABELS
+        _oe = ctk.CTkSegmentedButton(oe_row, values=[_labels[k] for k in self.app.OUTPUT_EXISTS_CHOICES],
+                                     command=lambda v: self.app.output_exists_var.set(
+                                         next(k for k, lbl in _labels.items() if lbl == v)))
+        _oe.set(_labels.get(self.app.output_exists_var.get(), "Skip"))
+        _oe.pack(side="left")
         theme_row = ctk.CTkFrame(ui, fg_color=PANEL)
         theme_row.pack(fill="x", padx=14, pady=(4, 10))
         ctk.CTkLabel(theme_row, text="Appearance", text_color=WHITE).pack(side="left", padx=(0, 12))
@@ -3838,18 +3864,27 @@ class JobDialog(EmbeddedDialog):
             pass
 
     # ── compatibility check (backport analyser, read-only) ───────────────────
+    _CHECK_CONTAINERS = (".pkg", ".ffpfs", ".ffpfsc")
+
     def _check_folder(self) -> Path | None:
-        """The game folder Check reads: the source itself, or the first game folder of a
-        parent folder. None when there is none (a container is checked when it runs)."""
+        """What Check reads: a game folder, a .pkg/.ffpfs/.ffpfsc (the backend reads only its
+        executables out of it), or the first of those in a parent folder. None for an archive
+        or a disk image: those are checked when the job runs, before the game is unpacked
+        where the source allows it."""
+        raw = (self.src_var.get() or "").strip()
+        if self._kind in ("pkg", "ffpfs", "ffpfsc") and raw:
+            return Path(raw)
         if self._kind not in ("folder", "parent"):
             return None
-        return next((s for s in self._games if s.is_dir()), None)
+        return (next((s for s in self._games if s.is_dir()), None)          # a folder reads fastest
+                or next((s for s in self._games
+                         if s.is_file() and s.suffix.lower() in self._CHECK_CONTAINERS), None))
 
     def _check_compat(self):
         folder = self._check_folder()
         if folder is None:
-            self.check_var.set("The check reads a game folder. A container or an archive is checked when its job "
-                               "runs, after it is unpacked.")
+            self.check_var.set("Check reads a game folder, a .pkg, .ffpfs or .ffpfsc. An archive or a disk image "
+                               "is checked when its job runs, after it is unpacked.")
             return
         target = self.backport_target_var.get()
         libs = (self.app.backport_libs_var.get() or "").strip()
@@ -3975,20 +4010,31 @@ class JobDialog(EmbeddedDialog):
 
         sources = (self._parent_todo() if self._kind == "parent"
                    else self._games if self._kind == "folder" else [p])
+        sign = bool(self.sign_var.get()) and to != "pkg"     # a .pkg is always signed by its builder
+        app = self.app
+
+        def make(s):
+            # Tk-free: runs on the add thread for a new job (archive headers are read here)
+            it = GameItem.from_chain(s, to=to, output_path=out or None, sign=sign,
+                                     patch_source=patch or None, backport_target=target,
+                                     backport_libs_root=libs or None, delete_source=not keep)
+            if to == "pkg":
+                app._apply_fpkg_params(it, pkg_params)
+            it.compression_level = ff_level if to == "ffpfsc" else None
+            it.auto_organize = organize
+            return it
+
+        if self.edit_item is None:
+            # New jobs: built one by one on a worker, each joins the queue as it is ready,
+            # with a progress line above the list. The editor closes right away.
+            app._add_jobs_async(list(sources), make)
+            self.destroy(); return
         made = []
         for s in sources:
             try:
-                it = GameItem.from_chain(s, to=to, output_path=out or None,
-                                         sign=bool(self.sign_var.get()) and to != "pkg",   # a .pkg is always signed by its builder
-                                         patch_source=patch or None, backport_target=target,
-                                         backport_libs_root=libs or None, delete_source=not keep)
+                made.append(make(s))
             except Exception as e:
                 messagebox.showerror("Source", f"Could not read {s}:\n{e}", parent=self); return
-            if to == "pkg":
-                self.app._apply_fpkg_params(it, pkg_params)
-            it.compression_level = ff_level if to == "ffpfsc" else None
-            it.auto_organize = organize
-            made.append(it)
         if not made:
             return
 
@@ -3998,6 +4044,14 @@ class JobDialog(EmbeddedDialog):
             for attr in ("display_name", "bundle_subfolder", "password"):
                 if getattr(old, attr, None) is not None and getattr(new, attr, None) is None:
                     setattr(new, attr, getattr(old, attr))
+            _old_src = getattr(old, "archive_path", None) or getattr(old, "path", None)
+            if _old_src is not None and str(_old_src) == str(p):
+                # Same source: keep where it came from, so a retry runs from the copy the job
+                # kept (and a removal deletes it) instead of a stranger's path in the scratch.
+                for attr in ("origin_archive", "origin_extracted_size", "kept_extract", "bundle_siblings",
+                             "pkg_content_size", "extracted_size", "header_locked"):
+                    if hasattr(old, attr):
+                        setattr(new, attr, getattr(old, attr))
             if getattr(old, "status", "") not in ("Done",):
                 new.status = "Pending Extract" if getattr(new, "archive_path", None) else "Queued"
             try:
@@ -4006,7 +4060,8 @@ class JobDialog(EmbeddedDialog):
             except ValueError:
                 self.app.queue.append(new)
             self.app.update_queue_box(select_item=new)
-            self.app.log("OK", f"Job updated: {chain_summary(new)} — {new.display_name or new.name}")
+            _run = "" if self.app._batch_running else " Start runs it."
+            self.app.log("OK", f"Job updated: {chain_summary(new)} — {new.display_name or new.name}.{_run}")
             self.destroy(); return
 
         for it in made:
@@ -4082,6 +4137,60 @@ class ArchivePasswordPrompt(MessageWindow):
 
     def _skip(self):
         self.password = ""
+        self.destroy()
+
+
+class OutputExistsDialog(MessageWindow):
+    """Before a start: jobs whose output file is already in the output folder. One answer
+    for all of them: Skip (the safe default), Overwrite, Keep both, or Cancel the start.
+    .choice is 'skip' | 'overwrite' | 'keep' | 'cancel'. Shown only when Settings says Ask."""
+
+    MAX_ROWS = 8
+
+    def __init__(self, parent, conflicts):
+        super().__init__(parent)
+        self.choice = "cancel"
+        n = len(conflicts)
+        head = "Already in the output folder"
+        self.title(head)
+        self.configure(fg_color=BLACK); self.resizable(False, False)   # sized to its content
+        self.protocol("WM_DELETE_WINDOW", lambda: self._done("cancel"))
+        self.after(50, self.grab_set)
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=17, weight="bold"), text_color=WHITE
+                     ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(self, text=(f"{n} job{'s' if n != 1 else ''} would write a file that is already there. "
+                                 f"Skip leaves {'them' if n != 1 else 'it'} out of this run; Overwrite replaces "
+                                 f"the file{'s' if n != 1 else ''} once the new build is finished; Keep both "
+                                 f"gives the new build a numbered name. Settings › Interface can answer this "
+                                 f"for every start."),
+                     text_color=MUTED, wraplength=520, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+        box = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
+        box.pack(fill="x", padx=20, pady=(0, 4))
+        for name, hit in conflicts[:self.MAX_ROWS]:
+            ctk.CTkLabel(box, text=str(name), text_color=WHITE, font=ctk.CTkFont(size=13),
+                         anchor="w", justify="left", wraplength=500).pack(anchor="w", padx=12, pady=(8, 0))
+            ctk.CTkLabel(box, text=str(hit), text_color=MUTED, font=ctk.CTkFont(size=11),
+                         anchor="w", justify="left", wraplength=500).pack(anchor="w", padx=12, pady=(0, 6))
+        if n > self.MAX_ROWS:
+            ctk.CTkLabel(box, text=f"… and {n - self.MAX_ROWS} more", text_color=MUTED,
+                         font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(0, 8))
+        btns = ctk.CTkFrame(self, fg_color=BLACK); btns.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btns, text="Skip", fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+                      width=96, command=lambda: self._done("skip")).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Keep both", fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                      width=96, border_width=1, border_color=BTN_BORDER,
+                      command=lambda: self._done("keep")).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Overwrite", fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                      width=96, border_width=1, border_color=BTN_BORDER,
+                      command=lambda: self._done("overwrite")).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Cancel", fg_color=BTN, text_color=WHITE, hover_color=BTN_HOVER,
+                      width=96, border_width=1, border_color=BTN_BORDER,
+                      command=lambda: self._done("cancel")).pack(side="right")
+        self.bind("<Return>", lambda e: self._done("skip"))
+        self.bind("<Escape>", lambda e: self._done("cancel"))
+
+    def _done(self, choice: str):
+        self.choice = choice
         self.destroy()
 
 
@@ -4881,30 +4990,50 @@ class App:
         left = kit.frame(pw)
         pw.add(left, minsize=280, stretch="always")
         left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(1, weight=1)
-        head, btns = self._column_header(left, "Queue", subtitle_var=self.queue_total_var)
+        left.grid_rowconfigure(2, weight=1)
+        self._q_sub_var = tk.StringVar(value=self.queue_total_var.get())   # shortened when narrow
+        head, btns = self._column_header(left, "Queue", subtitle_var=self._q_sub_var)
         head.grid(row=0, column=0, sticky="ew", padx=(18, 14), pady=(18, 12))
+        self.queue_total_var.trace_add("write", lambda *_: self._fit_queue_header())
+        self._clear_btn = self._small(btns, "Clear completed", "check-circle", lambda: self.clear_jobs("done"),
+                                      tooltip="Remove the finished jobs. Right-click: clear failed, clear all")
+        self._clear_btn.grid(row=0, column=0, padx=(0, 6))
+        for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+            self._clear_btn.bind(seq, self._clear_menu, add="+")
         self._add_btn = self._small(btns, "Add job", "plus", self.open_job_dialog, variant="secondary",
                                     tooltip=f"Pick a source, what to change in it and what comes out  {SHORTCUT['add']}")
-        self._add_btn.grid(row=0, column=0, padx=(0, 6))
+        self._add_btn.grid(row=0, column=1, padx=(0, 6))
         self.start_btn = self._small(btns, "Start", "play", self.start, variant="primary",
                                      tooltip=f"Run the jobs from the top  {SHORTCUT['start']}")
-        self.start_btn.grid(row=0, column=1)
+        self.start_btn.grid(row=0, column=2)
         # While the queue runs, Stop takes Start's place, so stopping works with the details closed.
         self.stop_btn = self._small(btns, "Stop", "stop", self.cancel, variant="danger",
                                     tooltip=f"Cancel the running job and stop the queue  {SHORTCUT['stop']}")
-        self.stop_btn.grid(row=0, column=1)
+        self.stop_btn.grid(row=0, column=2)
         self.stop_btn.grid_remove()
         self._details_btn = self._small(btns, "", "sidebar-right", self.toggle_inspector,
                                         tooltip=f"Show or hide the details  {SHORTCUT['details']}")
-        self._details_btn.grid(row=0, column=2, padx=(8, 0))
+        self._details_btn.grid(row=0, column=3, padx=(8, 0))
+        self._q_head, self._q_title = head, head.grid_slaves(row=0, column=0)[0]
+        head.bind("<Configure>", self._fit_queue_header, add="+")
         self.queue_listbox = QueueList(
             left, kit, on_select=lambda i: self._on_queue_clicked(), on_activate=self._on_queue_double_click,
             on_context=self._queue_context_menu, on_key_up=self._lb_key_up, on_key_down=self._lb_key_down,
             on_delete=self.queue_remove_selected, empty_title="Your queue is empty",
             empty_body="Drop a game folder, archive, disk image, .ffpfs, .ffpfsc or .pkg into this window, "
                        "or use Add job.")
-        self.queue_listbox.grid(row=1, column=0, sticky="nsew")
+        self.queue_listbox.grid(row=2, column=0, sticky="nsew")
+        # While Add job builds its jobs (archive headers are read, one by one): a line and
+        # a bar between the header and the list, so the window says what it is doing.
+        self._add_box = kit.frame(left)
+        self._add_box.grid(row=1, column=0, sticky="ew", padx=(18, 14), pady=(0, 10))
+        self._add_box.grid_columnconfigure(0, weight=1)
+        self._add_label_var = tk.StringVar(value="")
+        kit.label(self._add_box, fg="muted", font=kit.fonts.small, textvariable=self._add_label_var,
+                  anchor="w").grid(row=0, column=0, sticky="ew")
+        self._add_bar = ProgressBar(self._add_box, kit, height=4)
+        self._add_bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self._add_box.grid_remove()
 
         # The job card keeps its width when the window is resized (only the list grows),
         # like an inspector. Re-laying out the whole card on every step of a window drag
@@ -4927,10 +5056,91 @@ class App:
         m.add_command(label="Move down", command=self.queue_move_down)
         m.add_separator()
         m.add_command(label="Remove", command=self.queue_remove_selected)
+        m.add_separator()
+        self._add_clear_items(m)
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
             m.grab_release()
+
+    def _fit_queue_header(self, _e=None):
+        """A narrow queue column (details open, small window): Clear completed, then Add job
+        drop their words and keep their icon and tooltip, so the title and Start stay whole."""
+        try:
+            width = self._q_head.winfo_width()
+            if width <= 1:
+                return
+            full = self.queue_total_var.get()
+            short = full.split("  ·  ")[0]         # "3 jobs" without the size, as a last step
+            run = self.stop_btn if self.stop_btn.winfo_ismapped() else self.start_btn
+            for sub, clear_t, add_t in ((full, "Clear completed", "Add job"), (full, "", "Add job"),
+                                        (full, "", ""), (short, "", "")):
+                if self._q_sub_var.get() != sub:
+                    self._q_sub_var.set(sub)
+                if self._clear_btn._text != clear_t:
+                    self._clear_btn.configure(text=clear_t)
+                if self._add_btn._text != add_t:
+                    self._add_btn.configure(text=add_t)
+                title_w = max(w.winfo_reqwidth() for w in self._q_title.winfo_children())
+                need = sum(b.winfo_reqwidth() for b in (self._clear_btn, self._add_btn, run, self._details_btn)) + 20
+                if title_w + 16 + need <= width:
+                    break
+        except Exception:
+            pass
+
+    # ── clearing finished jobs ────────────────────────────────────────────────
+    _CLEAR_KINDS = {"done": ("Done",), "failed": ("Failed", "Skipped", "Cancelled")}
+
+    def _clearable(self, which: str) -> list:
+        """The jobs *which* (done | failed | all) removes; never the running one."""
+        running = self.queue[0] if (self._batch_running and self.queue) else None
+        if which == "all":
+            return [it for it in self.queue if it is not running]
+        want = self._CLEAR_KINDS.get(which, ())
+        return [it for it in self.queue if it is not running and getattr(it, "status", "") in want]
+
+    def _add_clear_items(self, menu) -> None:
+        for label, which in (("Clear completed", "done"), ("Clear failed", "failed"), ("Clear all", "all")):
+            menu.add_command(label=label, command=lambda w=which: self.clear_jobs(w),
+                             state="normal" if self._clearable(which) else "disabled")
+
+    def _clear_menu(self, event):
+        m = tk.Menu(self.root, tearoff=0)
+        self._add_clear_items(m)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def clear_jobs(self, which: str) -> None:
+        """Remove the finished (done), the failed / skipped / cancelled (failed) or all
+        jobs from the queue. The running job stays. A failed job's kept extraction goes
+        with it, so clearing those asks first."""
+        gone = self._clearable(which)
+        if not gone:
+            return
+        kept = [it for it in gone if getattr(it, "kept_extract", False)]
+        if which == "all" and self._batch_running:
+            if not messagebox.askyesno("Clear all", "A job is running. Remove every other job from the queue?\n"
+                                                    "(The running job finishes normally.)"):
+                return
+        elif kept:
+            n = len(kept)
+            if not messagebox.askyesno(
+                    "Clear jobs", f"{n} of these job{'s' if n != 1 else ''} keep{'' if n != 1 else 's'} what "
+                                  f"{'they' if n != 1 else 'it'} extracted from {'their' if n != 1 else 'its'} "
+                                  f"archive{'s' if n != 1 else ''}, for a retry. Clearing deletes "
+                                  f"{'those copies' if n != 1 else 'that copy'}. Clear anyway?"):
+                return
+        for it in gone:
+            self._drop_kept_extract(it)
+            self.queue.remove(it)
+        if which == "all":
+            self._queue_missing_saved = []   # a deliberate clear also drops parked entries
+        word = {"done": "completed", "failed": "failed or cancelled", "all": ""}[which]
+        self.log("INFO", f"Cleared {len(gone)} {word + ' ' if word else ''}job{'s' if len(gone) != 1 else ''}.")
+        self.update_queue_box()
 
     def _build_job_card(self, card):
         """The inspector next to the list: the selected job, and the running job's progress."""
@@ -5025,16 +5235,22 @@ class App:
 
         acts = kit.frame(body, bg=B)
         acts.grid(row=6, column=0, sticky="ew", pady=(10, 0))
-        acts.grid_columnconfigure(4, weight=1)
+        acts.grid_columnconfigure(5, weight=1)
         for col, (text, icon, cmd, tip) in enumerate((
                 ("Full log", "terminal", lambda: self._show_view("log"), "The whole log  ⌘3"),
                 ("Command", "code", self._toggle_command, "Show the backend command for this job"),
                 ("Edit", "edit", lambda: self._on_queue_double_click(None), "Change this job (or double-click it)"),
+                ("Retry", "retry", self._retry_selected, "Run this job again"),
                 ("Remove", "trash", self.queue_remove_selected, None))):
-            self._small(acts, text, icon, cmd, tooltip=tip, bg=B).grid(row=0, column=col, padx=(0, 2))
+            b = self._small(acts, text, icon, cmd, tooltip=tip, bg=B)
+            b.grid(row=0, column=col, padx=(0, 2))
+            if text == "Retry":
+                self.retry_btn = b
+                b.autohide = True          # only for a job that failed, was cancelled or skipped
+                b.configure(state="disabled")
         self.cancel_btn = self._small(acts, "Cancel", "x", self.cancel, variant="danger",
                                       tooltip="Stop the running job", bg=B)
-        self.cancel_btn.grid(row=0, column=5, sticky="e")
+        self.cancel_btn.grid(row=0, column=6, sticky="e")
         self.cancel_btn.autohide = True
         self.cancel_btn.configure(state="disabled")
 
@@ -5067,10 +5283,13 @@ class App:
         While a batch runs, the run code owns the Start button's state."""
         try:
             empty = not self.queue
-            self._add_btn.configure(variant="primary" if empty else "secondary")
-            self.start_btn.configure(variant="secondary" if empty else "primary")
+            # finished jobs alone leave nothing to start (failed ones run again on Start)
+            idle = not any(getattr(it, "status", "") != "Done" for it in self.queue)
+            self._add_btn.configure(variant="primary" if idle else "secondary")
+            self.start_btn.configure(variant="secondary" if idle else "primary")
             if not self._batch_running:
-                self.start_btn.configure(state="disabled" if empty else "normal")
+                self.start_btn.configure(state="disabled" if idle else "normal")
+            self._clear_btn.configure(state="normal" if self._clearable("done") else "disabled")
             if empty:
                 self._set_inspector(False)
         except Exception:
@@ -5312,6 +5531,7 @@ class App:
         fm.add_separator()
         fm.add_command(label="Start Queue", accelerator=ACCEL["start"], command=guard(self.start))
         fm.add_command(label="Stop Queue", accelerator=ACCEL["stop"], command=self._stop_if_running)
+        fm.add_command(label="Clear Completed Jobs", command=guard(lambda: self.clear_jobs("done")))
         fm.add_separator()
         fm.add_command(label="Clean Temp Folder", command=guard(self.clear_temp_files))
         if not IS_MAC:
@@ -5482,6 +5702,13 @@ class App:
         self._pending_fpkg_identity = None   # (source path, identity dict) handed from the dialog to the scan result
         self.verify_output_var   = self._persisted_bool(settings, "verify_output", False)
         self.auto_clear_temp_var = self._persisted_bool(settings, "auto_clear_temp", False)
+        # A finished job stays in the queue, marked Done, until it is cleared; with this on
+        # it leaves the queue as soon as it succeeds. Failed jobs always stay.
+        self.auto_remove_done_var = self._persisted_bool(settings, "auto_remove_done", False)
+        # What a job does when its output is already in the output folder.
+        _oe = settings.get("output_exists", "skip")
+        self.output_exists_var = tk.StringVar(value=_oe if _oe in self.OUTPUT_EXISTS_CHOICES else "skip")
+        self.output_exists_var.trace_add("write", lambda *_: save_settings({"output_exists": self.output_exists_var.get()}))
         # Auto-patch: when a release folder holds a base game plus a clearly-smaller
         # game-like sibling (a patch), overlay it onto the game before packing. Off
         # by default — opt in knowingly, since it changes what lands in the .ffpfsc.
@@ -7090,6 +7317,11 @@ class App:
                 self._copy_item_payload(item, primary)
                 if kind == "pkg":
                     self._probe_pkg_content(item)
+                try:
+                    if self._take_game_name(item, self._game_identity(item)):
+                        self._names_dirty = True
+                except Exception:
+                    pass
                 # (Extra payload items of a multi-game archive queued as an fPKG job are
                 # converted in the _extract_q "ok" handler — on the main thread, since the
                 # conversion reads Tk variables.)
@@ -7250,6 +7482,10 @@ class App:
                 or not getattr(item, "archive_path", None)):
             return
         arc = item.archive_path
+        if getattr(item, "archive_problem", ""):
+            # Broken, not locked: no password reads past a damaged or missing part.
+            self._log_archive_problem(item)
+            return
         if not getattr(item, "header_locked", False):
             # A saved password (or none) opened the header; only the size looked odd, so the
             # drive routing estimates it. Asking for a password would be wrong here.
@@ -7258,10 +7494,14 @@ class App:
             return
         cands0 = self._candidate_passwords(item)
         if cands0:
-            opened, sz = ArchiveExtractor.probe_header(arc, cands0)
-            if opened:                     # a password added since the job was created
+            state, sz, problem = ArchiveExtractor.probe_header_state(arc, cands0)
+            if state == "open":            # a password added since the job was created
                 item.header_locked = False
                 item.extracted_size = ArchiveExtractor.plausible_extracted_size(sz, getattr(item, "size", 0))
+                return
+            if state == "damaged":
+                item.header_locked, item.archive_problem = False, problem
+                self._log_archive_problem(item)
                 return
         attempts = 0
         while attempts < 3:
@@ -7275,9 +7515,15 @@ class App:
                 return   # user skipped
             attempts += 1
             try:
-                opened, sz = ArchiveExtractor.probe_header(arc, [pw])
+                state, sz, problem = ArchiveExtractor.probe_header_state(arc, [pw])
             except Exception:
-                opened, sz = False, 0
+                state, sz, problem = "locked", 0, ""
+            if state == "damaged":
+                # the password got past the check, the archive itself is broken
+                item.header_locked, item.archive_problem, item.password = False, problem, pw
+                self._log_archive_problem(item)
+                return
+            opened = state == "open"
             if opened:
                 item.header_locked = False
                 item.extracted_size = ArchiveExtractor.plausible_extracted_size(sz, getattr(item, "size", 0))
@@ -7300,6 +7546,11 @@ class App:
                 return
         self.log("WARN", f"Gave up on the password for '{arc.name}' — routing will use the size estimate.")
 
+    def _log_archive_problem(self, item) -> None:
+        arc = getattr(item, "archive_path", None)
+        self.log("WARN", f"'{Path(str(arc)).name if arc else item.name}' cannot be read: {item.archive_problem}. "
+                         f"No password helps here; get the damaged or missing part again, or remove the job.")
+
     def _on_queue_double_click(self, event=None):
         """Double-click a queue row → open the matching submenu dialog pre-filled with
         this item's settings, so the user can change source / output / format etc. The
@@ -7317,15 +7568,26 @@ class App:
             idx = self._queue_sel_idx()
         if idx is None or idx >= len(self.queue):
             return "break"
-        item = self.queue[idx]
+        self._edit_job(self.queue[idx])
+        return "break"
+
+    def _edit_job(self, item) -> None:
+        """Open the editor on *item*. Not the running job (its paths are in use) and not a
+        finished one; a failed or cancelled job points at a source that exists first."""
+        if item not in self.queue:
+            return
+        idx = self.queue.index(item)
         # Block edit on the running job (queue[0] during a batch) — its paths are in use.
         if self._batch_running and idx == 0:
             self.log("WARN", "Cannot edit the currently running job.")
-            return "break"
+            return
         status = (getattr(item, "status", "") or "").lower()
         if status in ("done",):
             self.log("INFO", "This job is already done — remove and re-add to run it again with new settings.")
-            return "break"
+            return
+        if status in ("failed", "skipped", "cancelled"):
+            # its extracted copy may be gone: the editor then shows the archive it came from
+            self._rearm_from_archive(item)
 
         # One editor for every kind of job: it shows the job as source → changes → output,
         # and saving replaces the job at its place in the queue.
@@ -7333,7 +7595,6 @@ class App:
             JobDialog(self, item=item)
         except Exception as e:
             self.log("ERROR", f"Could not open the editor: {e}")
-        return "break"
 
 
     # ── fPKG jobs — the Pack dialog's '.pkg' format ─────────────────────────────
@@ -7556,6 +7817,8 @@ class App:
         cached = getattr(item, "_identity", None)
         if cached:
             return cached
+        if getattr(item, "archive_path", None) and not getattr(item, "path", None):
+            return self._archive_identity(item)
         p = getattr(item, "path", None)
         if not p:
             return None
@@ -7606,9 +7869,88 @@ class App:
                 pass
         return ident
 
+    def _archive_identity(self, item, passwords=None) -> dict | None:
+        """The game behind an archive job before it is extracted, from the param.json read
+        out of the archive alone (ZIP, RAR and 7z that are not solid). Kept on the job
+        (archive_title / _id / _version, saved with the queue); not the full identity: the
+        firmware tag needs the executable, so the extracted game is read again later and
+        this is never cached as _identity. *passwords* for a call off the main thread."""
+        if getattr(item, "archive_title", "") or getattr(item, "archive_title_id", ""):
+            return {"title": item.archive_title, "title_id": item.archive_title_id,
+                    "version": getattr(item, "archive_version", ""), "fw": ""}
+        arc = Path(str(item.archive_path))
+        try:
+            key = (str(arc), arc.stat().st_mtime_ns)
+        except OSError:
+            return None
+        if getattr(item, "_archive_ident_miss", None) == key:
+            return None
+        if passwords is None:
+            passwords = self._candidate_passwords(item)
+        ident = None
+        try:
+            data = ArchiveExtractor.read_game_param(arc, passwords)
+            ident = ident_from_param_bytes(data) if data else None
+        except Exception:
+            ident = None
+        if not ident:
+            item._archive_ident_miss = key
+            return None
+        item.archive_title, item.archive_title_id = ident["title"], ident["title_id"]
+        item.archive_version = ident.get("version", "")
+        return dict(ident, fw="")
+
+    def _name_jobs_from_games(self) -> None:
+        """Name every job after its game as soon as the game can be read: a folder's or an
+        image's param.json, a .pkg's, or the one inside a ZIP / RAR / 7z that is not solid.
+        A release name such as '[site]-PPSA12345.part01' says little. Runs off the main
+        thread (an image or a .pkg is read by a helper process); the passwords are
+        collected here first, because they come from a Tk field."""
+        todo = [it for it in self.queue if not getattr(it, "_name_probed", False)]
+        if not todo:
+            return
+        for it in todo:
+            it._name_probed = True
+        pw = {id(it): self._candidate_passwords(it) for it in todo
+              if getattr(it, "archive_path", None) and not getattr(it, "path", None)}
+
+        def work():
+            changed = False
+            for it in todo:
+                try:
+                    if id(it) in pw:
+                        ident = self._archive_identity(it, pw[id(it)])
+                    else:
+                        ident = self._game_identity(it)
+                except Exception:
+                    ident = None
+                if self._take_game_name(it, ident):
+                    changed = True
+            if changed:
+                self._names_dirty = True
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _take_game_name(item, ident) -> bool:
+        """The job's label becomes the game's title (without ™ ®) and its title id:
+        'Example Quest [PPSA01234]'. True when it changed."""
+        title = canonical_game_title((ident or {}).get("title") or "") if ident else ""
+        tid = str((ident or {}).get("title_id") or "").strip().upper() if ident else ""
+        if not title:
+            return False
+        label = f"{title} [{tid}]" if tid and tid.lower() not in title.lower() else title
+        if getattr(item, "display_name", None) == label:
+            return False
+        item.display_name = label
+        return True
+
     @staticmethod
     def _ident_from_param_json(pj: Path) -> dict | None:
         """{'title','title_id','version'} from a sce_sys/param.json (Sony layout)."""
+        try:
+            return ident_from_param_bytes(Path(pj).read_bytes())
+        except OSError:
+            return None
         try:
             d = json.loads(Path(pj).read_text(encoding="utf-8-sig", errors="replace"))
         except Exception:
@@ -7776,6 +8118,219 @@ class App:
         folder, fname = organized_names(ident, ext, item)
         return out / folder, fname
 
+    _FW_TAG = re.compile(r"\s*\[fw[\d.x]+\]$", re.I)
+    # Settings › Interface: skip (default, no question) | ask | overwrite | keep (both)
+    OUTPUT_EXISTS_CHOICES = ("skip", "ask", "overwrite", "keep")
+    OUTPUT_EXISTS_LABELS = {"skip": "Skip", "ask": "Ask", "overwrite": "Overwrite", "keep": "Keep both"}
+
+    def _predicted_output(self, item) -> Path | None:
+        """The file this job will write, named the way build_command names it, or None when
+        that cannot be known before the job runs: an archive whose game cannot be read yet
+        (its name then comes from the extracted game), a .pkg without auto-organize (the
+        package tool names it), a folder output."""
+        op = getattr(item, "operation", "pack")
+        if op == "chain":
+            to = getattr(item, "chain_to", None) or "ffpfsc"
+        elif op == "pack":
+            try:
+                _ip = Path(getattr(item, "path", "") or "")
+                pfs_family = _ip.is_dir() or _ip.suffix.lower() == ".ffpfs"
+            except Exception:
+                pfs_family = False
+            comp = getattr(item, "output_compressed", None)
+            if comp is None:
+                comp = self.output_compressed_var.get()
+            to = "ffpfs" if (pfs_family and not comp) else "ffpfsc"
+        elif op == "fpkg-build":
+            to = "pkg"
+        else:
+            return None
+        if to not in ("ffpfs", "ffpfsc", "pkg"):
+            return None
+        out = self._job_output_dir(item)
+        if out is None:
+            return None
+        if out.suffix.lower() in (".ffpfs", ".ffpfsc", ".pkg"):
+            return out                                   # an explicit file
+        ext = "." + to
+        unread_archive = bool(getattr(item, "archive_path", None)) and not getattr(item, "path", None)
+        sub = getattr(item, "bundle_subfolder", None)
+        if self._auto_organize_on(item) and self._game_identity(item):
+            base, name = self._organized_layout(item, out, ext)
+            if base is not None:
+                return base / name
+        if unread_archive or to == "pkg":
+            return None
+        base = self._mirror_base(item, out, sub) if sub else out
+        try:
+            return base / descriptive_ffpfsc_name(item, ext=ext)
+        except Exception:
+            return None
+
+    def _existing_output(self, target: Path) -> Path | None:
+        """A file already at *target*, or beside it under the same name with another
+        firmware tag (before an archive is unpacked the tag is not known yet)."""
+        try:
+            if target.exists():
+                return target
+            parent = target.parent
+            if not parent.is_dir():
+                return None
+            want = self._FW_TAG.sub("", target.stem)
+            for f in parent.iterdir():
+                if f.suffix.lower() == target.suffix.lower() and self._FW_TAG.sub("", f.stem) == want:
+                    return f
+        except OSError:
+            return None
+        return None
+
+    def _output_rule(self) -> str:
+        """Settings › Interface › When the output is already there: skip | ask | overwrite | keep."""
+        try:
+            v = self.output_exists_var.get()
+        except Exception:
+            v = "skip"
+        return v if v in self.OUTPUT_EXISTS_CHOICES else "skip"
+
+    def _check_existing_outputs(self) -> bool:
+        """Before a fresh start: which jobs would write a file that is already there? The
+        rule in Settings decides (skip by default); with Ask, one window lists them all,
+        before anything is unpacked. The answer also covers a job whose output only shows
+        after its archive is unpacked. False on Cancel."""
+        self._output_policy = None if self._output_rule() == "ask" else self._output_rule()
+        conflicts = []
+        for it in self.queue:
+            if getattr(it, "status", "") in self._TERMINAL_STATUSES:
+                continue
+            it._replace_output = False
+            it._keep_both = False
+            try:
+                target = self._predicted_output(it)
+            except Exception:
+                target = None
+            it._output_checked = target is not None
+            hit = self._existing_output(target) if target is not None else None
+            if hit is not None:
+                conflicts.append((it, hit))
+        if not conflicts:
+            return True
+        choice = self._output_policy or self._ask_existing_outputs(conflicts)
+        if choice == "cancel":
+            self.log("INFO", "Start cancelled: outputs already there.")
+            return False
+        self._output_policy = choice
+        for it, hit in conflicts:
+            self._apply_output_choice(it, hit, choice)
+        self.update_queue_box()
+        return True
+
+    def _ask_existing_outputs(self, conflicts) -> str:
+        """overwrite | skip | cancel, asked in a window of its own."""
+        dlg = OutputExistsDialog(self.root, [(getattr(it, "display_name", None) or it.name, hit)
+                                             for it, hit in conflicts])
+        try:
+            self.root.wait_window(dlg)
+        except Exception:
+            return "cancel"
+        return dlg.choice or "cancel"
+
+    def _apply_output_choice(self, item, hit: Path, choice: str) -> None:
+        name = getattr(item, "display_name", None) or item.name
+        if choice == "overwrite":
+            item._replace_output = True
+            self.log("INFO", f"{name}: replaces {hit}.")
+        elif choice == "keep":
+            item._keep_both = True
+            self.log("INFO", f"{name}: {hit.name} is already there; the new build gets a numbered name beside it.")
+        else:
+            self._retire_failed(item, "Skipped", f"Its output is already there: {hit}")
+            self.log("INFO", f"{name}: skipped, its output is already there: {hit}")
+
+    def _late_output_check(self, item) -> str:
+        """Right before a job's backend starts (an archive has been unpacked by now): its
+        output, if the start could not know it. proceed | skip | cancel; the choice made at
+        the start applies, else the user is asked for this job."""
+        if (getattr(item, "_output_checked", False) or getattr(item, "_replace_output", False)
+                or getattr(item, "_keep_both", False)):
+            return "proceed"
+        item._output_checked = True
+        try:
+            target = self._predicted_output(item)
+        except Exception:
+            target = None
+        hit = self._existing_output(target) if target is not None else None
+        if hit is None:
+            return "proceed"
+        rule = self._output_rule()
+        choice = (getattr(self, "_output_policy", None) or (None if rule == "ask" else rule)
+                  or self._ask_existing_outputs([(item, hit)]))
+        if choice == "cancel":
+            return "cancel"
+        if not getattr(self, "_output_policy", None):
+            self._output_policy = choice          # the rest of this batch follows it
+        if choice in ("overwrite", "keep"):
+            self._apply_output_choice(item, hit, choice)
+            return "proceed"
+        return "skip"
+
+    @staticmethod
+    def _free_output_name(path: Path) -> Path:
+        """*path* with ' (2)', ' (3)', … after the title, the first one that is free and
+        still within the ShadowMount name limit (the title is shortened when needed):
+        'Title (2) [PPSA01234] [v01.000] [fw10.00].ffpfsc'."""
+        stem, ext = path.stem, path.suffix
+        i = stem.find(" [")
+        title, tags = (stem[:i], stem[i:]) if i > 0 else (stem, "")
+        n = 2
+        while n < 1000:
+            t = title
+            while len(f"{t} ({n}){tags}{ext}".encode("utf-8")) > SHADOWMOUNT_NAME_LIMIT and len(t) > 4:
+                t = t[:-1].rstrip()
+            cand = path.with_name(f"{t} ({n}){tags}{ext}")
+            if not cand.exists():
+                return cand
+            n += 1
+        return path
+
+    def _keep_both_name(self, item, out: Path) -> Path:
+        """Keep both: the new build of a job set to Keep both goes beside the old file."""
+        if getattr(item, "_keep_both", False) and out.suffix.lower() in (".ffpfs", ".ffpfsc") and out.exists():
+            new = self._free_output_name(out)
+            self.log("INFO", f"Keep both: {out.name} is already there, the new build is {new.name}.")
+            return new
+        return out
+
+    def _skip_late(self, item, hit_note: str = "") -> None:
+        """A running batch skips *item* after its archive was unpacked: it leaves this run
+        (not counted as a failure), the scratch it wrote is reclaimed, the batch goes on."""
+        self._cleanup_after_failure(item)
+        target = None
+        try:
+            target = self._existing_output(self._predicted_output(item))
+        except Exception:
+            pass
+        note = f"Its output is already there: {target}" if target else (hit_note or "Its output is already there.")
+        self._retire_failed(item, "Skipped", note)
+        self.log("INFO", f"{getattr(item, 'display_name', None) or item.name}: skipped, {note[0].lower() + note[1:]}")
+        if self._batch_running:
+            done = self._batch_done + self._batch_failed
+            if 0 <= done < len(getattr(self, "_batch_sizes", []) or []):
+                self._batch_sizes.pop(done)
+            self._batch_total = max(0, self._batch_total - 1)
+            self._update_batch_counter()
+            self.update_queue_box()
+            if self._has_pending():
+                self.root.after(600, self._batch_auto_start)
+            else:
+                self._batch_running = False
+                self.start_btn.configure(state="normal")
+                self.cancel_btn.configure(state="disabled")
+                self._update_batch_counter()
+        else:
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self.update_queue_box()
+
     def _mirror_base(self, item, out: Path, sub: str) -> Path:
         """A bundle mirrors its source folder name at the destination — unless that would be
         the source folder ITSELF (output folder == the source's parent), which would drop
@@ -7802,6 +8357,11 @@ class App:
             return pkg_path
         target = pkg_path.with_name(want)
         try:
+            if target.exists() and getattr(item, "_replace_output", False):
+                # the user chose Overwrite at the start: the new build takes its place
+                os.replace(pkg_path, target)
+                self.log("INFO", f"Auto-organize: {want} replaced with the new build.")
+                return target
             if target.exists():
                 # Never replace a file that is already there (a second build of the same
                 # title with other settings is the common case) — keep both.
@@ -7865,6 +8425,8 @@ class App:
         self.update_queue_box()
 
     def clear_queue(self):
+        """Every job but the running one (the same as Clear all, without the kept-copy question
+        for callers that already asked)."""
         if self._batch_running:
             ok = messagebox.askyesno("Clear Queue",
                                       "A compression is running. Clear the waiting games?\n"
@@ -7951,7 +8513,8 @@ class App:
                         obj.status = "Pending Extract"
                 # The source must still be on disk to be packable/unpackable.
                 probe = getattr(obj, "archive_path", None) or getattr(obj, "path", None)
-                if not probe or not Path(probe).exists():
+                # A finished job is a record: it stays listed when its source is gone.
+                if getattr(obj, "status", "") != "Done" and (not probe or not Path(probe).exists()):
                     # Unreachable right now (drive unplugged, share down): keep the saved
                     # entry so it is not lost when the queue is next persisted.
                     skipped += 1
@@ -8052,6 +8615,10 @@ class App:
             return
 
         total = sum(getattr(x, "size", 0) or 0 for x in self.queue)
+        try:
+            self._name_jobs_from_games()
+        except Exception:
+            pass
         rows = []
         for i, item in enumerate(self.queue):
             # Capture a STABLE display name the first time we render this item — at add
@@ -8192,7 +8759,15 @@ class App:
 
     _CARD_INFO_KEYS = ("Status", "Source", "Changes", "Compression", "Drives", "Space")
 
+    def _sync_retry_btn(self, item) -> None:
+        try:
+            self.retry_btn.configure(state="normal" if getattr(item, "status", "") in self._RETRYABLE
+                                     and item in self.queue else "disabled")
+        except Exception:
+            pass
+
     def _fill_card_info(self, item):
+        self._sync_retry_btn(item)
         rows = getattr(self, "_card_info_rows", None)
         if not rows or item is None:
             return
@@ -8219,6 +8794,8 @@ class App:
             status = f"{status}: {note}"
         if getattr(item, "kept_extract", False):
             status += "; the extracted copy is kept, so Start goes on from it (removing the job deletes it)"
+        if getattr(item, "archive_problem", "") and getattr(item, "archive_path", None):
+            status += f"; the archive cannot be read: {item.archive_problem}"
         info["Status"] = status
         src = getattr(item, "archive_path", None) or getattr(item, "path", None)
         if src:
@@ -8442,7 +9019,7 @@ class App:
             elif sub:
                 base = self._mirror_base(item, out, sub)
             try:
-                out = base / (organized_name or descriptive_ffpfsc_name(item, ext=out_ext))
+                out = self._keep_both_name(item, base / (organized_name or descriptive_ffpfsc_name(item, ext=out_ext)))
                 if getattr(item, "_name_was_truncated", False):
                     self.log("WARN", f"Output filename shortened to fit the {SHADOWMOUNT_NAME_LIMIT}-"
                                      f"byte ShadowMount limit: {out.name}")
@@ -8499,7 +9076,7 @@ class App:
                     elif sub:
                         base = self._mirror_base(item, out, sub)
                     try:
-                        out = base / (organized_name or descriptive_ffpfsc_name(item, ext=ext))
+                        out = self._keep_both_name(item, base / (organized_name or descriptive_ffpfsc_name(item, ext=ext)))
                     except Exception:
                         out = base
                 run_dir = out.parent if out.suffix.lower() in (".ffpfsc", ".ffpfs") else out
@@ -9562,6 +10139,146 @@ class App:
         src = getattr(item, "path", None)
         return bool(src) and Path(str(src)).exists()
 
+    _RETRYABLE = ("Failed", "Cancelled", "Skipped")
+
+    def _retry_selected(self):
+        item = getattr(self, "_details_item", None)
+        if item is not None and item in self.queue:
+            self._retry_job(item)
+
+    def _retry_job(self, item) -> None:
+        """Run one failed, cancelled or skipped job again: from the copy it kept, else from
+        its archive. While the queue runs it joins the jobs still waiting; otherwise it
+        starts now, and the other failed jobs stay as they are."""
+        if item not in self.queue or getattr(item, "status", "") not in self._RETRYABLE:
+            return
+        self._rearm_from_archive(item)
+        item.status = "Pending Extract" if getattr(item, "archive_path", None) else "Queued"
+        item.status_note = ""
+        name = getattr(item, "display_name", None) or item.name
+        if self._batch_running:
+            self.log("INFO", f"Retry: {name} runs after the jobs already waiting.")
+            self.update_queue_box(select_item=item)
+            return
+        self.queue.remove(item)
+        self.queue.insert(0, item)
+        self.update_queue_box(select_item=item)
+        self.log("INFO", f"Retry: {name}.")
+        self.start(rearm_failed=False)
+
+    def _add_jobs_async(self, sources, make) -> None:
+        """Build the jobs for *sources* on a worker thread and hand them to the main loop one
+        at a time (_drain_add_q): each appears in the queue as soon as it is ready, a line
+        and a bar above the list count them, and Start waits until the last one is in. An
+        archive's headers are read here, which for a many-part set on a slow drive takes
+        seconds each; on the main thread the window froze for all of them."""
+        if not sources:
+            return
+        st = self.__dict__.setdefault("_add_state", {"total": 0, "done": 0, "made": [], "errors": 0})
+        st["total"] += len(sources)
+        with self._scan_lock:
+            self._scan_in_flight += 1
+        q = self.__dict__.setdefault("_add_q", queue.Queue())
+
+        def work():
+            try:
+                for s in sources:
+                    try:
+                        q.put(("item", make(s), s, ""))
+                    except Exception as e:
+                        q.put(("error", None, s, str(e)))
+            finally:
+                q.put(("done", None, None, ""))
+        threading.Thread(target=work, daemon=True).start()
+        self._show_add_progress()
+
+    def _show_add_progress(self) -> None:
+        st = getattr(self, "_add_state", None)
+        try:
+            if not st or st["total"] == 0:
+                self._add_box.grid_remove()
+                return
+            n, total = st["done"], st["total"]
+            last = st["made"][-1] if st["made"] else None
+            name = (getattr(last, "display_name", None) or getattr(last, "name", "")) if last else ""
+            self._add_label_var.set(f"Adding jobs…  {n} of {total}" + (f"   ·   {name}" if name else ""))
+            self._add_bar.set(n / total if total else 0)
+            self._add_box.grid()
+        except Exception:
+            pass
+
+    def _drain_add_q(self) -> None:
+        """Main loop: take the jobs the add worker has built so far into the queue."""
+        q = getattr(self, "_add_q", None)
+        st = getattr(self, "_add_state", None)
+        if q is None or st is None:
+            return
+        added = False
+        while True:
+            try:
+                kind, it, src, err = q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "item":
+                self.queue.append(it)
+                st["made"].append(it)
+                st["done"] += 1
+                added = True
+                try:
+                    if getattr(it, "archive_path", None):
+                        self._resolve_archive_password(it)
+                except Exception:
+                    pass
+            elif kind == "error":
+                st["done"] += 1
+                st["errors"] += 1
+                self.log("WARN", f"Could not add {Path(str(src)).name}: {err}")
+            else:                                   # one worker finished
+                with self._scan_lock:
+                    self._scan_in_flight = max(0, self._scan_in_flight - 1)
+                if st["done"] >= st["total"]:
+                    made = st["made"]
+                    if made:
+                        what = chain_summary(made[0]) + (f" × {len(made)}" if len(made) > 1 else "")
+                        self.log("OK", f"Queued: {what} — {made[0].display_name or made[0].name}"
+                                       + (f" (+{len(made) - 1} more)" if len(made) > 1 else "")
+                                       + ".  Press ▶ START to run.")
+                    self._add_state = {"total": 0, "done": 0, "made": [], "errors": 0}
+                    if self.pending_start and self._scan_in_flight == 0:
+                        self.pending_start = False
+                        self.root.after(50, self.start)
+        if added:
+            self.update_queue_box(select_item=st["made"][-1] if st["made"] else None)
+        self._show_add_progress()
+
+    def _release_failed_copies(self, item) -> bool:
+        """Before the next job of a batch: when it does not fit, delete the extracted copies
+        that failed jobs kept for a retry, so a failure never costs the jobs after it their
+        space. A copy kept after a cancel is the user's and stays. True when a reclaim
+        started (the caller waits for it and checks the space again)."""
+        kept = [it for it in self.queue
+                if it is not item and getattr(it, "status", "") == "Failed" and getattr(it, "kept_extract", False)]
+        if not kept or getattr(item, "operation", "pack") in ("unpack", "fake-sign", "fpkg-extract"):
+            return False
+        try:
+            self._probe_pkg_content(item)
+            self._resolve_extract_root(item)
+            od = self._job_output_dir(item) or Path(self.output_var.get().strip())
+            temp_dir = Path(getattr(item, "_build_temp", None) or (self.temp_var.get().strip() or str(Path.home())))
+            if _space_preflight_ok(item, temp_dir, Path(od)):
+                return False
+        except Exception:
+            return False
+        for it in kept:
+            it.kept_extract = False
+            it.status_note = (it.status_note + " " if it.status_note else "") + \
+                "Its extracted copy was deleted to make room for the next job."
+            self.log("INFO", f"Deleted the extracted copy of the failed job {getattr(it, 'display_name', None) or it.name}: "
+                             f"{item.name} needs the space. A retry unpacks its archive again.")
+            self._cleanup_item_extract(it)
+        self.update_queue_box()
+        return True
+
     def _drop_kept_extract(self, item) -> None:
         """A job leaves the queue: the extracted copy it kept after a cancel goes too."""
         if getattr(item, "kept_extract", False):
@@ -9657,6 +10374,9 @@ class App:
             return
         item = self.queue[0]
         self.update_game_details(item)   # refreshes art + space stats for next game
+        if self._release_failed_copies(item):
+            self.root.after(500, self._batch_auto_start)   # waits for the reclaim, then gates again
+            return
 
         # ── Space pre-flight gate — places the run on a drive sized for its real
         #    footprint, then go/skip/cancel. Skip cleans any partial scratch and keeps
@@ -9701,6 +10421,18 @@ class App:
         # Archive placeholder — extract first
         if getattr(item, "archive_path", None):
             self._extract_queued_item(item)
+            return
+        # The output of an unpacked archive is known now: is it there already?
+        _late = self._late_output_check(item)
+        if _late == "cancel":
+            self._cleanup_after_failure(item)
+            self._batch_running = False
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self._update_batch_counter()
+            return
+        if _late == "skip":
+            self._skip_late(item)
             return
         # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
         # user's own — left indexable). Archives were marked in _extract_queued_item.
@@ -9772,20 +10504,31 @@ class App:
         successful archive extraction (the _extract_q 'ok' branch calls start() again) is a
         no-op thanks to the guard, preserving running progress."""
         if not self._batch_running:
-            self._batch_total   = len(self.queue)
+            # Only the jobs that will run count: done and kept failed jobs are listed too.
+            todo = [it for it in self.queue if getattr(it, "status", "") not in self._TERMINAL_STATUSES]
+            self._batch_total   = len(todo)
             self._batch_done    = 0
             self._batch_failed  = 0
             self._batch_running = self._batch_total > 0
             # Size-weighted total progress: a 187 GB game advances the queue bar far more
             # than a 35 GB one (games finish in queue order; done-bytes = sum of first _done).
             try:
-                self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in self.queue]
+                self._batch_sizes = [max(0, int(display_size(it) or 0)) for it in todo]
             except Exception:
                 self._batch_sizes = []
         self._update_batch_counter()
 
     # ── Start / Cancel ────────────────────────────────────────────────────────
-    def start(self):
+    def start(self, rearm_failed: bool = True):
+        """Run the queue. A fresh Start also re-runs failed, skipped and cancelled jobs;
+        Retry passes rearm_failed=False to run only the job it re-armed."""
+        if not self._batch_running and (getattr(self, "_add_state", None) or {}).get("total"):
+            # Add job is still building jobs: start once the last one is in the queue.
+            self.pending_start = True
+            self.status_update("Adding", "Adding the jobs, then starting…", "Scanning Files",
+                               0, 0, "00:00", "—", "—", side=True)
+            self.log("INFO", "Start: the queue starts as soon as every new job has been added.")
+            return
         if not self.output_var.get().strip():
             messagebox.showerror("Missing output", "Select an output folder.")
             return
@@ -9811,7 +10554,7 @@ class App:
         # (within a run they stay skipped to avoid an endless loop; pressing Start again
         # retries them). The user deletes any they don't want. NOT on the internal re-entry
         # after an archive extraction — that's mid-batch (_batch_running is True then).
-        if not self._batch_running:
+        if not self._batch_running and rearm_failed is not False:
             requeued = 0
             for it in self.queue:
                 if getattr(it, "status", "") in ("Failed", "Skipped", "Cancelled"):
@@ -9822,10 +10565,18 @@ class App:
                 self.log("INFO", f"Retrying {requeued} previously failed/skipped job(s).")
                 self.update_queue_box()
 
+        # Outputs that are already there: one question for all, before anything is unpacked.
+        if not self._batch_running and not self._check_existing_outputs():
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            return
+
         # Run the first NOT-yet-run item; kept Failed/Skipped items are left in place and
         # skipped. If everything left is terminal, there's nothing to start.
         if not self._next_pending_to_front():
-            self.log("INFO", "Nothing to start — the queue is empty.")
+            self.log("INFO", "Nothing to start — every job in the queue has run. Clear completed removes "
+                             "the finished ones; Retry runs a failed one again." if self.queue
+                     else "Nothing to start — the queue is empty.")
             self.start_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             return
@@ -9877,6 +10628,19 @@ class App:
             self._extract_queued_item(item)  # not aborts, the rest of the queue
             return
 
+        # The output of an unpacked archive is known now: is it there already?
+        _late = self._late_output_check(item)
+        if _late == "cancel":
+            self._cleanup_after_failure(item)
+            self._batch_running = False
+            self.start_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self._update_batch_counter()
+            self.status_update("Ready", "Start cancelled.", "Ready", 0, 0, "00:00", "—", "—")
+            return
+        if _late == "skip":
+            self._skip_late(item)
+            return
         # Folder pack: keep Spotlight off the temp/image dir (the source folder is the
         # user's own — left indexable). Archives were marked in _extract_queued_item.
         self._mark_no_spotlight(getattr(item, "_build_temp", None))
@@ -10262,6 +11026,13 @@ class App:
         try:
             self._tick_space_status()
             self._sync_run_ui()
+            self._drain_add_q()
+            if getattr(self, "_names_dirty", False):
+                self._names_dirty = False
+                _sel = getattr(self, "_details_item", None)
+                self.update_queue_box(select_item=_sel)
+                if _sel is not None and _sel in self.queue:
+                    self._fill_job_card(_sel)
             self._card_tick = getattr(self, "_card_tick", 0) + 1
             if self._card_tick >= 5 and getattr(self, "_inspector_open", False):
                 self._card_tick = 0
@@ -10687,6 +11458,9 @@ class App:
                     self._cleanup_item_extract(completed_item)
                     self._cleanup_inner_image(completed_item)   # drop the pass-1 inner cache
                     self._ampr_cleanup(completed_item)   # restore a direct source folder
+                    if not self.auto_remove_done_var.get():
+                        # stays in the list, marked Done, after the jobs still to run
+                        self._retire_failed(completed_item, "Done")
 
                 # Feature 4: batch auto-advance (the next PENDING item; kept failed/skipped
                 # items don't count as work left to do).
@@ -10742,11 +11516,20 @@ class App:
                 self.log("ERROR", msg)
                 self.play_complete_sound(False)
                 if completed_item is not None:
-                    self._cleanup_after_failure(completed_item)
+                    # A finished extraction stays, as after a cancel: Edit and Retry run the
+                    # job from it again instead of unpacking the archive a second time. A
+                    # later job that needs the space frees it (_release_failed_copies).
+                    keep = self._extract_is_complete(completed_item)
+                    self._cleanup_after_failure(completed_item, keep_source=keep)
                     self._cleanup_inner_image(completed_item)   # terminal failure / gave up — no resume
                     # Keep the failed item in the queue (marked Failed, moved to the end) —
                     # only successful items disappear.
                     self._retire_failed(completed_item, "Failed", msg)
+                    completed_item.kept_extract = keep
+                    if keep:
+                        own = self._extract_dir_for_item(completed_item)
+                        self.log("INFO", f"Kept the extracted copy in {own} on {_drive_name(own)}: Edit or Retry "
+                                         f"runs the job from it again, and removing the job deletes it.")
                 self.update_queue_box()
                 # Batch resilience: one failure must not abort the rest of the queue.
                 if self._batch_running and self._has_pending():
@@ -10762,9 +11545,11 @@ class App:
                         self._show_batch_complete()
                     else:
                         log_lines = get_last_log_lines(50)
+                        _fi = completed_item
                         ErrorDialog(self.root, msg, last_cmd, log_lines,
-                                    operation=getattr(completed_item, "operation", "pack")
-                                    if completed_item else "pack")
+                                    operation=getattr(_fi, "operation", "pack") if _fi else "pack",
+                                    on_edit=(lambda it=_fi: self._edit_job(it)) if _fi is not None else None,
+                                    on_retry=(lambda it=_fi: self._retry_job(it)) if _fi is not None else None)
         except queue.Empty:
             pass
 

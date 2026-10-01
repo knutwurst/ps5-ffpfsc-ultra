@@ -884,6 +884,23 @@ def test_list_and_selective_extract(r: Runner):
                     "inspect/validate/extract-inner --json exit 0 and parse",
                     "; ".join(f"{l}: rc={rc} {o!r}" for l, g, rc, o in verdicts if not g))
 
+        if tag == "hbt":
+            # A backport check reads the executables alone out of a package, before a job
+            # unpacks the whole game: eboot.bin byte-identical to the full extract, no data.
+            import cli as _cli
+            exd = r.work / "lsx_hbt_exec"
+            if exd.exists(): shutil.rmtree(exd)
+            try:
+                pulled = _cli._pull_executables(pkg, exd)
+                err = ""
+            except Exception as e:
+                pulled, err = False, str(e)
+            got = sorted(str(q.relative_to(exd)) for q in exd.rglob("*") if q.is_file()) if exd.exists() else []
+            r.check("lsx.hbt.executables-only",
+                    pulled and "eboot.bin" in got and all(_cli._is_executable_name(g) for g in got)
+                    and sha(exd / "eboot.bin") == sha(full / "eboot.bin"),
+                    f"{len(got)} executable(s) pulled, eboot.bin identical", f"{err} {got[:6]}")
+
         if tag == "synth":
             # A directory member with nothing inside is still recreated (structure parity with mkpfs).
             sel2 = r.work / "lsx_synth_sel2"; sel2.mkdir(exist_ok=True)

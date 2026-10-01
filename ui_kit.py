@@ -192,6 +192,25 @@ ICONS: dict[str, list[tuple]] = {
 }
 
 
+def _retry_icon():
+    """A circular arrow: an open arc, clockwise, with its head at the top right."""
+    cx, cy, r = 12, 12, 7.5
+    arc = []
+    for k in range(15):
+        a = math.radians(30 + k * 20)            # 30° … 310°, clockwise on screen
+        arc += [round(cx + r * math.cos(a), 2), round(cy + r * math.sin(a), 2)]
+    ex, ey = arc[-2], arc[-1]
+    a = math.radians(310)
+    tx, ty = -math.sin(a), math.cos(a)           # direction of travel at the end
+    nx, ny = -ty, tx
+    head = [round(ex - 4 * tx + 3 * nx, 2), round(ey - 4 * ty + 3 * ny, 2), ex, ey,
+            round(ex - 4 * tx - 3 * nx, 2), round(ey - 4 * ty - 3 * ny, 2)]
+    return [("l", *arc), ("l", *head)]
+
+
+ICONS["retry"] = _retry_icon()
+
+
 def _hand_cursor(w) -> str:
     for name in ("pointinghand", "hand2"):
         try:

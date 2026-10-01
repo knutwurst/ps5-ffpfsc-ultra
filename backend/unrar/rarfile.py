@@ -25,6 +25,10 @@ class RarExtractionCancelled(Exception):
     """Extraction was aborted via the cancel callback."""
 
 
+class SolidArchive(BadRarFile):
+    """A solid archive: one member cannot be read without decompressing what precedes it."""
+
+
 class RarInfo:
     """Metadata about a single member of a RAR archive."""
 
@@ -70,6 +74,29 @@ class RarFile:
                 raise BadRarFile(msg) from exc
             self._filelist = [RarInfo(item) for item in raw_list]
         return self._filelist
+
+    def read(self, name: str) -> bytes:
+        """The bytes of one member, without extracting the others (they are skipped, which
+        is cheap unless the archive is solid: then SolidArchive is raised)."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="rar-member-") as td:
+            dest = os.path.join(td, "member")
+            try:
+                got = _unrar.extract_names(self.filename, [name], [dest], self.pwd)
+            except PermissionError as exc:
+                raise RarWrongPassword(str(exc)) from exc
+            except _unrar.UnrarError as exc:
+                msg = str(exc)
+                low = msg.lower()
+                if "solid archive" in low:
+                    raise SolidArchive(msg) from exc
+                if "error 22" in low or "error 24" in low or "password" in low:
+                    raise RarWrongPassword(msg) from exc
+                raise BadRarFile(msg) from exc
+            if not got or not os.path.isfile(dest):
+                raise KeyError(name)
+            with open(dest, "rb") as f:
+                return f.read()
 
     def namelist(self) -> list[str]:
         """Return a list of member filenames."""

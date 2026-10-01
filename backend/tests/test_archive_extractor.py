@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 import types
 import unittest
 from pathlib import Path
@@ -390,6 +391,47 @@ class PasswordErrorRecognition(unittest.TestCase):
 class HeaderProbe(unittest.TestCase):
     """probe_header separates two answers: did a password open the header, and is the
     size in it worth trusting. Only the first may lead to a password prompt."""
+
+    def test_a_damaged_zip_is_damaged_not_locked(self):
+        with tempfile.TemporaryDirectory() as td:
+            z = Path(td) / "broken.zip"
+            z.write_bytes(b"PK\x03\x04" + b"\0" * 200)
+            state, size, reason = AE.probe_header_state(z, ["pw"])
+        self.assertEqual((state, size), ("damaged", 0))
+        self.assertIn("damaged or incomplete", reason)
+
+    def test_the_game_param_is_read_out_of_a_zip_alone(self):
+        import json as _json
+        pj = _json.dumps({"titleId": "PPSA00001", "localizedParameters": {
+            "defaultLanguage": "en-US", "en-US": {"titleName": "Example Quest"}}}).encode()
+        with tempfile.TemporaryDirectory() as td:
+            z = Path(td) / "[site.example]-PPSA00001.zip"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr("Game/DLC/sce_sys/param.json", b'{"titleId": "PPSA99999"}')   # deeper: not the game
+                zf.writestr("Game/sce_sys/param.json", pj)
+                zf.writestr("Game/eboot.bin", b"x" * 100)
+            ident = m.ident_from_param_bytes(AE.read_game_param(z))
+        self.assertEqual((ident["title"], ident["title_id"]), ("Example Quest", "PPSA00001"))
+
+    def test_a_solid_7z_is_not_read_ahead(self):
+        # one member of a solid 7z costs decompressing everything before it: not worth it
+        import py7zr
+        with tempfile.TemporaryDirectory() as td:
+            s = Path(td) / "game.7z"
+            with py7zr.SevenZipFile(s, "w") as sz:
+                sz.writestr(b'{"titleId": "PPSA00001"}', "Game/sce_sys/param.json")
+                sz.writestr(b"y" * 2000, "Game/eboot.bin")
+            self.assertIsNone(AE.read_game_param(s))
+
+    def test_a_gap_in_a_part_set_is_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            for n in (1, 2, 4):
+                (Path(td) / f"[A.B]-X.part{n:02d}.rar").write_bytes(b"x")
+            self.assertEqual(AE.volume_gaps(Path(td) / "[A.B]-X.part01.rar"), ["[A.B]-X.part03.rar"])
+            for n in ("rar", "r00", "r02"):
+                (Path(td) / f"Old.{n}").write_bytes(b"x")
+            self.assertEqual(AE.volume_gaps(Path(td) / "Old.rar"), ["Old.r01"])
+
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()

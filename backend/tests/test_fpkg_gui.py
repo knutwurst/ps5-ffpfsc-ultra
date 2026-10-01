@@ -75,6 +75,12 @@ def pump(cond, timeout=20.0):
         if cond(): return True
         time.sleep(0.05)
     return cond()
+def settle(timeout=60.0):
+    """Add job builds new jobs on a worker and hands them to the queue one by one: wait
+    until the last one is in."""
+    root.update()
+    pump(lambda: not (getattr(app, "_add_state", None) or {}).get("total"), timeout=timeout)
+    root.update()
 def close_toplevels():
     # Work dialogs are panels of the main window since 2.0.0 (app._panels.stack); messages
     # (job result, error report, prompts) are windows of their own.
@@ -121,7 +127,7 @@ try:
     ok("dialog.autofill.tid", dlg.tid_var.get() == "PPSA99099", dlg.tid_var.get())
     ok("dialog.pkg.panel-shown", dlg._to_key() == "pkg" and dlg._pkg_opts.winfo_manager() != "", dlg._to_key())
     dlg.out_var.set(str(OUT)); dlg.inner_var.set("kraken"); dlg.speed_var.set("fast")
-    n0 = len(app.queue); dlg._add(); root.update()
+    n0 = len(app.queue); dlg._add(); settle()
     q = app.queue[-1] if app.queue else None
     ok("dialog.add.queued", len(app.queue) == n0 + 1 and q.operation == "chain" and q.chain_to == "pkg", f"queue={len(app.queue)} errors={errors[-1:]}")
     ok("dialog.add.fields", q.fpkg_inner_mode == "kraken" and q.fpkg_level == -4 and q.fpkg_content_id == CID
@@ -133,7 +139,7 @@ try:
     dlg2 = m.JobDialog(app, init_src=str(FF), init_to="pkg"); root.update()
     ok("dialog.image.identity-empty", dlg2.cid_var.get() == "" and dlg2.tid_var.get() == "", f"{dlg2.cid_var.get()!r}")
     ok("dialog.image.hint", "param.json" in dlg2._ident_note.get(), dlg2._ident_note.get())
-    dlg2.out_var.set(str(OUT)); n1 = len(app.queue); dlg2._add(); root.update()
+    dlg2.out_var.set(str(OUT)); n1 = len(app.queue); dlg2._add(); settle()
     ok("dialog.image.queued", len(app.queue) == n1 + 1 and app.queue[-1].path == FF and app.queue[-1].chain_to == "pkg", f"errors={errors[-1:]}")
     cmd3, *_ = app.build_command(app.queue[-1])
     ok("build_command.image-source", str(FF) in cmd3 and "--content-id" not in cmd3, " ".join(cmd3[-10:]))
@@ -142,16 +148,16 @@ try:
     dlg3 = m.JobDialog(app, item=q); root.update()
     ok("dialog.edit.preselects-pkg", dlg3._to_key() == "pkg" and dlg3._pkg_opts.winfo_manager() != ""
        and dlg3.speed_var.get() == "fast", f"{dlg3._to_key()}/{dlg3.speed_var.get()}")
-    dlg3.speed_var.set("normal"); dlg3.title_var.set("Edited"); dlg3._add(); root.update()
+    dlg3.speed_var.set("normal"); dlg3.title_var.set("Edited"); dlg3._add(); settle()
     q = app.queue[idx]
     ok("dialog.edit.saved", q.fpkg_level == 7 and q.fpkg_title == "Edited", f"{q.fpkg_level}/{q.fpkg_title} errors={errors[-1:]}")
     dlg3b = m.JobDialog(app, item=q); root.update(); dlg3b.to_var.set(L["ffpfsc"]); root.update()
     ok("dialog.edit.panel-hidden", dlg3b._pkg_opts.winfo_manager() == "", dlg3b._to_key())
-    dlg3b._add(); root.update()
+    dlg3b._add(); settle()
     rep = app.queue[idx]
     ok("dialog.edit.to-pack", rep.chain_to == "ffpfsc" and rep.output_compressed is True and rep.path == HBT
        and "fpkg_level" not in vars(rep), f"{rep.chain_to} errors={errors[-1:]}")
-    dlg3c = m.JobDialog(app, item=rep); root.update(); dlg3c.to_var.set(L["pkg"]); root.update(); dlg3c._add(); root.update()
+    dlg3c = m.JobDialog(app, item=rep); root.update(); dlg3c.to_var.set(L["pkg"]); root.update(); dlg3c._add(); settle()
     q = app.queue[idx]
     ok("dialog.edit.back-to-pkg", q.chain_to == "pkg" and q.fpkg_content_id == CID, f"{q.chain_to} errors={errors[-1:]}")
     # 6) the identity rows: folded away by default, a bad content id is refused and shows them
@@ -167,7 +173,7 @@ try:
     px = m.GameItem(HBT); app._as_fpkg_job(px, {"inner": "none", "backend": "publishingtools", "level": 7, "dll": "/nonexistent/x.dll"})
     ok("as-fpkg.publishingtools-forced-builtin", (px.fpkg_kraken_backend == "builtin" and px.fpkg_pubtools_dll == "") if sys.platform != "win32" else px.fpkg_kraken_backend == "publishingtools", f"{px.fpkg_kraken_backend}")
     dlg4x.destroy(); app.pubtools_dll_var.set(_prev_dll)
-    dlg4.out_var.set(str(OUT)); dlg4.cid_var.set("garbage"); n2 = len(app.queue); dlg4._add(); root.update()
+    dlg4.out_var.set(str(OUT)); dlg4.cid_var.set("garbage"); n2 = len(app.queue); dlg4._add(); settle()
     ok("dialog.validation.bad-cid", len(app.queue) == n2 and any("Content ID" in e for e in errors), str(errors[-1:]))
     ok("dialog.validation.reveals-identity", dlg4._pkg_more and dlg4._pkg_more_box.winfo_manager() == "pack", f"more={dlg4._pkg_more}")
     dlg4.destroy()
@@ -179,7 +185,7 @@ try:
     ok("dialog.noparam.identity-forced", dlg4b._ident_forced and dlg4b._pkg_more_box.winfo_manager() == "pack"
        and "required" in dlg4b._ident_head.get() and dlg4b._pkg_more_btn.cget("state") == "disabled",
        f"forced={dlg4b._ident_forced} head={dlg4b._ident_head.get()[:40]}")
-    dlg4b.out_var.set(str(OUT)); n2b = len(app.queue); dlg4b._add(); root.update()
+    dlg4b.out_var.set(str(OUT)); n2b = len(app.queue); dlg4b._add(); settle()
     ok("dialog.noparam.requires-identity", len(app.queue) == n2b and any("Identity needed" in e for e in errors), str(errors[-1:]))
     dlg4b.src_var.set(str(HBT)); root.update()
     ok("dialog.noparam.unforced-on-good-source", not dlg4b._ident_forced and dlg4b._pkg_more_box.winfo_manager() == ""
@@ -189,7 +195,7 @@ try:
     dlg5 = m.JobDialog(app, init_src=str(FF), init_to="ffpfsc"); root.update()
     ok("dialog.ffpfsc.copy-hint", "Copy or move" in dlg5.summary_var.get(), dlg5.summary_var.get())
     ok("dialog.ffpfsc.copy-row-shown", dlg5._keep_cb.winfo_manager() != "", f"manager={dlg5._keep_cb.winfo_manager()!r}")
-    dlg5.out_var.set(str(OUT)); n3 = len(app.queue); dlg5._add(); root.update()
+    dlg5.out_var.set(str(OUT)); n3 = len(app.queue); dlg5._add(); settle()
     ok("dialog.ffpfsc.enqueued-as-copy", len(app.queue) == n3 + 1 and app.queue[-1].chain_to == "ffpfsc"
        and m.chain_summary(app.queue[-1]).startswith("Copy or move"), m.chain_summary(app.queue[-1]) if app.queue else "")
     ok("dialog.ffpfsc.copy.delete-source-default", getattr(app.queue[-1], "copy_delete_source", None) is True,
@@ -199,7 +205,7 @@ try:
     dlg6 = m.JobDialog(app, init_src=str(ZP), init_to="pkg"); root.update()
     ok("dialog.archive.hint", dlg6._kind == "archive" and "Archive" in dlg6.detect_var.get(), dlg6.detect_var.get())
     dlg6.cid_var.set(CID); dlg6.tid_var.set("PPSA99099")
-    dlg6.out_var.set(str(OUT)); n4 = len(app.queue); dlg6._add(); root.update()
+    dlg6.out_var.set(str(OUT)); n4 = len(app.queue); dlg6._add(); settle()
     arc = app.queue[-1]
     ok("archive.queued-as-pkg", len(app.queue) == n4 + 1 and arc.chain_to == "pkg" and arc.archive_path == ZP
        and arc.fpkg_inner_mode == app.fpkg_defaults["inner"], f"{getattr(arc, 'chain_to', None)} {getattr(arc, 'archive_path', None)} errors={errors[-1:]}")
@@ -235,11 +241,11 @@ try:
     bidx = app.queue.index(bi)
     e1 = m.JobDialog(app, item=bi); root.update()
     ok("edit.pack-opens-as-ffpfsc", e1._to_key() == "ffpfsc", e1._to_key())
-    e1.to_var.set(L["pkg"]); root.update(); e1._add(); root.update()
+    e1.to_var.set(L["pkg"]); root.update(); e1._add(); settle()
     b1 = app.queue[bidx]
     ok("edit.inplace.pack-to-pkg", b1.chain_to == "pkg" and b1.bundle_subfolder == "Bundle X" and b1.fpkg_content_id == CID,
        f"{getattr(b1, 'chain_to', None)} errors={errors[-1:]}")
-    e2 = m.JobDialog(app, item=b1); root.update(); e2.to_var.set(L["ffpfs"]); root.update(); e2._add(); root.update()
+    e2 = m.JobDialog(app, item=b1); root.update(); e2.to_var.set(L["ffpfs"]); root.update(); e2._add(); settle()
     b2 = app.queue[bidx]
     ok("edit.inplace.pkg-to-pack", b2.chain_to == "ffpfs" and b2.output_compressed is False and "fpkg_level" not in vars(b2)
        and b2.bundle_subfolder == "Bundle X", f"{getattr(b2, 'chain_to', None)} errors={errors[-1:]}")
@@ -272,7 +278,7 @@ try:
         ed.destroy()
     if pkg:
         it = olds["fpkg-extract"]; i = app.queue.index(it)
-        ed = m.JobDialog(app, item=it); root.update(); ed.out_var.set(str(OUT / "ext2")); ed._add(); root.update()
+        ed = m.JobDialog(app, item=it); root.update(); ed.out_var.set(str(OUT / "ext2")); ed._add(); settle()
         ok("edit.saves.fpkg-extract", app.queue[i].chain_to == "folder" and str(app.queue[i].output_path) == str(OUT / "ext2"),
            f"{getattr(app.queue[i], 'chain_to', None)} {getattr(app.queue[i], 'output_path', None)}")
     # 10) queue rendering with badges + details
@@ -479,7 +485,7 @@ try:
     jd.to_var.set(".ffpfsc"); jd.backport_on_var.set(True); jd.backport_target_var.set("7.61")
     jd.out_var.set(str(OUT / "job")); root.update()
     ok("job.summary.sentence", jd.summary_var.get() == "Backport to 7.61, then build .ffpfsc", jd.summary_var.get())
-    n0 = len(app.queue); jd._add(); root.update()
+    n0 = len(app.queue); jd._add(); settle()
     ji = app.queue[-1]
     ok("job.add.chain-item", len(app.queue) == n0 + 1 and ji.operation == "chain" and ji.chain_to == "ffpfsc"
        and ji.backport_target == "7.61" and not ji.chain_sign, f"errors={errors}")
@@ -495,11 +501,12 @@ try:
     jd2.to_var.set(".pkg"); jd2.out_var.set(str(OUT / "job")); jd2.speed_var.set("fast"); root.update()
     ok("job.pkg.sign-forced", jd2._sign_cb.cget("state") == "disabled" and jd2._sign_fixed.winfo_manager() == "pack"
        and jd2._sign_cb.winfo_manager() == "", str(jd2._sign_cb.cget("state")))
-    # the compatibility check reads a game folder; for a container it is disabled
-    ok("job.check.disabled-for-container", str(jd2._check_btn.cget("state")) == "disabled", str(jd2._check_btn.cget("state")))
+    # the compatibility check reads a .ffpfsc too (only its executables are pulled out)
+    ok("job.check.reads-container", str(jd2._check_btn.cget("state")) == "normal"
+       and jd2._check_folder() == Path(jd2.src_var.get()), str(jd2._check_btn.cget("state")))
     ok("job.help.idle-line", jd2.help_var.get() == jd2._HELP_IDLE, jd2.help_var.get())
     ok("job.summary.pkg", jd2.summary_var.get() == "Build .pkg", jd2.summary_var.get())
-    n0 = len(app.queue); jd2._add(); root.update(); j2 = app.queue[-1]
+    n0 = len(app.queue); jd2._add(); settle(); j2 = app.queue[-1]
     ok("job.add.pkg-item", len(app.queue) == n0 + 1 and j2.operation == "chain" and j2.chain_to == "pkg"
        and getattr(j2, "fpkg_level", None) == -4, f"errors={errors}")
     jcmd2, *_ = app.build_command(j2)
@@ -511,7 +518,7 @@ try:
         jd3 = m.JobDialog(app, init_src=str(pkg)); root.update()
         jd3.to_var.set("Folder"); jd3.out_var.set(str(OUT / "job")); root.update()
         ok("job.summary.unpack", jd3.summary_var.get() == "Unpack to folder", jd3.summary_var.get())
-        n0 = len(app.queue); jd3._add(); root.update(); j3 = app.queue[-1]
+        n0 = len(app.queue); jd3._add(); settle(); j3 = app.queue[-1]
         jcmd3, _, jout3, _ = app.build_command(j3)
         ok("job.build_command.folder-out", jcmd3[jcmd3.index("--to") + 1] == "folder"
            and str(jout3).endswith(" [extracted]") and jout3.parent == OUT / "job", str(jout3))
@@ -530,7 +537,7 @@ try:
     e = m.JobDialog(app, item=ji); root.update()
     ok("job.edit.prefill", e.src_var.get() == str(HBT) and e.backport_on_var.get() and e.to_var.get() == ".ffpfsc",
        f"{e.src_var.get()} {e.to_var.get()}")
-    idx = app.queue.index(ji); e.backport_on_var.set(False); e.sign_var.set(True); e._add(); root.update()
+    idx = app.queue.index(ji); e.backport_on_var.set(False); e.sign_var.set(True); e._add(); settle()
     ok("job.edit.swapped-in-place", app.queue[idx].operation == "chain" and app.queue[idx].chain_sign
        and app.queue[idx].backport_target is None and app.queue[idx] is not ji, "")
     # J6) the queue row and the details panel carry the derived sentence
@@ -553,7 +560,7 @@ try:
     _lvl0 = app.compression_level_var.get()
     jc.to_var.set(".ffpfsc"); jc.level_var.set(3); jc.out_var.set(str(OUT / "job")); root.update()
     ok("job.compression.label", jc._level_lbl.cget("text") == "level 3", jc._level_lbl.cget("text"))
-    n0 = len(app.queue); jc._add(); root.update(); jl = app.queue[-1]
+    n0 = len(app.queue); jc._add(); settle(); jl = app.queue[-1]
     jlcmd, *_ = app.build_command(jl)
     ok("job.compression.per-job-level", len(app.queue) == n0 + 1 and jl.compression_level == 3
        and jlcmd[jlcmd.index("--compression-level") + 1] == "3", " ".join(jlcmd[-12:]))
@@ -599,7 +606,7 @@ try:
     _real_pw = app._resolve_archive_password
     app._resolve_archive_password = lambda _it: None
     try:
-        n0 = len(app.queue); errors.clear(); jp._add(); root.update()
+        n0 = len(app.queue); errors.clear(); jp._add(); settle()
     finally:
         app._resolve_archive_password = _real_pw
     _new = app.queue[n0:]
@@ -627,7 +634,7 @@ try:
     _asked = []
     class _FakePrompt:
         def __init__(self, _app, name): _asked.append(name); self.password = ""
-    _real_prompt, _real_probe = m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header
+    _real_prompt, _real_probe = m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header_state
     m.ArchivePasswordPrompt = _FakePrompt
     try:
         _ai = m.GameItem.__new__(m.GameItem)
@@ -637,17 +644,43 @@ try:
         _no_prompt_when_open = not _asked
         _ai.header_locked = True
         _saved_list = list(app.archive_passwords); app.archive_passwords = ["saved-pass"]
-        m.ArchiveExtractor.probe_header = staticmethod(lambda _a, _p=None: (True, 800))
+        m.ArchiveExtractor.probe_header_state = staticmethod(lambda _a, _p=None: ("open", 800, ""))
         app._resolve_archive_password(_ai)
         app.archive_passwords = _saved_list
         _no_prompt_when_saved_opens = not _asked and _ai.header_locked is False and _ai.extracted_size == 800
         _ai.header_locked, _ai.extracted_size = True, 0
-        m.ArchiveExtractor.probe_header = staticmethod(lambda _a, _p=None: (False, 0))
+        m.ArchiveExtractor.probe_header_state = staticmethod(lambda _a, _p=None: ("locked", 0, ""))
         app._resolve_archive_password(_ai)
     finally:
-        m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header = _real_prompt, _real_probe
+        m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header_state = _real_prompt, _real_probe
     ok("password.prompt.only-when-locked", _no_prompt_when_open and _no_prompt_when_saved_opens
        and _asked == ["Example.part1.rar"], f"{_no_prompt_when_open} {_no_prompt_when_saved_opens} {_asked}")
+    # a damaged archive is never a password question
+    _asked.clear()
+    m.ArchivePasswordPrompt = _FakePrompt
+    _real_state = m.ArchiveExtractor.probe_header_state
+    try:
+        _di = m.GameItem.__new__(m.GameItem)
+        _di.source_kind, _di.extracted_size, _di.size = "archive", 0, 1000
+        _di.archive_path, _di.header_locked, _di.password = S / "Broken.part1.rar", False, None
+        _di.archive_problem = "1 part of the set is missing (Broken.part2.rar)"
+        app._resolve_archive_password(_di)
+        _no_prompt_flagged = not _asked
+        _di.archive_problem, _di.header_locked = "", True
+        _saved_list = list(app.archive_passwords); app.archive_passwords = ["saved-pass"]
+        m.ArchiveExtractor.probe_header_state = staticmethod(lambda _a, _p=None: ("damaged", 0, "the archive is damaged"))
+        app._resolve_archive_password(_di)
+        app.archive_passwords = _saved_list
+        _no_prompt_reprobe = not _asked and _di.archive_problem == "the archive is damaged" and not _di.header_locked
+    finally:
+        m.ArchivePasswordPrompt, m.ArchiveExtractor.probe_header_state = _real_prompt, _real_state
+    ok("password.no-prompt-for-damaged-archive", _no_prompt_flagged and _no_prompt_reprobe,
+       f"{_no_prompt_flagged} {_no_prompt_reprobe} {_asked}")
+    _dc = app._card_info_text(_di) if hasattr(app, "_card_info_text") else {}
+    ok("card.status-names-archive-damage", "cannot be read: the archive is damaged" in _dc.get("Status", ""),
+       _dc.get("Status", ""))
+    ok("error.diagnosis-damaged-archive", "broken" in (m.ErrorDialog._diagnose(
+        "RAR extraction failed — 1 part of the set is missing (X.part2.rar) — download the set again", "") or ""), "")
     # J6g) a silent step reports progress: the backend's bars move the stage, % and speed
     _pj = m.GameItem.from_chain(HBT, to="ffpfsc")
     _pc, _pcwd, _pout, _ptmp = app.build_command(_pj)
@@ -804,6 +837,275 @@ try:
        and _rq.status == "Pending Extract" and _rq.extracted_size == 1234,
        f"{getattr(_rq, 'archive_path', None)} {getattr(_rq, 'status', None)}")
     app.queue[:] = _live_q; m.save_settings({"queue": _saved_q or []}); app.update_queue_box(); root.update()
+    # J6i) a failed job keeps its extraction; Edit and Retry work on it
+    _live_q = list(app.queue); _old_temp2 = app.temp_var.get(); app.temp_var.set(str(_kt))
+    _fpkg_dir = _kt / "_extracted" / "Fail__4" / "inner"; _fpkg_dir.mkdir(parents=True, exist_ok=True)
+    _fpk = _fpkg_dir / "Title.pkg"; _fpk.write_bytes(b"\x7fCNT")
+    _fi = m.GameItem.from_chain(_fpk, to="ffpfsc", output_path=str(OUT / "job"), backport_target="10.xx")
+    _fi.origin_archive, _fi.status = str(_korg), "Running"
+    _real_sound, _real_start = app.play_complete_sound, app.start
+    app.play_complete_sound = lambda *_a, **_k: None
+    app.queue[:] = [_fi]; app._active_item = _fi; app._batch_running = False; app._batch_total = 1
+    app.worker = None
+    _refusal = "The game uses 120 function(s) that 10.xx lacks (libSceAcm, …). It needs patched libraries."
+    _tops_before = set(root.winfo_children())
+    app.finish(False, _refusal, "cmd")
+    pump(lambda: _fi.status == "Failed", timeout=10.0); root.update()
+    ok("failure.keeps-extract", _fi.kept_extract and (_kt / "_extracted" / "Fail__4").exists()
+       and _fi in app.queue, f"{_fi.status} kept={_fi.kept_extract}")
+    _eds = [w for w in root.winfo_children() if w not in _tops_before and isinstance(w, m.ErrorDialog)]
+    _btn_texts = set()
+    def _walk(w):
+        for c in w.winfo_children():
+            try:
+                _btn_texts.add(c.cget("text"))
+            except Exception:
+                pass
+            _walk(c)
+    for _e in _eds:
+        _walk(_e)
+    ok("failure.error-window-offers-edit-and-retry", len(_eds) == 1 and {"Edit job", "Retry"} <= _btn_texts,
+       str(sorted(x for x in _btn_texts if isinstance(x, str))[:12]))
+    ok("failure.diagnosis-backport", "Edit job" in (m.ErrorDialog._diagnose(_refusal, "") or ""), "")
+    close_toplevels()
+    app.update_game_details(_fi); root.update()
+    ok("failure.retry-button-shown", app.retry_btn._state == "normal", str(getattr(app.retry_btn, "_state", "?")))
+    # Edit: the kept copy is the source, and saving keeps the job's archive link and copy
+    _before = set(app._panels.stack)
+    app._edit_job(_fi); root.update()
+    _jd = next((w for w in app._panels.stack if w not in _before and isinstance(w, m.JobDialog)), None)
+    ok("failure.edit-opens-on-kept-copy", _jd is not None and _jd.src_var.get() == str(_fpk),
+       _jd.src_var.get() if _jd else "no editor")
+    if _jd is not None:
+        _jd.backport_target_var.set("7.61"); _jd.out_var.set(str(OUT / "job")); root.update()
+        _jd._add(); settle()
+    _ne = app.queue[0] if app.queue else None
+    ok("failure.edit-keeps-archive-link", _ne is not None and _ne is not _fi and _ne.backport_target == "7.61"
+       and _ne.origin_archive == str(_korg) and _ne.kept_extract and _ne.status == "Queued",
+       f"{getattr(_ne, 'backport_target', None)} {getattr(_ne, 'origin_archive', None)} {getattr(_ne, 'status', None)}")
+    # Edit a failed job whose copy is gone: the editor shows the archive it came from
+    _gi = m.GameItem.from_chain(_fpk, to="ffpfsc", output_path=str(OUT / "job"))
+    _gi.origin_archive, _gi.status, _gi.path = str(_korg), "Failed", S / "gone2" / "Title.pkg"
+    app.queue.append(_gi); app.update_queue_box(); _before = set(app._panels.stack)
+    app._edit_job(_gi); root.update()
+    _jd2 = next((w for w in app._panels.stack if w not in _before and isinstance(w, m.JobDialog)), None)
+    ok("failure.edit-shows-archive-when-copy-gone", _jd2 is not None and _jd2.src_var.get() == str(_korg), "")
+    if _jd2 is not None:
+        _jd2.destroy(); root.update()
+    # Retry runs this job alone, first
+    _starts = []
+    app.start = lambda rearm_failed=True: _starts.append(rearm_failed)
+    _gi.status = "Failed"; app.queue.remove(_gi); app.queue.append(_gi)
+    app._retry_job(_gi)
+    ok("retry.runs-this-job-only", app.queue[0] is _gi and _gi.status in ("Pending Extract", "Queued")
+       and _starts == [False], f"{_gi.status} {_starts}")
+    app.start = _real_start
+    # the next job of a batch frees a failed job's copy when it needs the space
+    _rel = _kt / "_extracted" / "Rel__5"; _rel.mkdir(parents=True, exist_ok=True); (_rel / "Title.pkg").write_bytes(b"x")
+    _rf = m.GameItem.from_chain(_rel / "Title.pkg", to="ffpfsc", output_path=str(OUT / "job"))
+    _rf.status, _rf.kept_extract, _rf.origin_archive = "Failed", True, str(_korg)
+    _rc = m.GameItem.from_chain(_rel / "Title.pkg", to="ffpfsc", output_path=str(OUT / "job"))
+    _rc.status, _rc.kept_extract = "Cancelled", True
+    _nx = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job"))
+    app.queue[:] = [_nx, _rf, _rc]
+    _real_pf, _real_rer = m._space_preflight_ok, app._resolve_extract_root
+    m._space_preflight_ok = lambda *_a: True
+    app._resolve_extract_root = lambda _it: None
+    _fits = app._release_failed_copies(_nx)
+    m._space_preflight_ok = lambda *_a: False
+    _tight = app._release_failed_copies(_nx)
+    m._space_preflight_ok, app._resolve_extract_root = _real_pf, _real_rer
+    pump(lambda: not _rel.exists(), timeout=10.0)
+    ok("batch.frees-failed-copy-only-when-needed", _fits is False and _tight is True and not _rf.kept_extract
+       and _rc.kept_extract and "make room" in _rf.status_note and not _rel.exists(),
+       f"fits={_fits} tight={_tight} rf={_rf.kept_extract} rc={_rc.kept_extract}")
+    # J6j) a finished job stays in the queue, marked Done, until it is cleared
+    _real_sum, _real_open = app.summary_popup_var.get(), app.open_output_var.get()
+    app.summary_popup_var.set(False); app.open_output_var.set(False)
+    app.auto_remove_done_var.set(False)
+    _dj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job")); _dj.status = "Running"
+    _fj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job")); _fj.status = "Failed"
+    _cj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job")); _cj.status = "Cancelled"
+    app.queue[:] = [_dj, _fj, _cj]; app._active_item = _dj; app._batch_running = False; app._batch_total = 1
+    app.update_queue_box(); root.update()
+    ok("queue.clear-disabled-without-done", app._clear_btn._state == "disabled", app._clear_btn._state)
+    app.finish(True, "ok", "cmd")
+    pump(lambda: _dj.status == "Done", timeout=10.0); root.update()
+    _rows = list(app.queue_listbox.rows)
+    ok("queue.done-job-stays", _dj in app.queue and app.queue[-1] is _dj and _dj.status == "Done"
+       and app._clear_btn._state == "normal", f"{_dj.status} {[i.status for i in app.queue]}")
+    ok("queue.done-row-is-green", bool(_rows) and _rows[-1].get("state") == "done", str([r.get("state") for r in _rows]))
+    # only the jobs that run count for "Game n/N"
+    app._batch_running = False; app._ensure_batch_started()
+    ok("queue.batch-counts-only-runnable", app._batch_total == 0 and not app._batch_running, str(app._batch_total))
+    app._batch_running = False
+    app._sync_primary_action()
+    ok("queue.start-stays-for-failed-jobs", str(app.start_btn._state) == "normal", app.start_btn._state)
+    _asks = []
+    _real_ask = m.messagebox.askyesno
+    m.messagebox.askyesno = lambda *a, **k: (_asks.append(a[0] if a else ""), True)[1]
+    try:
+        app.clear_jobs("done")
+        _after_done = [i.status for i in app.queue]
+        _cj.kept_extract = True
+        app.clear_jobs("failed")
+        _after_failed = list(app.queue)
+    finally:
+        m.messagebox.askyesno = _real_ask
+    ok("queue.clear-completed", _after_done == ["Failed", "Cancelled"], str(_after_done))
+    ok("queue.clear-failed-asks-for-kept-copies", _after_failed == [] and len(_asks) == 1, f"{_after_failed} {_asks}")
+    # the setting removes a finished job right away
+    app.auto_remove_done_var.set(True)
+    _dk = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job")); _dk.status = "Running"
+    app.queue[:] = [_dk]; app._active_item = _dk
+    app.finish(True, "ok", "cmd")
+    pump(lambda: _dk not in app.queue, timeout=10.0)
+    ok("queue.auto-remove-setting", _dk not in app.queue, str([i.status for i in app.queue]))
+    app.auto_remove_done_var.set(False)
+    # clear all keeps the running job
+    _r1 = m.GameItem.from_chain(HBT, to="ffpfsc"); _r2 = m.GameItem.from_chain(HBT, to="ffpfsc"); _r2.status = "Done"
+    app.queue[:] = [_r1, _r2]; app._batch_running = True
+    m.messagebox.askyesno = lambda *a, **k: True
+    try:
+        app.clear_jobs("all")
+    finally:
+        m.messagebox.askyesno = _real_ask
+    ok("queue.clear-all-keeps-running", app.queue == [_r1], str(len(app.queue)))
+    app._batch_running = False
+    app.queue[:] = [_r2]; app._sync_primary_action()
+    ok("queue.start-off-when-all-done", str(app.start_btn._state) == "disabled", app.start_btn._state)
+    # a restored Done job stays listed even when its source is gone
+    _saved_q2 = m.load_settings().get("queue")
+    _de = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(_r2).items()
+           if not k.startswith("_") and k != "artwork" and (v is None or isinstance(v, (str, int, float, bool, Path)))}
+    _de.update({"status": "Done", "path": str(S / "gone3" / "x"), "archive_path": None})
+    m.save_settings({"queue": [_de]}); app.queue.clear(); app._restore_queue()
+    ok("queue.restore-keeps-done-record", len(app.queue) == 1 and app.queue[0].status == "Done", str(len(app.queue)))
+    m.save_settings({"queue": _saved_q2 or []})
+    app.summary_popup_var.set(_real_sum); app.open_output_var.set(_real_open)
+    # J6k) an output that is already there is asked about at the start, before anything runs
+    _xo = OUT / "exists_check"; shutil.rmtree(_xo, ignore_errors=True); _xo.mkdir(parents=True)
+    _xj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(_xo)); _xj.auto_organize = True
+    _pred = app._predicted_output(_xj)
+    ok("exists.predicted-like-build", _pred is not None and _pred.suffix == ".ffpfsc"
+       and _pred.parent.parent == _xo, str(_pred))
+    _pred.parent.mkdir(parents=True, exist_ok=True)
+    _other_fw = _pred.with_name(app._FW_TAG.sub("", _pred.stem) + " [fw9.99]" + _pred.suffix)
+    _other_fw.write_bytes(b"old")
+    ok("exists.found-despite-fw-tag", app._existing_output(_pred) == _other_fw, str(app._existing_output(_pred)))
+    _real_askx = app._ask_existing_outputs
+    _asked_x = []
+    def _ans(choice):
+        def f(conflicts):
+            _asked_x.append([str(h) for _n, h in conflicts]); return choice
+        return f
+    _rule0 = app.output_exists_var.get(); app.output_exists_var.set("ask")
+    try:
+        app.queue[:] = [_xj]; _xj.status = "Queued"
+        app._ask_existing_outputs = _ans("cancel")
+        _c = app._check_existing_outputs()
+        app._ask_existing_outputs = _ans("overwrite")
+        _o = app._check_existing_outputs()
+        _o_flag = getattr(_xj, "_replace_output", False)
+        app._ask_existing_outputs = _ans("skip")
+        _xj.status = "Queued"
+        _s = app._check_existing_outputs()
+    finally:
+        app._ask_existing_outputs = _real_askx
+        app.output_exists_var.set(_rule0)
+    ok("exists.cancel-stops-start", _c is False, str(_c))
+    ok("exists.overwrite-marks-job", _o is True and _o_flag and _xj.status in ("Queued", "Skipped"), str(_o_flag))
+    ok("exists.skip-retires-job", _s is True and _xj.status == "Skipped" and "already there" in _xj.status_note
+       and len(_asked_x) == 3, f"{_xj.status} {_xj.status_note} {len(_asked_x)}")
+    # the rule in Settings answers without a window: Skip by default, Keep both, Overwrite
+    _asked_x.clear(); app._ask_existing_outputs = _ans("cancel")
+    try:
+        _xj.status = "Queued"; app.output_exists_var.set("skip")
+        _rs = app._check_existing_outputs(); _rs_state = _xj.status
+        _xj.status = "Queued"; app.output_exists_var.set("keep")
+        _rk = app._check_existing_outputs(); _rk_flag = getattr(_xj, "_keep_both", False)
+        _xj.status = "Queued"; app.output_exists_var.set("overwrite")
+        _ro = app._check_existing_outputs(); _ro_flag = getattr(_xj, "_replace_output", False)
+    finally:
+        app._ask_existing_outputs = _real_askx
+        app.output_exists_var.set(_rule0)
+    ok("exists.rule-skip-is-default-without-window", _rule0 == "skip" and _rs and _rs_state == "Skipped"
+       and not _asked_x, f"{_rule0} {_rs_state} {_asked_x}")
+    ok("exists.rule-keep-and-overwrite", _rk and _rk_flag and _ro and _ro_flag, f"{_rk_flag} {_ro_flag}")
+    _kb = _pred.parent / "Example Quest [PPSA00001] [v01.000] [fw10.00].ffpfsc"; _kb.write_bytes(b"old")
+    _kbi = m.GameItem.from_chain(HBT, to="ffpfsc"); _kbi._keep_both = True
+    _kn = app._keep_both_name(_kbi, _kb)
+    _long = _pred.parent / ("A" * 70 + " [PPSA00001] [v01.000] [fw10.00].ffpfsc")
+    _ln = app._free_output_name(_long)
+    ok("exists.keep-both-numbered-name", _kn.name == "Example Quest (2) [PPSA00001] [v01.000] [fw10.00].ffpfsc"
+       and len(_ln.name.encode()) <= m.SHADOWMOUNT_NAME_LIMIT and " (2) [PPSA00001]" in _ln.name, f"{_kn.name} | {_ln.name}")
+    # a job whose output shows only after unpacking follows the choice made at the start
+    _lj = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(_xo)); _lj.auto_organize = True
+    _lj._output_checked = False
+    app._output_policy = "skip"
+    ok("exists.late-check-follows-choice", app._late_output_check(_lj) == "skip", "")
+    app._output_policy = None
+    # a .pkg the user chose to overwrite replaces the old one instead of a "(2)" copy
+    _pk_dir = _xo / "pkgtest"; _pk_dir.mkdir()
+    (_pk_dir / "Game [PPSA00001] [v01.000].pkg").write_bytes(b"old")
+    _new_pkg = _pk_dir / "UP0000-PPSA00001_00-X.pkg"; _new_pkg.write_bytes(b"new")
+    _pi = m.GameItem.from_chain(HBT, to="pkg"); _pi._organized_pkg_name = "Game [PPSA00001] [v01.000].pkg"
+    _pi._replace_output = True
+    _fin = app._finalize_pkg_name(_pi, _new_pkg)
+    ok("exists.pkg-overwrite-replaces", _fin.read_bytes() == b"new" and not (_pk_dir / "Game [PPSA00001] [v01.000] (2).pkg").exists(),
+       str(sorted(x.name for x in _pk_dir.iterdir())))
+    # J6l) the job is named after the game, read out of the archive before extraction
+    import zipfile as _zf
+    _za = S / "release" / "[site.example]-PPSA00777.zip"; _za.parent.mkdir(exist_ok=True)
+    with _zf.ZipFile(_za, "w") as _z:
+        _z.writestr("PPSA00777/sce_sys/param.json", json.dumps({"titleId": "PPSA00777", "contentVersion": "01.004.000",
+            "localizedParameters": {"defaultLanguage": "en-US", "en-US": {"titleName": "Example Quest™"}}}))
+        _z.writestr("PPSA00777/eboot.bin", b"\x7fELF" + b"\0" * 100)
+    _ai2 = m.GameItem.from_chain(_za, to="ffpfsc", output_path=str(_xo))
+    _ident_a = app._archive_identity(_ai2)
+    ok("name.archive-identity-before-extraction", _ident_a is not None and _ident_a["title"] == "Example Quest™"
+       and _ident_a["title_id"] == "PPSA00777" and _ai2.archive_version == "01.004.000", str(_ident_a))
+    _ai3 = m.GameItem.from_chain(_za, to="ffpfsc", output_path=str(_xo))
+    app.queue[:] = [_ai3]; app.update_queue_box(); root.update()
+    pump(lambda: getattr(_ai3, "display_name", "") == "Example Quest [PPSA00777]", timeout=10.0); root.update()
+    ok("name.job-named-after-game", _ai3.display_name == "Example Quest [PPSA00777]", str(_ai3.display_name))
+    _ap = app._predicted_output(_ai3)
+    ok("name.archive-output-predicted", _ap is not None and "Example Quest" in _ap.name, str(_ap))
+    app.queue[:] = []
+    app.update_queue_box(); root.update()
+    # J6m) adding many jobs shows its progress, and a Start pressed meanwhile waits for them
+    _real_fc = m.GameItem.from_chain
+    def _slow_fc(*a, **k):
+        time.sleep(0.25)
+        return _real_fc(*a, **k)
+    _starts2 = []
+    _real_start2 = app.start
+    m.GameItem.from_chain = _slow_fc
+    app.start = lambda rearm_failed=True: _starts2.append(rearm_failed)
+    try:
+        _srcs = [HBT] * 5
+        app._add_jobs_async(_srcs, lambda s: m.GameItem.from_chain(s, to="ffpfsc", output_path=str(OUT / "job")))
+        pump(lambda: (getattr(app, "_add_state", {}) or {}).get("done", 0) >= 2, timeout=10.0)
+        _mid_visible = app._add_box.winfo_manager() == "grid"
+        _mid_label = app._add_label_var.get()
+        _mid_queue = len(app.queue)
+        _real_start2()                    # pressed while jobs are still being added
+        _pending = app.pending_start
+        settle()
+        root.update(); time.sleep(0.2); root.update()
+    finally:
+        m.GameItem.from_chain = _real_fc
+        app.start = _real_start2
+    ok("add.progress-while-adding", _mid_visible and "Adding jobs" in _mid_label and " of 5" in _mid_label
+       and 2 <= _mid_queue < 5, f"{_mid_visible} {_mid_label!r} {_mid_queue}")
+    ok("add.all-in-and-bar-gone", len(app.queue) == 5 and app._add_box.winfo_manager() == "", str(len(app.queue)))
+    ok("add.start-waits-for-new-jobs", _pending and _starts2 == [True], f"{_pending} {_starts2}")
+    app.pending_start = False
+    app.queue[:] = []
+    app.update_queue_box(); root.update()
+    app.play_complete_sound = _real_sound
+    app.queue[:] = _live_q; app.temp_var.set(_old_temp2); app._active_item = None
+    app.update_queue_box(); root.update()
     # J6d) the details pane: facts about the job, a log that fills the height, a failure reason
     jc2 = m.GameItem.from_chain(HBT, to="ffpfsc", output_path=str(OUT / "job"))
     jc2.compression_level = 5
@@ -844,12 +1146,12 @@ try:
     ok("job.backport.hint-problem", "cannot be used" in jd7.backport_hint_var.get()
        and "5.10" in jd7.backport_hint_var.get(), jd7.backport_hint_var.get())
     jd7.to_var.set(".ffpfsc"); jd7.out_var.set(str(OUT / "job")); root.update()
-    n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
+    n0 = len(app.queue); errors.clear(); jd7._add(); settle()
     ok("job.backport.add-refuses-unusable-target", len(app.queue) == n0 and any("5.10" in x for x in errors),
        str(errors))
     ok("job.backport.no-libraries-field", not hasattr(jd7, "backport_libs_var"), "")
     jd7.backport_target_var.set("9.60"); app.backport_libs_var.set(str(fwr)); root.update()
-    n0 = len(app.queue); errors.clear(); jd7._add(); root.update()
+    n0 = len(app.queue); errors.clear(); jd7._add(); settle()
     ok("job.backport.refuses-firmware-folder-as-patched", len(app.queue) == n0
        and any("original libraries" in x and "Settings" in x for x in errors), str(errors))
     app.backport_libs_var.set("")
@@ -868,7 +1170,7 @@ try:
     pump(lambda: jd7.check_var.get() not in ("", "Checking…"), timeout=60.0)
     ok("job.check.shows-verdict", jd7.check_var.get().startswith(("Not checked", "The game uses", "Firmware",
                                                                   "Every function")), jd7.check_var.get())
-    jd7.backport_target_var.set("9.60"); root.update(); errors.clear(); jd7._add(); root.update()
+    jd7.backport_target_var.set("9.60"); root.update(); errors.clear(); jd7._add(); settle()
     j7 = app.queue[-1]
     jcmd7, *_ = app.build_command(j7)
     ok("job.backport.cmd-derived-target", len(app.queue) == n0 + 1 and j7.backport_target == "9.60"
@@ -899,7 +1201,7 @@ try:
             shutil.copytree(HBT, parent / nme)
     jd7 = m.JobDialog(app, init_src=str(parent)); root.update()
     ok("job.detect.parent", jd7._kind == "parent" and len(jd7._games) == 2, jd7.detect_var.get())
-    jd7.to_var.set(".ffpfsc"); jd7.out_var.set(str(OUT / "job")); n0 = len(app.queue); jd7._add(); root.update()
+    jd7.to_var.set(".ffpfsc"); jd7.out_var.set(str(OUT / "job")); n0 = len(app.queue); jd7._add(); settle()
     ok("job.add.parent-two-items", len(app.queue) == n0 + 2 and all(x.operation == "chain" for x in app.queue[-2:]),
        f"+{len(app.queue) - n0}")
     # J8) the choices are remembered per kind of source
@@ -1000,7 +1302,7 @@ try:
         pump(lambda: getattr(jd, "_kind", "") not in ("", None), timeout=15)
         jd.to_var.set(".ffpfsc"); jd.out_var.set(str(OUT / "wire")); root.update()
         n0 = len(app.queue)
-        app._panels._on_key("<Return>", None); root.update()
+        app._panels._on_key("<Return>", None); settle()
         ok("wire.panel.return-adds-job", len(app.queue) == n0 + 1, f"+{len(app.queue) - n0}, kind={getattr(jd, '_kind', '?')}")
         close_toplevels(); root.update()
 

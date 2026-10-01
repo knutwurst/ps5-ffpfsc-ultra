@@ -3,7 +3,114 @@
 ════════════════════════════════════════════════════════════════════════
 
 ────────────────────────────────────────────────────────────────────────
-  v2.0.1  (current)
+  v2.0.2  (current)
+────────────────────────────────────────────────────────────────────────
+
+AN OUTPUT THAT IS ALREADY THERE IS SKIPPED
+
+  - Start checks which jobs would write a file that is already in the
+    output folder, before anything is unpacked or packed, and skips
+    them. Until now every job replaced an existing file without a word,
+    after hours of work, and a .pkg got a second copy named "(2)".
+  - Settings › Interface › "When the output is already there" sets the
+    rule: Skip (the default), Ask (one window lists every such job:
+    Skip, Overwrite, Keep both or Cancel), Overwrite, or Keep both,
+    where the new build gets a numbered name beside the old file:
+    "Title (2) [PPSA01234] [v01.000] [fw10.00].ffpfsc", within the
+    ShadowMount name limit.
+  - The check uses the name the job will give its output. A file with
+    the same name but another firmware tag counts as the same output.
+  - A job whose name is known only after its archive is unpacked (a
+    solid 7z or RAR, a .pkg inside an archive) is checked right after
+    the unpack, before the long packing step, and follows the same rule
+    (or the answer given at the start). A skipped job leaves the run
+    without counting as failed.
+  - Overwrite replaces an existing .pkg too, instead of keeping both.
+
+A JOB IS NAMED AFTER ITS GAME
+
+  - The queue shows the game's title and title id, "Example Quest
+    [PPSA01234]", as soon as the app can read them:
+    from a game folder, a .ffpfs, .ffpfsc, .exfat or .pkg, and from a
+    ZIP, RAR or 7z that is not solid, whose param.json is read out of
+    the archive alone. A release name like "[site]-PPSA12345.part01"
+    says little. For other archives the title appears once the archive
+    is unpacked.
+
+ADDING MANY JOBS NO LONGER FREEZES THE WINDOW
+
+  - Add job builds its jobs in the background. Reading the headers of
+    a many-part archive on a slow drive takes seconds, and the window
+    froze until every source of a folder was read. Now each job joins
+    the queue as soon as it is ready, a line with a bar above the list
+    counts them ("Adding jobs… 6 of 9"), and a Start pressed meanwhile
+    begins once the last one is in.
+
+FINISHED JOBS STAY IN THE QUEUE
+
+  - A job that succeeds stays in the queue, marked Done with a green
+    check, below the jobs still to run. It used to vanish the moment it
+    finished. Settings › Interface › "Remove a job from the queue when
+    it is done" brings that back; failed jobs always stay.
+  - Clear completed, in the queue header, removes the finished jobs. A
+    right-click on it (or on a job) offers Clear failed, for failed,
+    skipped and cancelled jobs, and Clear all. The running job always
+    stays, and clearing a job that kept an extracted copy for a retry
+    asks first, because the copy goes with it.
+  - In a narrow window the header buttons drop their words and keep
+    their icons, so the title and Start stay whole.
+  - "Game 2/5" counts only the jobs that run, not the finished and
+    failed ones listed with them, and Start is off while every job in
+    the queue is done. A finished job stays listed after a restart,
+    even when its source is gone.
+
+A FAILED JOB CAN BE CHANGED AND RUN AGAIN
+
+  - Edit works on a failed or cancelled job. It used to open on the
+    extracted copy the app had just deleted after the failure, and Add
+    refused the missing source. The editor now shows the source the job
+    will run from: the copy it kept, or the archive it came from.
+  - Retry sits next to Edit for a failed, cancelled or skipped job and
+    runs that job again, on its own; the other failed jobs stay as they
+    are. The error window has Edit job and Retry buttons too, and for a
+    refused backport it says what to do: pick another target (Check
+    tells you which one works) or add patched libraries for it.
+  - A failed job keeps what it extracted from its archive, like a
+    cancelled one, so a retry does not unpack the archive again.
+    Removing the job deletes the copy. When the next job of a batch
+    needs the space, the app deletes the copies of failed jobs first
+    and says so in the log; a copy kept after a cancel stays.
+
+A BROKEN ARCHIVE IS NOT A PASSWORD QUESTION
+
+  - A damaged or incomplete archive no longer asks for a password. The
+    check that runs when you add an archive read every failure as "none
+    of your saved passwords opens it", so a set with a missing or
+    corrupt part brought up the password prompt, and the right password
+    typed in was refused as well. The check now tells the two apart: it
+    asks only when the archive answers with a password error, and
+    otherwise names the damage in the log and the details pane, for
+    example "1 part of the set is missing (….part2.rar)" or "its data
+    is damaged". A damaged ZIP reads as damaged too.
+  - When such an archive fails to extract, the error says what is
+    broken, and the error window adds that a password does not help.
+  - A part that goes away while the archive is extracted (a drive that
+    drops out or falls asleep) ends the job with an error. The
+    extraction used to wait for that part forever.
+
+A BACKPORT IS CHECKED BEFORE THE GAME IS UNPACKED
+
+  - A backport job on a .pkg, .ffpfs or .ffpfsc reads only the game's
+    executables out of it and runs the function check on them before
+    it unpacks the whole game. A target that cannot work is refused
+    after seconds; it used to be refused after the full unpack, which
+    takes half an hour for a big package.
+  - Check in Add job reads a .pkg, .ffpfs or .ffpfsc the same way, so
+    you see the verdict before you add the job. --backport-analyze
+    takes these containers too.
+
+────────────────────────────────────────────────────────────────────────
+  v2.0.1
 ────────────────────────────────────────────────────────────────────────
 
 ARCHIVE PASSWORDS

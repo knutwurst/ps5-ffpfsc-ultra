@@ -1743,24 +1743,52 @@ def _fake_sign_tree(folder) -> dict:
     return fake_sign_tree(str(folder), log=lambda m: print(m, flush=True))
 
 
-def _apply_backport(folder, target: str, libs_root=None, fw_root=None) -> None:
-    """Backport pass on *folder*, IN PLACE. Runs before fake-sign in the same
-    invocation. Everything that can stop the job is decided before a byte changes:
+_EXECUTABLE_SUFFIXES = (".prx", ".sprx", ".elf", ".self")
 
-    1. The target's SDK words: the public table for 7.61/6.02/10.xx, otherwise read
-       from that firmware's own libraries under *fw_root* (one subfolder per firmware).
-    2. Encrypted executables are refused: nothing in them can be read or changed.
-    3. With *fw_root*, the check: which functions does the game use that the target
-       firmware lacks? None: lowering the SDK is enough. Some: patched libraries for
-       the target (*libs_root*, or its <target> subfolder) are required.
-    4. Lower the SDK words in every eboot/prx/sprx, raw or fake-signed (in place).
-    5. Copy the patched libraries into <folder>/fakelib/ (never overwrites files
-       already there — the user's own copies win).
 
-    The staging mirror is expected to be a copy already; the caller decides whether
-    this modifies the user's own folder (fake-sign-first path) or the staging one
-    (queue path)."""
-    from pathlib import Path
+def _is_executable_name(rel: str) -> bool:
+    """eboot.bin and every module: the files a backport reads and changes."""
+    name = rel.rsplit("/", 1)[-1].lower()
+    return name == "eboot.bin" or name.endswith(_EXECUTABLE_SUFFIXES)
+
+
+def _pull_executables(src: Path, dest: Path) -> bool:
+    """Copy only the executables of the game in a .pkg, .ffpfs or .ffpfsc into *dest*,
+    in their folders, without unpacking the rest (the package tool and the PFS reader
+    both extract single members). A backport check needs nothing else, so it can run
+    in seconds before a job unpacks the whole game. False for other sources."""
+    src, dest = Path(src), Path(dest)
+    suf = src.suffix.lower()
+    if suf == ".pkg":
+        import fpkg as _fpkg
+        listing = _fpkg.list_inner(src)
+    elif suf in (".ffpfs", ".ffpfsc"):
+        listing = list_pfs_image(src)
+    else:
+        return False
+    names = [str(e.get("path", "")).strip("/") for e in listing.get("entries", [])
+             if e.get("type") == "file" and _is_executable_name(str(e.get("path", "")))]
+    if not names:
+        return False
+    dest.mkdir(parents=True, exist_ok=True)
+    if suf == ".pkg":
+        members = dest.parent / f".{dest.name}.members.txt"
+        members.write_text("\n".join(names) + "\n", encoding="utf-8")
+        try:
+            rc = _fpkg.extract_members(src, dest, members, on_line=lambda _l: None)
+        finally:
+            members.unlink(missing_ok=True)
+    else:
+        rc = extract_pfs_members(src, names, dest)
+    if rc:
+        raise RuntimeError(f"could not read the executables out of {src.name} (rc={rc})")
+    return True
+
+
+def _backport_precheck(folder, target: str, libs_root=None, fw_root=None):
+    """Everything that can stop a backport, decided on the executables under *folder*
+    before a byte changes. Returns (sdk words, patched libraries folder or None);
+    raises with the reason when the backport cannot work."""
     import backport as _bp
     folder = Path(folder)
     if libs_root is not None and not Path(libs_root).is_dir():
@@ -1790,6 +1818,30 @@ def _apply_backport(folder, target: str, libs_root=None, fw_root=None) -> None:
     else:
         print(f"[WARN] Backport: no firmware libraries folder given, so the functions the game uses "
               f"were not checked against {target}.", flush=True)
+    return words, libs
+
+
+def _apply_backport(folder, target: str, libs_root=None, fw_root=None) -> None:
+    """Backport pass on *folder*, IN PLACE. Runs before fake-sign in the same
+    invocation. Everything that can stop the job is decided before a byte changes:
+
+    1. The target's SDK words: the public table for 7.61/6.02/10.xx, otherwise read
+       from that firmware's own libraries under *fw_root* (one subfolder per firmware).
+    2. Encrypted executables are refused: nothing in them can be read or changed.
+    3. With *fw_root*, the check: which functions does the game use that the target
+       firmware lacks? None: lowering the SDK is enough. Some: patched libraries for
+       the target (*libs_root*, or its <target> subfolder) are required.
+    4. Lower the SDK words in every eboot/prx/sprx, raw or fake-signed (in place).
+    5. Copy the patched libraries into <folder>/fakelib/ (never overwrites files
+       already there — the user's own copies win).
+
+    The staging mirror is expected to be a copy already; the caller decides whether
+    this modifies the user's own folder (fake-sign-first path) or the staging one
+    (queue path)."""
+    from pathlib import Path
+    import backport as _bp
+    folder = Path(folder)
+    words, libs = _backport_precheck(folder, target, libs_root, fw_root)
     print(f"[INFO] Backport: lowering SDK to {target} (ps5 {words[0]:#010x}, ps4 {words[1]:#010x})",
           flush=True)
     report = _bp.lower_sdk_in_folder(folder, target, words)
@@ -2225,8 +2277,22 @@ def main() -> None:
                   flush=True)
             sys.exit(2)
         src = Path(args.backport_analyze).expanduser().resolve()
+        _analyze_tmp = None
+        if src.is_file() and src.suffix.lower() in (".pkg", ".ffpfs", ".ffpfsc"):
+            # the executables alone answer the question; the rest stays packed
+            _analyze_tmp = tempfile.TemporaryDirectory(prefix="analyze-")
+            try:
+                if not _pull_executables(src, Path(_analyze_tmp.name) / "game"):
+                    print(f"[ERROR] --backport-analyze: no executables in {src.name}", flush=True)
+                    sys.exit(1)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"[ERROR] --backport-analyze: {e}", flush=True)
+                sys.exit(1)
+            src = Path(_analyze_tmp.name) / "game"
         if not src.is_dir():
-            print(f"[ERROR] --backport-analyze: not a folder: {src}", flush=True)
+            print(f"[ERROR] --backport-analyze: not a folder, .pkg, .ffpfs or .ffpfsc: {src}", flush=True)
             sys.exit(1)
         import backport as _bp
         fw = Path(args.fw_libs_root).expanduser().resolve() if args.fw_libs_root else None
@@ -2391,6 +2457,19 @@ def main() -> None:
                   "ffpfsc": {"folder", "exfat", "ffpkg", "ffpfs", "zip", "rar"},
                   "pkg": {"folder", "ffpfs", "ffpfsc", "exfat", "ffpkg"}}
         root, owned = src, None
+        if args.backport_target and src.is_file() and kind in ("pkg", "ffpfs", "ffpfsc"):
+            # Check the backport on the executables alone before the whole game is
+            # unpacked: a refusal comes after seconds, not after the unpack.
+            probe = Path(tempfile.mkdtemp(prefix="chain-check-", dir=str(scratch_root)))
+            try:
+                print(f"[INFO] Checking the backport to {args.backport_target} on the executables of "
+                      f"{src.name} before unpacking it...", flush=True)
+                if _pull_executables(src, probe / "game"):
+                    _backport_precheck(probe / "game", args.backport_target, *_backport_dirs(args))
+            except Exception as e:
+                print(f"[ERROR] {e}", flush=True); sys.exit(1)
+            finally:
+                shutil.rmtree(probe, ignore_errors=True)
         if wanted or kind not in native.get(to, set()):
             try:
                 root, owned = _chain_materialize(src, scratch_root, args)

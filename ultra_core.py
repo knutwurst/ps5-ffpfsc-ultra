@@ -18,6 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -1382,6 +1383,36 @@ def descriptive_ffpfsc_name(item, ext: str = ".ffpfsc", *,
 
 
 # ── Auto-organize: library names from the game's own metadata ─────────────────
+def ident_from_param_bytes(data) -> dict | None:
+    """{'title', 'title_id', 'version'} from the bytes of a sce_sys/param.json (Sony's
+    layout: the title of the default language, else any language, else titleName). None
+    when the data is no param.json or names neither a title nor a title id."""
+    try:
+        d = json.loads(data.decode("utf-8-sig", errors="replace") if isinstance(data, (bytes, bytearray)) else data)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    title = ""
+    lp = d.get("localizedParameters") or {}
+    if isinstance(lp, dict):
+        lang = lp.get("defaultLanguage")
+        block = lp.get(lang) if isinstance(lang, str) else None
+        if isinstance(block, dict):
+            title = str(block.get("titleName") or "")
+        if not title:
+            for v in lp.values():
+                if isinstance(v, dict) and v.get("titleName"):
+                    title = str(v["titleName"]); break
+    if not title:
+        title = str(d.get("titleName") or "")
+    tid = str(d.get("titleId") or "").strip().upper()
+    ver = str(d.get("contentVersion") or d.get("masterVersion") or "").strip()
+    if not (title or tid):
+        return None
+    return {"title": title.strip(), "title_id": tid, "version": ver}
+
+
 def canonical_game_title(title: str) -> str:
     """A game title as it appears in a library name: no ™®©℠℗, 'A: B' → 'A - B'
     (a bare colon would become 'A- B' through the filename sanitiser), tidy spaces."""
@@ -1654,6 +1685,69 @@ class ArchiveExtractor:
         )
 
     @staticmethod
+    def read_game_param(archive: Path, passwords=None) -> bytes | None:
+        """The game's sce_sys/param.json read out of *archive* alone, the other members
+        skipped: so the job knows the game's name and its output before anything is
+        unpacked. The game's is the shallowest one in the archive (a patch or DLC folder
+        beside it sits deeper). ZIP always; RAR and 7z only when they are not solid,
+        because there one member costs decompressing everything before it. None when it
+        cannot be read that cheaply, or the archive holds no param.json (a .pkg inside)."""
+        archive = Path(archive)
+        if re.match(r"^\.r\d{2,}$", archive.suffix.lower()) or archive.suffix.lower() == ".rar":
+            archive = ArchiveExtractor._first_volume(archive)
+        suffix = archive.suffix.lower()
+        if suffix not in (".zip", ".rar", ".7z"):
+            return None
+        pwds = [p.strip() for p in (passwords or []) if p and p.strip()]
+        names = ArchiveExtractor.list_members(archive, pwds)
+        hits = sorted((n for n in names if n.lower().rstrip("/").endswith("sce_sys/param.json")),
+                      key=lambda n: (n.count("/"), len(n)))
+        if not hits:
+            return None
+        name = hits[0]
+        cands = pwds + [""]
+        try:
+            if suffix == ".zip":
+                with zipfile.ZipFile(archive, "r") as zf:
+                    for pwd in [""] + pwds:
+                        try:
+                            return zf.read(name, pwd=pwd.encode() if pwd else None)
+                        except RuntimeError:             # ZipCrypto: wrong / missing password
+                            continue
+                        except NotImplementedError:      # AES: the stdlib cannot decrypt it
+                            return None
+                return None
+            if suffix == ".rar":
+                backend_dir = backend_base_dir()
+                if str(backend_dir) not in sys.path:
+                    sys.path.insert(0, str(backend_dir))
+                from unrar import rarfile as _br  # type: ignore
+                for pwd in cands:
+                    try:
+                        return _br.RarFile(str(archive), pwd=pwd or None).read(name)
+                    except _br.RarWrongPassword:
+                        continue
+                    except Exception:
+                        return None                      # solid, damaged, a part missing
+                return None
+            import py7zr  # type: ignore
+            for pwd in cands:
+                try:
+                    kwargs = {"password": pwd} if pwd else {}
+                    with py7zr.SevenZipFile(str(archive), mode="r", **kwargs) as sz:
+                        if getattr(sz.archiveinfo(), "solid", True):
+                            return None
+                        with tempfile.TemporaryDirectory(prefix="7z-member-") as td:
+                            sz.extract(path=td, targets=[name])
+                            f = Path(td) / name
+                            return f.read_bytes() if f.is_file() else None
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def list_members(archive: Path, passwords=None) -> list[str]:
         """Return member names ('/'-separated) WITHOUT extracting — a cheap peek
         used to tell a game archive from a DLC/extra. Tries candidate passwords
@@ -1713,6 +1807,83 @@ class ArchiveExtractor:
         (plausible_extracted_size decides that), and that is no reason to ask for a
         password. The size is the honest input to the space pre-check — third-party
         archives are often compressed ~2:1, so the on-disk size badly undershoots."""
+        state, size, _reason = ArchiveExtractor.probe_header_state(archive, passwords)
+        return state == "open", size
+
+    # UnRAR's DLL error codes that mean the archive itself is broken, in plain words.
+    _RAR_DAMAGE = {
+        12: "its data is damaged (a checksum does not match): a part is corrupt or incomplete",
+        13: "the archive is damaged",
+        14: "the file is not a RAR archive, or it is damaged at the start",
+        15: "a part of the set is missing or cannot be opened",
+        18: "a part of the set cannot be read",
+    }
+
+    @staticmethod
+    def volume_gaps(archive: Path) -> list[str]:
+        """Names of the parts missing from a multi-part RAR set between its first part and
+        the highest one present (….part1.rar … .partN.rar, or .rar + .r00 …). A missing
+        LAST part leaves no gap; UnRAR reports that one when it reads the set."""
+        name = archive.name
+        m = re.match(r"^(?P<base>.*\.part)(?P<num>\d+)\.rar$", name, re.I)
+        try:
+            if m:
+                base, width = m.group("base"), len(m.group("num"))
+                pat = re.compile(re.escape(base) + r"(\d+)\.rar$", re.I)
+                nums = {int(mm.group(1)) for f in archive.parent.iterdir() if (mm := pat.match(f.name))}
+                if not nums:
+                    return []
+                return [f"{base}{str(n).zfill(width)}.rar" for n in range(1, max(nums) + 1) if n not in nums]
+            m = re.match(r"^(?P<base>.+)\.(?:rar|r\d{2,})$", name, re.I)
+            if m:
+                base = m.group("base")
+                pat = re.compile(re.escape(base) + r"\.r(\d{2,})$", re.I)
+                found = [(int(mm.group(1)), len(mm.group(1))) for f in archive.parent.iterdir()
+                         if (mm := pat.match(f.name))]
+                if not found:
+                    return []
+                width = found[0][1]
+                nums = {n for n, _w in found}
+                return [f"{base}.r{str(n).zfill(width)}" for n in range(0, max(nums) + 1) if n not in nums]
+        except OSError:
+            return []
+        return []
+
+    @staticmethod
+    def rar_damage_reason(msg: str, archive: Path | None = None) -> str:
+        """What a non-password UnRAR failure means, in plain words, naming a missing part
+        when the set has a gap. Empty when *msg* is no known damage code."""
+        gaps = ArchiveExtractor.volume_gaps(archive) if archive is not None else []
+        if gaps:
+            return (f"{len(gaps)} part{'s' if len(gaps) != 1 else ''} of the set "
+                    f"{'are' if len(gaps) != 1 else 'is'} missing ({', '.join(gaps[:3])}"
+                    f"{', …' if len(gaps) > 3 else ''})")
+        m = re.search(r"\berror (\d+)\b", msg or "", re.I)
+        code = int(m.group(1)) if m else None
+        return ArchiveExtractor._RAR_DAMAGE.get(code, "")
+
+    @staticmethod
+    def _rar4_encrypted_headers(archive: Path) -> bool:
+        """A RAR 4 archive with encrypted headers (rar -hp, old format). It has no password
+        check value, so a wrong password reads as a damaged archive: for these a failure
+        may still mean "wrong password"."""
+        try:
+            with open(archive, "rb") as f:
+                head = f.read(7 + 13)
+        except OSError:
+            return False
+        # marker block, then the main archive header: CRC(2) type(1)=0x73 flags(2)
+        return (head[:7] == b"Rar!\x1a\x07\x00" and len(head) >= 12 and head[9] == 0x73
+                and bool(int.from_bytes(head[10:12], "little") & 0x0080))
+
+    @staticmethod
+    def probe_header_state(archive: Path, passwords=None) -> tuple[str, int, str]:
+        """("open" | "locked" | "damaged", size, reason). "locked": every candidate failed
+        with a password error, so asking for one makes sense. "damaged": the archive
+        failed for another reason (bad data, a missing or broken part), so no password
+        will help and *reason* says why in plain words. RAR 5 tells the two apart with
+        its password check; a damaged ZIP is plainly damaged. A .7z keeps the old
+        answer (any failure reads as locked): its errors do not say which it is."""
         suffix = archive.suffix.lower()
         if re.match(r"^\.r\d{2,}$", suffix):
             archive = ArchiveExtractor._first_volume(archive)
@@ -1720,21 +1891,33 @@ class ArchiveExtractor:
         cands = [p for p in (passwords or []) if p] + [""]
         try:
             if suffix == ".zip":
-                with zipfile.ZipFile(archive, "r") as zf:
-                    return True, sum(int(getattr(zi, "file_size", 0) or 0) for zi in zf.infolist())
+                try:
+                    with zipfile.ZipFile(archive, "r") as zf:
+                        return "open", sum(int(getattr(zi, "file_size", 0) or 0) for zi in zf.infolist()), ""
+                except zipfile.BadZipFile as e:
+                    return "damaged", 0, f"it is not a readable ZIP ({e}): damaged or incomplete"
             if suffix == ".rar":
                 resolved = ArchiveExtractor._first_volume(archive)
                 backend_dir = backend_base_dir()
                 if str(backend_dir) not in sys.path:
                     sys.path.insert(0, str(backend_dir))
                 from unrar import rarfile as _br  # type: ignore
+                damage = ""
                 for pwd in cands:
                     try:
                         with _br.RarFile(str(resolved), pwd=pwd or None) as rf:
-                            return True, sum(int(getattr(ri, "file_size", 0) or 0) for ri in rf.infolist())
-                    except Exception:
+                            return "open", sum(int(getattr(ri, "file_size", 0) or 0) for ri in rf.infolist()), ""
+                    except _br.RarWrongPassword:
                         continue
-                return False, 0
+                    except Exception as e:
+                        damage = damage or (ArchiveExtractor.rar_damage_reason(str(e), resolved) or str(e))
+                        continue
+                if damage and not ArchiveExtractor._rar4_encrypted_headers(resolved):
+                    return "damaged", 0, damage
+                gaps = ArchiveExtractor.volume_gaps(resolved)
+                if gaps:   # a hole in the set: no password reads past it
+                    return "damaged", 0, ArchiveExtractor.rar_damage_reason("", resolved)
+                return "locked", 0, ""
             if suffix == ".7z":
                 import py7zr  # type: ignore
                 for pwd in cands:
@@ -1744,13 +1927,13 @@ class ArchiveExtractor:
                             total = sum(int(getattr(f, "uncompressed", 0) or 0) for f in sz.list())
                             if total <= 0:
                                 total = int(getattr(sz.archiveinfo(), "uncompressed", 0) or 0)
-                            return True, total
+                            return "open", total, ""
                     except Exception:
                         continue
-                return False, 0
+                return "locked", 0, ""
         except Exception:
-            return False, 0
-        return True, 0
+            return "locked", 0, ""
+        return "open", 0, ""
 
     @staticmethod
     def plausible_extracted_size(size: int, ondisk: int) -> int:
@@ -1999,7 +2182,7 @@ class ArchiveExtractor:
         return archive
 
     @staticmethod
-    def _rar_error_hint(e: Exception) -> str:
+    def _rar_error_hint(e: Exception, archive: Path | None = None) -> str:
         """Turn a raw UnRAR error into a short, user-actionable reason."""
         msg = str(e).strip()
         low = msg.lower()
@@ -2012,8 +2195,10 @@ class ArchiveExtractor:
             return ("this RAR is password-protected — enter the correct password in the "
                     "'Archive Password' field and try again "
                     "(error 22 = no password given, 24 = wrong password)")
-        if ("error 12" in low or "read header failed" in low
-                or "failed to open" in low or "missing" in low or "volume" in low):
+        damage = ArchiveExtractor.rar_damage_reason(msg, archive)
+        if damage:
+            return f"{damage} — download the set again, or check that every part is complete"
+        if ("read header failed" in low or "failed to open" in low or "missing" in low or "volume" in low):
             return ("a volume of this multi-part RAR is missing, incomplete, or it was "
                     "opened on the wrong part — make sure every .partN.rar (or .rNN) file "
                     "is present in the same folder")
@@ -2067,7 +2252,7 @@ class ArchiveExtractor:
             if log_fn:
                 log_fn("WARN", f"Bundled UnRAR unavailable ({e}) — trying fallback extractors…")
         except Exception as e:
-            bundled_err = ArchiveExtractor._rar_error_hint(e)
+            bundled_err = ArchiveExtractor._rar_error_hint(e, archive)
             if log_fn:
                 log_fn("WARN", f"Bundled UnRAR failed: {e}")
 
@@ -2588,6 +2773,10 @@ class GameItem:
     chain_to = None         # chain job: "folder" | "ffpfs" | "ffpfsc" | "pkg"
     chain_sign = False      # chain job: fake-sign executables (after patch and backport)
     header_locked = False   # archive: no saved password opened its header when it was added
+    archive_problem = ""    # archive: why it cannot be read (damaged, a part missing); no password helps
+    archive_title = ""      # archive: the game read from the param.json inside, before extraction
+    archive_title_id = ""
+    archive_version = ""
     pkg_content_size = 0    # .pkg source: bytes of its files, from the package's directory (0 = not read)
     origin_archive = None   # str: the archive this job's source was extracted from (retry restarts there)
     origin_extracted_size = 0  # that archive's extracted size, read from its headers
@@ -2636,9 +2825,10 @@ class GameItem:
             pw = [p.strip() for p in (load_settings().get("archive_passwords") or []) if str(p).strip()]
         except Exception:
             pw = []
-        opened, hdr = ArchiveExtractor.probe_header(first, pw)
-        obj.header_locked  = not opened
-        obj.extracted_size = ArchiveExtractor.plausible_extracted_size(hdr, obj.size)
+        state, hdr, problem = ArchiveExtractor.probe_header_state(first, pw)
+        obj.header_locked   = state == "locked"
+        obj.archive_problem = problem if state == "damaged" else ""
+        obj.extracted_size  = ArchiveExtractor.plausible_extracted_size(hdr, obj.size)
         return obj
 
     @classmethod
@@ -2940,6 +3130,7 @@ __all__ = [
     "_strip_edition_fluff",
     "descriptive_ffpfsc_name",
     "canonical_game_title",
+    "ident_from_param_bytes",
     "organized_names",
     "find_artwork",
     "load_history",
